@@ -232,7 +232,9 @@ private:
     // Default excluded directories
     static const std::unordered_set<std::string>& excluded_dirs() {
         static const std::unordered_set<std::string> dirs = {
-            ".git", "build", "out", "node_modules"
+            ".git", "build", "out", "node_modules",
+            "vcpkg", "vcpkg_installed", "vendor", "third_party",
+            "__pycache__", ".venv", "target"
         };
         return dirs;
     }

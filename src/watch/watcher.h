@@ -42,13 +42,12 @@ public:
 
     void start() {
         running_ = true;
-        watch_thread_ = std::jthread([this](std::stop_token st) { run(st); });
+        watch_thread_ = std::thread([this]() { run(); });
     }
 
     void stop() {
         running_ = false;
         if (watch_thread_.joinable()) {
-            watch_thread_.request_stop();
             watch_thread_.join();
         }
     }
@@ -58,18 +57,18 @@ private:
     WatchCallback callback_;
     std::chrono::milliseconds debounce_;
     std::atomic<bool> running_;
-    std::jthread watch_thread_;
+    std::thread watch_thread_;
 
-    void run(std::stop_token stoken) {
+    void run() {
 #ifdef _WIN32
-        run_windows(stoken);
+        run_windows();
 #else
-        run_polling(stoken);  // Fallback: poll for changes
+        run_polling();  // Fallback: poll for changes
 #endif
     }
 
 #ifdef _WIN32
-    void run_windows(std::stop_token stoken) {
+    void run_windows() {
         HANDLE dir_handle = CreateFileW(
             root_.wstring().c_str(),
             FILE_LIST_DIRECTORY,
@@ -87,7 +86,7 @@ private:
 
         alignas(DWORD) char buffer[64 * 1024];
 
-        while (!stoken.stop_requested() && running_) {
+        while (running_) {
             DWORD bytes_returned = 0;
             ResetEvent(overlapped.hEvent);
 
@@ -137,7 +136,7 @@ private:
             // Debounce: wait for more events before dispatching
             std::this_thread::sleep_for(debounce_);
 
-            if (!events.empty() && !stoken.stop_requested()) {
+            if (!events.empty() && running_.load()) {
                 callback_(events);
             }
         }
@@ -148,7 +147,7 @@ private:
 #endif
 
     // Polling fallback for non-Windows platforms
-    void run_polling(std::stop_token stoken) {
+    void run_polling() {
         std::unordered_map<std::string, fs::file_time_type> known_files;
 
         // Initial scan
@@ -159,7 +158,7 @@ private:
             }
         }
 
-        while (!stoken.stop_requested() && running_) {
+        while (running_) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
 
             std::vector<WatchEvent> events;
@@ -191,7 +190,7 @@ private:
                 }
             }
 
-            if (!events.empty() && !stoken.stop_requested()) {
+            if (!events.empty() && running_.load()) {
                 callback_(events);
             }
         }
