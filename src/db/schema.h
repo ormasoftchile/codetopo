@@ -17,7 +17,7 @@ inline void create_tables(Connection& conn) {
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,
-            language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','go','yaml')),
+            language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','javascript','python','rust','java','go','bash','sql','yaml')),
             size_bytes INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
             content_hash TEXT NOT NULL,

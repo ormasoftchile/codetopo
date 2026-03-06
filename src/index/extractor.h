@@ -250,8 +250,8 @@ private:
         else if (*language_ == "csharp") {
             extract_csharp(node, type_str, parent_qualname);
         }
-        // T033: TypeScript extraction
-        else if (*language_ == "typescript") {
+        // T033: TypeScript/JavaScript extraction
+        else if (*language_ == "typescript" || *language_ == "javascript") {
             extract_typescript(node, type_str, parent_qualname);
         }
         // T034: Go extraction
@@ -261,6 +261,26 @@ private:
         // T035: YAML extraction
         else if (*language_ == "yaml") {
             extract_yaml(node, type_str, parent_qualname);
+        }
+        // T036: Python extraction
+        else if (*language_ == "python") {
+            extract_python(node, type_str, parent_qualname);
+        }
+        // T037: Rust extraction
+        else if (*language_ == "rust") {
+            extract_rust(node, type_str, parent_qualname);
+        }
+        // T038: Java extraction
+        else if (*language_ == "java") {
+            extract_java(node, type_str, parent_qualname);
+        }
+        // T039: Bash extraction
+        else if (*language_ == "bash") {
+            extract_bash(node, type_str, parent_qualname);
+        }
+        // T040: SQL extraction
+        else if (*language_ == "sql") {
+            extract_sql(node, type_str, parent_qualname);
         }
 
         // Recurse into children
@@ -427,7 +447,7 @@ private:
         }
     }
 
-    // T033: TypeScript symbol extraction
+    // T033: TypeScript/JavaScript symbol extraction
     void extract_typescript(TSNode node, const std::string& type, const std::string& parent_qn) {
         if (type == "function_declaration") {
             auto name = get_name_from_child(node, "name");
@@ -544,6 +564,191 @@ private:
                     }
                 }
             }
+        }
+    }
+
+    // T036: Python symbol extraction
+    void extract_python(TSNode node, const std::string& type, const std::string& parent_qn) {
+        if (type == "function_definition") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node, parent_qn.empty() ? name : parent_qn + "." + name);
+        }
+        else if (type == "class_definition") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("class", name, node);
+        }
+        else if (type == "decorated_definition") {
+            // Decorated functions/classes — recurse into the definition child
+        }
+        else if (type == "assignment") {
+            // Module-level assignments as variables
+            auto left = ts_node_child_by_field_name(node, "left", 4);
+            if (!ts_node_is_null(left)) {
+                std::string lt(ts_node_type(left));
+                if (lt == "identifier") {
+                    auto name = node_text(left);
+                    if (!name.empty()) add_symbol("variable", name, node);
+                }
+            }
+        }
+        else if (type == "call") {
+            auto func = ts_node_child_by_field_name(node, "function", 8);
+            if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call");
+        }
+        else if (type == "import_statement" || type == "import_from_statement") {
+            add_ref("include", node_text(node), node, "import");
+        }
+    }
+
+    // T037: Rust symbol extraction
+    void extract_rust(TSNode node, const std::string& type, const std::string& parent_qn) {
+        if (type == "function_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node, parent_qn.empty() ? name : parent_qn + "::" + name);
+        }
+        else if (type == "struct_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("struct", name, node);
+        }
+        else if (type == "enum_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("enum", name, node);
+        }
+        else if (type == "impl_item") {
+            auto name = get_name_from_child(node, "type");
+            if (!name.empty()) add_symbol("impl", name, node);
+        }
+        else if (type == "trait_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("trait", name, node);
+        }
+        else if (type == "mod_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("module", name, node);
+        }
+        else if (type == "type_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("type_alias", name, node);
+        }
+        else if (type == "const_item" || type == "static_item") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("variable", name, node);
+        }
+        else if (type == "macro_definition") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("macro", name, node);
+        }
+        else if (type == "call_expression") {
+            auto func = ts_node_child_by_field_name(node, "function", 8);
+            if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call");
+        }
+        else if (type == "use_declaration") {
+            add_ref("include", node_text(node), node, "use");
+        }
+    }
+
+    // T038: Java symbol extraction
+    void extract_java(TSNode node, const std::string& type, const std::string& parent_qn) {
+        if (type == "class_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("class", name, node);
+        }
+        else if (type == "interface_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("interface", name, node);
+        }
+        else if (type == "method_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("method", name, node, parent_qn.empty() ? name : parent_qn + "." + name);
+        }
+        else if (type == "constructor_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node);
+        }
+        else if (type == "enum_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("enum", name, node);
+        }
+        else if (type == "field_declaration") {
+            // Fields can have multiple declarators
+            uint32_t count = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < count; ++i) {
+                TSNode child = ts_node_named_child(node, i);
+                if (std::string(ts_node_type(child)) == "variable_declarator") {
+                    auto name = get_name_from_child(child, "name");
+                    if (!name.empty()) add_symbol("field", name, child);
+                }
+            }
+        }
+        else if (type == "annotation_type_declaration") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("annotation", name, node);
+        }
+        else if (type == "method_invocation") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_ref("call", name, node, "call");
+        }
+        else if (type == "import_declaration") {
+            add_ref("include", node_text(node), node, "import");
+        }
+    }
+
+    // T039: Bash/Shell symbol extraction
+    void extract_bash(TSNode node, const std::string& type, const std::string& parent_qn) {
+        if (type == "function_definition") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node);
+        }
+        else if (type == "variable_assignment") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("variable", name, node);
+        }
+        else if (type == "command") {
+            auto name_node = ts_node_child(node, 0);
+            if (!ts_node_is_null(name_node)) {
+                std::string cmd = node_text(name_node);
+                if (!cmd.empty() && cmd != "echo" && cmd != "cd" && cmd != "exit")
+                    add_ref("call", cmd, node, "command");
+            }
+        }
+        else if (type == "source_command") {
+            add_ref("include", node_text(node), node, "source");
+        }
+    }
+
+    // T040: SQL symbol extraction
+    void extract_sql(TSNode node, const std::string& type, const std::string& parent_qn) {
+        if (type == "create_function_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node);
+        }
+        else if (type == "create_table_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("class", name, node); // table as "class"
+        }
+        else if (type == "create_view_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("class", name, node); // view as "class"
+        }
+        else if (type == "create_procedure_statement" || type == "create_or_replace_procedure_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node);
+        }
+        else if (type == "create_trigger_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("function", name, node);
+        }
+        else if (type == "create_index_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("variable", name, node);
+        }
+        else if (type == "create_type_statement") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_symbol("typedef", name, node);
+        }
+        else if (type == "function_call") {
+            auto name = get_name_from_child(node, "name");
+            if (!name.empty()) add_ref("call", name, node, "call");
         }
     }
 };

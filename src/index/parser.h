@@ -18,7 +18,13 @@ extern "C" {
     const TSLanguage* tree_sitter_c_sharp(void);
     const TSLanguage* tree_sitter_go(void);
     const TSLanguage* tree_sitter_yaml(void);
-    // tree_sitter_typescript deferred — ABI incompatibility
+    const TSLanguage* tree_sitter_typescript(void);
+    const TSLanguage* tree_sitter_javascript(void);
+    const TSLanguage* tree_sitter_python(void);
+    const TSLanguage* tree_sitter_rust(void);
+    const TSLanguage* tree_sitter_java(void);
+    const TSLanguage* tree_sitter_bash(void);
+    // tree_sitter_sql deferred — grammar has MSVC compilation issues
 }
 
 class Parser {
@@ -68,7 +74,13 @@ private:
         if (lang == "c") return tree_sitter_c();
         if (lang == "cpp") return tree_sitter_cpp();
         if (lang == "csharp") return tree_sitter_c_sharp();
-        if (lang == "typescript") return nullptr;  // Deferred — ABI incompatibility
+        if (lang == "typescript") return tree_sitter_typescript();
+        if (lang == "javascript") return tree_sitter_javascript();
+        if (lang == "python") return tree_sitter_python();
+        if (lang == "rust") return tree_sitter_rust();
+        if (lang == "java") return tree_sitter_java();
+        if (lang == "bash") return tree_sitter_bash();
+        if (lang == "sql") return nullptr; // Deferred — grammar MSVC issues
         if (lang == "go") return tree_sitter_go();
         if (lang == "yaml") return tree_sitter_yaml();
         return nullptr;

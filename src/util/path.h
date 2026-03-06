@@ -79,7 +79,13 @@ inline std::string detect_language(const std::filesystem::path& file_path) {
     if (ext == ".hpp" || ext == ".hh" || ext == ".hxx" || ext == ".inl") return "cpp";
     if (ext == ".cs") return "csharp";
     if (ext == ".ts" || ext == ".tsx") return "typescript";
+    if (ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs") return "javascript";
+    if (ext == ".py" || ext == ".pyw") return "python";
+    if (ext == ".rs") return "rust";
+    if (ext == ".java") return "java";
     if (ext == ".go") return "go";
+    if (ext == ".sh" || ext == ".bash") return "bash";
+    if (ext == ".sql" || ext == ".tsql") return "sql";
     if (ext == ".yaml" || ext == ".yml") return "yaml";
 
     return "";

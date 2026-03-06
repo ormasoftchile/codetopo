@@ -107,12 +107,80 @@ add_library(ts_grammar_yaml OBJECT
 )
 target_include_directories(ts_grammar_yaml PRIVATE ${TS_INC} ${TS_GRAMMAR_DIR} "${TS_GRAMMAR_DIR}/yaml")
 
-# TypeScript grammar (v0.21.0 has ABI incompatibility — deferred)
-# add_library(ts_grammar_typescript OBJECT
-#     "${TS_GRAMMAR_DIR}/typescript/parser.c"
-#     "${TS_GRAMMAR_DIR}/typescript/scanner.c"
+# TypeScript grammar (v0.23 parser.h, C11)
+add_library(ts_grammar_typescript OBJECT
+    "${TS_GRAMMAR_DIR}/typescript/parser.c"
+    "${TS_GRAMMAR_DIR}/typescript/scanner.c"
+)
+target_include_directories(ts_grammar_typescript BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_typescript PRIVATE ${TS_INC} "${TS_GRAMMAR_DIR}" "${TS_GRAMMAR_DIR}/typescript")
+if(MSVC)
+    target_compile_options(ts_grammar_typescript PRIVATE /std:c11)
+endif()
+
+# JavaScript grammar (v0.23 parser.h, C11)
+add_library(ts_grammar_javascript OBJECT
+    "${TS_GRAMMAR_DIR}/javascript/parser.c"
+    "${TS_GRAMMAR_DIR}/javascript/scanner.c"
+)
+target_include_directories(ts_grammar_javascript BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_javascript PRIVATE ${TS_INC} "${TS_GRAMMAR_DIR}")
+if(MSVC)
+    target_compile_options(ts_grammar_javascript PRIVATE /std:c11)
+endif()
+
+# Python grammar (v0.23 parser.h, C11)
+add_library(ts_grammar_python OBJECT
+    "${TS_GRAMMAR_DIR}/python/parser.c"
+    "${TS_GRAMMAR_DIR}/python/scanner.c"
+)
+target_include_directories(ts_grammar_python BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_python PRIVATE ${TS_INC})
+if(MSVC)
+    target_compile_options(ts_grammar_python PRIVATE /std:c11)
+endif()
+
+# Rust grammar (v0.23 parser.h, C11)
+add_library(ts_grammar_rust OBJECT
+    "${TS_GRAMMAR_DIR}/rust/parser.c"
+    "${TS_GRAMMAR_DIR}/rust/scanner.c"
+)
+target_include_directories(ts_grammar_rust BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_rust PRIVATE ${TS_INC})
+if(MSVC)
+    target_compile_options(ts_grammar_rust PRIVATE /std:c11)
+endif()
+
+# Java grammar (v0.23 parser.h, C11, no scanner)
+add_library(ts_grammar_java OBJECT
+    "${TS_GRAMMAR_DIR}/java/parser.c"
+)
+target_include_directories(ts_grammar_java BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_java PRIVATE ${TS_INC})
+if(MSVC)
+    target_compile_options(ts_grammar_java PRIVATE /std:c11)
+endif()
+
+# Bash grammar (v0.23 parser.h, C11)
+add_library(ts_grammar_bash OBJECT
+    "${TS_GRAMMAR_DIR}/bash/parser.c"
+    "${TS_GRAMMAR_DIR}/bash/scanner.c"
+)
+target_include_directories(ts_grammar_bash BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+target_include_directories(ts_grammar_bash PRIVATE ${TS_INC})
+if(MSVC)
+    target_compile_options(ts_grammar_bash PRIVATE /std:c11)
+endif()
+
+# SQL grammar — disabled (m-novikov grammar has MSVC compilation issues)
+# add_library(ts_grammar_sql OBJECT
+#     "${TS_GRAMMAR_DIR}/sql/parser.c"
 # )
-# target_include_directories(ts_grammar_typescript PRIVATE ${TS_INC} ${TS_GRAMMAR_DIR} "${TS_GRAMMAR_DIR}/typescript")
+# target_include_directories(ts_grammar_sql BEFORE PRIVATE "${TS_GRAMMAR_DIR}/csharp_headers")
+# target_include_directories(ts_grammar_sql PRIVATE ${TS_INC})
+# if(MSVC)
+#     target_compile_options(ts_grammar_sql PRIVATE /std:c11)
+# endif()
 
 # --- Main executable ---
 file(GLOB_RECURSE CODETOPO_SOURCES
@@ -138,6 +206,12 @@ target_link_libraries(codetopo PRIVATE
     ts_grammar_csharp
     ts_grammar_go
     ts_grammar_yaml
+    ts_grammar_typescript
+    ts_grammar_javascript
+    ts_grammar_python
+    ts_grammar_rust
+    ts_grammar_java
+    ts_grammar_bash
     xxHash::xxhash
 )
 
@@ -179,6 +253,12 @@ target_link_libraries(codetopo_tests PRIVATE
     ts_grammar_csharp
     ts_grammar_go
     ts_grammar_yaml
+    ts_grammar_typescript
+    ts_grammar_javascript
+    ts_grammar_python
+    ts_grammar_rust
+    ts_grammar_java
+    ts_grammar_bash
     xxHash::xxhash
 )
 
