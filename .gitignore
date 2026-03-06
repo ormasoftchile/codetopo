@@ -65,6 +65,7 @@ doctor-*.txt
 # Scratch/notes files
 *.md
 !README.md
+!.github/copilot-instructions.md
 
 # Test artifacts
 test_csharp.cs
