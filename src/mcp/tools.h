@@ -1061,5 +1061,76 @@ inline std::string shortest_path(yyjson_val* params, Connection& conn,
     return doc.to_string();
 }
 
+// T089: index_summary — overview of what's in the index
+inline std::string index_summary(yyjson_val* /*params*/, Connection& conn,
+                                  QueryCache& cache, const std::string& repo_root) {
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "root", repo_root.c_str());
+
+    auto last_index = schema::get_kv(conn, "last_index_time", "");
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "last_index_time", last_index.c_str());
+
+    // Languages: files, symbols per language
+    auto* langs = doc.new_obj();
+    {
+        auto* stmt = cache.get("summary_langs",
+            "SELECT f.language, COUNT(DISTINCT f.id) as file_count, "
+            "COUNT(DISTINCT n.id) as symbol_count "
+            "FROM files f LEFT JOIN nodes n ON n.file_id = f.id "
+            "GROUP BY f.language ORDER BY file_count DESC");
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto* lang_text = sqlite3_column_text(stmt, 0);
+            if (!lang_text) continue;
+            std::string lang_str(reinterpret_cast<const char*>(lang_text));
+            auto* lang_obj = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, lang_obj, "files", sqlite3_column_int64(stmt, 1));
+            yyjson_mut_obj_add_int(doc.doc, lang_obj, "symbols", sqlite3_column_int64(stmt, 2));
+            auto* key = yyjson_mut_strcpy(doc.doc, lang_str.c_str());
+            yyjson_mut_obj_add(langs, key, lang_obj);
+        }
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "languages", langs);
+
+    // Top directories (first path segment)
+    auto* dirs = doc.new_obj();
+    {
+        auto* stmt = cache.get("summary_dirs",
+            "SELECT CASE WHEN INSTR(path, '/') > 0 "
+            "THEN SUBSTR(path, 1, INSTR(path, '/')) "
+            "ELSE path END as dir, COUNT(*) as cnt "
+            "FROM files GROUP BY dir ORDER BY cnt DESC LIMIT 20");
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto* dir_text = sqlite3_column_text(stmt, 0);
+            if (!dir_text) continue;
+            std::string dir_str(reinterpret_cast<const char*>(dir_text));
+            auto* key = yyjson_mut_strcpy(doc.doc, dir_str.c_str());
+            auto* val = yyjson_mut_int(doc.doc, sqlite3_column_int64(stmt, 1));
+            yyjson_mut_obj_add(dirs, key, val);
+        }
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "directories", dirs);
+
+    // Totals
+    auto* totals = doc.new_obj();
+    {
+        auto count_q = [&](const char* table) -> int64_t {
+            std::string sql = std::string("SELECT COUNT(*) FROM ") + table;
+            auto* stmt = cache.get(std::string("summary_count_") + table, sql);
+            int64_t n = 0;
+            if (sqlite3_step(stmt) == SQLITE_ROW) n = sqlite3_column_int64(stmt, 0);
+            return n;
+        };
+        yyjson_mut_obj_add_int(doc.doc, totals, "files", count_q("files"));
+        yyjson_mut_obj_add_int(doc.doc, totals, "symbols", count_q("nodes"));
+        yyjson_mut_obj_add_int(doc.doc, totals, "edges", count_q("edges"));
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "totals", totals);
+
+    return doc.to_string();
+}
+
 } // namespace tools
 } // namespace codetopo

@@ -93,7 +93,9 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
     server.register_tool("shortest_path", tools::shortest_path,
         "Find the shortest dependency path between two symbols in the code graph.",
         R"J({"type":"object","properties":{"src_id":{"type":"integer","description":"Source node_id"},"dst_id":{"type":"integer","description":"Destination node_id"}},"required":["src_id","dst_id"])J");
-
+    server.register_tool("index_summary", tools::index_summary,
+        "Get an overview of the indexed codebase: languages, directories, file/symbol/edge counts.",
+        R"J({"type":"object","properties":{}})J");
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root << ")\n";
     return server.run();
 }
