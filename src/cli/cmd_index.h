@@ -253,11 +253,13 @@ inline int run_index(const Config& config) {
             result.parse_status = result.extraction.truncated ? "partial" : "ok";
             result.parse_error = result.extraction.truncated ? result.extraction.truncation_reason : "";
 
+#ifdef _WIN32
             } catch (const SehException& e) {
                 char buf[64]; snprintf(buf, sizeof(buf), "SEH 0x%08X during parse/extract", e.code);
                 result.parse_status = "failed";
                 result.parse_error = buf;
                 result.has_error = true;
+#endif
             } catch (const std::exception& e) {
                 result.parse_status = "failed";
                 result.parse_error = std::string("exception: ") + e.what();
