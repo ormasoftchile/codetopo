@@ -1,5 +1,11 @@
 # Copilot Project Instructions
 
+## File System Rules
+
+- **NEVER** create, read, or write files outside the project working directory.
+- All temporary files, test scripts, and scratch work must stay within the workspace.
+- Do not use `/tmp`, home directories, or any path outside the repo root.
+
 ## Branch Naming Convention
 
 Always use this pattern when creating branches:

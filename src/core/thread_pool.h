@@ -16,15 +16,15 @@ class ThreadPool {
 public:
     explicit ThreadPool(int thread_count) : stop_(false) {
         for (int i = 0; i < thread_count; ++i) {
-            workers_.emplace_back([this](std::stop_token stoken) {
+            workers_.emplace_back([this]() {
                 while (true) {
                     std::function<void()> task;
                     {
                         std::unique_lock<std::mutex> lock(mutex_);
-                        cv_.wait(lock, [this, &stoken] {
-                            return stop_ || !tasks_.empty() || stoken.stop_requested();
+                        cv_.wait(lock, [this] {
+                            return stop_ || !tasks_.empty();
                         });
-                        if ((stop_ || stoken.stop_requested()) && tasks_.empty())
+                        if (stop_ && tasks_.empty())
                             return;
                         task = std::move(tasks_.front());
                         tasks_.pop();
@@ -42,9 +42,8 @@ public:
         }
         cv_.notify_all();
         for (auto& worker : workers_) {
-            worker.request_stop();
+            if (worker.joinable()) worker.join();
         }
-        // jthread joins automatically on destruction
     }
 
     ThreadPool(const ThreadPool&) = delete;
@@ -70,7 +69,7 @@ public:
     }
 
 private:
-    std::vector<std::jthread> workers_;
+    std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
     std::mutex mutex_;
     std::condition_variable cv_;
