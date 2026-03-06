@@ -1,0 +1,51 @@
+# T104: CI workflow for GitHub Actions
+name: CI
+
+on:
+  push:
+    branches: [master, main, "001-*"]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: 'vcpkg.json'
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Pre-populate grammar files
+        shell: pwsh
+        run: |
+          # Download grammar archives
+          Invoke-WebRequest "https://github.com/tree-sitter/tree-sitter-c/archive/refs/tags/v0.21.0.zip" -OutFile ts-c.zip
+          Invoke-WebRequest "https://github.com/tree-sitter/tree-sitter-cpp/archive/refs/tags/v0.21.0.zip" -OutFile ts-cpp.zip
+          Expand-Archive ts-c.zip -DestinationPath ts-c -Force
+          Expand-Archive ts-cpp.zip -DestinationPath ts-cpp -Force
+          New-Item -ItemType Directory build/ts_grammars/c, build/ts_grammars/cpp, build/ts_grammars/tree_sitter -Force
+          Copy-Item ts-c/tree-sitter-c-0.21.0/src/parser.c build/ts_grammars/c/
+          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/parser.c build/ts_grammars/cpp/
+          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/scanner.c build/ts_grammars/cpp/
+          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/tree_sitter/* build/ts_grammars/tree_sitter/
+
+      - name: Rebuild with grammars
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ./build/Release/codetopo_tests.exe
+
+      - name: Index self
+        run: ./build/Release/codetopo.exe index --root . --db codetopo.sqlite
+
+      - name: Doctor
+        run: ./build/Release/codetopo.exe doctor --db codetopo.sqlite

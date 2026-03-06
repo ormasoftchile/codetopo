@@ -1,0 +1,18 @@
+{
+  "name": "codetopo",
+  "version": "1.0.0",
+  "description": "Local code graph indexer and MCP server",
+  "dependencies": [
+    {
+      "name": "sqlite3",
+      "features": ["fts5"]
+    },
+    "cli11",
+    "yyjson",
+    "ftxui",
+    "catch2",
+    "tree-sitter",
+    "xxhash"
+  ],
+  "builtin-baseline": "3af1d1e60af2b2abf55760538cd607829029b07a"
+}
