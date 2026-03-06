@@ -1,51 +1,87 @@
-# T104: CI workflow for GitHub Actions
 name: CI
 
 on:
-  push:
-    branches: [master, main, "001-*"]
   pull_request:
-    branches: [master, main]
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  CMAKE_BUILD_TYPE: Release
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+            triplet: x64-linux
+            exe: ./build/codetopo
+            tests: ./build/codetopo_tests
+          - os: macos-latest
+            name: macOS
+            triplet: arm64-osx
+            exe: ./build/codetopo
+            tests: ./build/codetopo_tests
+          - os: windows-latest
+            name: Windows
+            triplet: x64-windows
+            exe: ./build/Release/codetopo.exe
+            tests: ./build/Release/codetopo_tests.exe
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
+
+      # Enable GitHub Actions cache for vcpkg binary caching
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgJsonGlob: 'vcpkg.json'
 
-      - name: Configure
-        run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+      # Linux needs pkg-config for vcpkg fixup steps
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
+
+      - name: Configure (Unix)
+        if: runner.os != 'Windows'
+        run: cmake --preset release
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Pre-populate grammar files
-        shell: pwsh
-        run: |
-          # Download grammar archives
-          Invoke-WebRequest "https://github.com/tree-sitter/tree-sitter-c/archive/refs/tags/v0.21.0.zip" -OutFile ts-c.zip
-          Invoke-WebRequest "https://github.com/tree-sitter/tree-sitter-cpp/archive/refs/tags/v0.21.0.zip" -OutFile ts-cpp.zip
-          Expand-Archive ts-c.zip -DestinationPath ts-c -Force
-          Expand-Archive ts-cpp.zip -DestinationPath ts-cpp -Force
-          New-Item -ItemType Directory build/ts_grammars/c, build/ts_grammars/cpp, build/ts_grammars/tree_sitter -Force
-          Copy-Item ts-c/tree-sitter-c-0.21.0/src/parser.c build/ts_grammars/c/
-          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/parser.c build/ts_grammars/cpp/
-          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/scanner.c build/ts_grammars/cpp/
-          Copy-Item ts-cpp/tree-sitter-cpp-0.21.0/src/tree_sitter/* build/ts_grammars/tree_sitter/
-
-      - name: Rebuild with grammars
-        run: cmake --build build --config Release
-
       - name: Test
-        run: ./build/Release/codetopo_tests.exe
+        run: ${{ matrix.tests }}
 
       - name: Index self
-        run: ./build/Release/codetopo.exe index --root . --db codetopo.sqlite
+        run: ${{ matrix.exe }} index --root . --db codetopo.sqlite
 
       - name: Doctor
-        run: ./build/Release/codetopo.exe doctor --db codetopo.sqlite
+        run: ${{ matrix.exe }} doctor --db codetopo.sqlite
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: codetopo-${{ matrix.name }}
+          path: |
+            ${{ matrix.exe }}
+          retention-days: 14
