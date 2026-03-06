@@ -162,11 +162,21 @@ TEST_CASE("MCP symbol_search finds main function", "[integration][us2]") {
         REQUIRE(results != nullptr);
         REQUIRE(yyjson_arr_size(results) >= 1);
 
-        // First result should be the main function
-        auto* first = yyjson_arr_get_first(results);
-        auto* name = json_get_str(first, "name");
-        REQUIRE(name != nullptr);
-        REQUIRE(std::string(name) == "main");
+        // Find the result that is a function named 'main'
+        // (file nodes like "src/main.cpp" may also match the FTS query)
+        bool found_main_fn = false;
+        yyjson_val* item;
+        yyjson_arr_iter iter;
+        yyjson_arr_iter_init(results, &iter);
+        while ((item = yyjson_arr_iter_next(&iter))) {
+            auto* kind = json_get_str(item, "kind");
+            auto* name = json_get_str(item, "name");
+            if (kind && name && std::string(kind) == "function" && std::string(name) == "main") {
+                found_main_fn = true;
+                break;
+            }
+        }
+        REQUIRE(found_main_fn);
     }
     fs::remove_all(db_path.parent_path());
 }

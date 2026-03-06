@@ -8,14 +8,17 @@ namespace fs = std::filesystem;
 
 // Helper: run codetopo and return exit code
 static int run_codetopo(const std::string& args) {
-    // Find the built executable
-    auto exe = fs::current_path() / "build" / "Release" / "codetopo.exe";
-    if (!fs::exists(exe)) {
-        exe = fs::current_path() / "build" / "codetopo.exe";
-    }
+    // Find the built executable — try platform-specific paths
+    auto exe = fs::current_path() / "build" / "Release" / "codetopo.exe";  // Windows Release
+    if (!fs::exists(exe)) exe = fs::current_path() / "build" / "codetopo.exe";  // Windows Debug
+    if (!fs::exists(exe)) exe = fs::current_path() / "build" / "codetopo";       // Unix/macOS
     if (!fs::exists(exe)) return -1;
 
+#ifdef _WIN32
     std::string cmd = "\"" + exe.string() + "\" " + args + " >NUL 2>NUL";
+#else
+    std::string cmd = "\"" + exe.string() + "\" " + args + " >/dev/null 2>/dev/null";
+#endif
     return std::system(cmd.c_str());
 }
 

@@ -65,5 +65,10 @@ TEST_CASE("Language detection from extension", "[path]") {
     REQUIRE(path_util::detect_language("config.yaml") == "yaml");
     REQUIRE(path_util::detect_language("config.yml") == "yaml");
     REQUIRE(path_util::detect_language("test.c") == "c");
-    REQUIRE(path_util::detect_language("unknown.rs").empty());
+    REQUIRE(path_util::detect_language("unknown.rs") == "rust");
+    REQUIRE(path_util::detect_language("App.java") == "java");
+    REQUIRE(path_util::detect_language("app.py") == "python");
+    REQUIRE(path_util::detect_language("app.js") == "javascript");
+    REQUIRE(path_util::detect_language("script.sh") == "bash");
+    REQUIRE(path_util::detect_language("unknown.xyz").empty());
 }
