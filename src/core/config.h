@@ -18,6 +18,8 @@ struct Config {
     int max_symbols_per_file = 50000;
     int max_ast_depth = 500;
     bool no_gitignore = false;
+    bool supervised = false;   // True when running as a supervised child process
+    bool safe_mode = false;    // True = commit after every file (for crash isolation)
 
     // MCP server settings
     int tool_timeout_s = 10;

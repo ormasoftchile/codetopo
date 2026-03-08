@@ -2,6 +2,8 @@
 
 #include "db/connection.h"
 #include <string>
+#include <unordered_set>
+#include <ctime>
 
 namespace codetopo {
 
@@ -86,6 +88,16 @@ inline void create_tables(Connection& conn) {
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+    )SQL");
+
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS quarantine (
+            path TEXT PRIMARY KEY,
+            crash_count INTEGER NOT NULL DEFAULT 1,
+            first_crash TEXT NOT NULL,
+            last_crash TEXT NOT NULL,
+            error TEXT
         );
     )SQL");
 }
@@ -197,11 +209,68 @@ inline int ensure_schema(Connection& conn) {
     conn.exec("DROP TABLE IF EXISTS nodes");
     conn.exec("DROP TABLE IF EXISTS files");
     conn.exec("DROP TABLE IF EXISTS kv");
+    conn.exec("DROP TABLE IF EXISTS quarantine");
 
     create_tables(conn);
     create_fts(conn);
     set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     return 0;
+}
+
+// Ensure quarantine table exists (additive migration — safe to call on any schema version)
+inline void ensure_quarantine_table(Connection& conn) {
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS quarantine (
+            path TEXT PRIMARY KEY,
+            crash_count INTEGER NOT NULL DEFAULT 1,
+            first_crash TEXT NOT NULL,
+            last_crash TEXT NOT NULL,
+            error TEXT
+        );
+    )SQL");
+}
+
+// Load all quarantined file paths into a set
+inline std::unordered_set<std::string> load_quarantine(Connection& conn) {
+    std::unordered_set<std::string> result;
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(conn.raw(),
+        "SELECT path FROM quarantine", -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return result;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        result.insert(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// Add a file to quarantine (or increment crash_count if already there)
+inline void quarantine_file(Connection& conn, const std::string& path, const std::string& error = "") {
+    auto now = std::to_string(std::time(nullptr));
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO quarantine(path, crash_count, first_crash, last_crash, error) "
+        "VALUES(?, 1, datetime('now'), datetime('now'), ?) "
+        "ON CONFLICT(path) DO UPDATE SET "
+        "crash_count = crash_count + 1, last_crash = datetime('now'), error = ?",
+        -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, error.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, error.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+// Get quarantine count
+inline int quarantine_count(Connection& conn) {
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(conn.raw(),
+        "SELECT COUNT(*) FROM quarantine", -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return 0;
+    int count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 } // namespace schema

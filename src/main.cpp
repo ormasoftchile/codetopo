@@ -8,6 +8,7 @@
 #include "cli/cmd_mcp.h"
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
+#include "index/supervisor.h"
 
 // Resolve default db path: <root>/.codetopo/index.sqlite
 static std::string default_db(const std::string& root) {
@@ -50,6 +51,8 @@ int main(int argc, char** argv) {
     int index_max_file_size = 10;
     int index_max_symbols = 50000;
     bool index_no_gitignore = false;
+    bool index_supervised = false;
+    bool index_safe_mode = false;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
@@ -59,6 +62,8 @@ int main(int argc, char** argv) {
     sub_index->add_option("--max-file-size", index_max_file_size, "Max file size in MB")->default_val(10);
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
+    sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
+    sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
 
     // --- mcp subcommand ---
     auto* sub_mcp = app.add_subcommand("mcp", "Start MCP server over stdio");
@@ -115,8 +120,16 @@ int main(int argc, char** argv) {
         cfg.max_file_size_mb = index_max_file_size;
         cfg.max_symbols_per_file = index_max_symbols;
         cfg.no_gitignore = index_no_gitignore;
+        cfg.supervised = index_supervised;
+        cfg.safe_mode = index_safe_mode;
         try {
-            return codetopo::run_index(cfg);
+            if (cfg.supervised) {
+                // Running as a supervised child — index directly
+                return codetopo::run_index(cfg);
+            } else {
+                // Running as top-level — become supervisor
+                return codetopo::run_index_supervisor(cfg);
+            }
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
