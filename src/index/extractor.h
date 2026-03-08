@@ -190,6 +190,47 @@ private:
         return node_text(func_node);
     }
 
+    // Extract the leading comment block immediately before a node.
+    // Walks backward through previous siblings to collect contiguous comment nodes.
+    std::string extract_leading_comment(TSNode node) {
+        std::string comment;
+        TSNode prev = ts_node_prev_sibling(node);
+        // Collect contiguous comment nodes (walk backward, then reverse)
+        std::vector<std::string> parts;
+        while (!ts_node_is_null(prev)) {
+            const char* prev_type = ts_node_type(prev);
+            if (!prev_type) break;
+            std::string pt(prev_type);
+            if (pt == "comment" || pt == "line_comment" || pt == "block_comment"
+                || pt == "documentation_comment" || pt == "doc_comment") {
+                std::string text = node_text(prev);
+                // Strip common comment prefixes
+                if (text.size() > 2) {
+                    if (text.substr(0, 3) == "///") text = text.substr(3);
+                    else if (text.substr(0, 2) == "//") text = text.substr(2);
+                    else if (text.size() > 4 && text.substr(0, 2) == "/*"
+                             && text.substr(text.size()-2) == "*/")
+                        text = text.substr(2, text.size()-4);
+                    // Trim leading whitespace
+                    auto pos = text.find_first_not_of(" \t");
+                    if (pos != std::string::npos) text = text.substr(pos);
+                }
+                if (!text.empty()) parts.push_back(text);
+                prev = ts_node_prev_sibling(prev);
+            } else {
+                break;
+            }
+        }
+        // Reverse to get top-to-bottom order
+        for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+            if (!comment.empty()) comment += "\n";
+            comment += *it;
+        }
+        // Truncate to avoid storing huge comment blocks
+        if (comment.size() > 500) comment = comment.substr(0, 500);
+        return comment;
+    }
+
     void add_symbol(const std::string& kind, const std::string& name,
                     TSNode node, const std::string& qualname = "",
                     const std::string& signature = "",
@@ -204,12 +245,15 @@ private:
         TSPoint start = ts_node_start_point(node);
         TSPoint end = ts_node_end_point(node);
 
+        // Extract leading comment as documentation
+        std::string doc_comment = extract_leading_comment(node);
+
         result_->symbols.push_back({
             kind, name, qualname.empty() ? name : qualname,
             signature,
             static_cast<int>(start.row + 1), static_cast<int>(start.column),
             static_cast<int>(end.row + 1), static_cast<int>(end.column),
-            true, visibility, "", ""
+            true, visibility, doc_comment, ""
         });
     }
 
