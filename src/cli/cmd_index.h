@@ -95,6 +95,15 @@ inline int run_index(const Config& config) {
     }
     // FTS triggers created later — after bulk inserts for performance
 
+    // Ensure quarantine table exists (additive migration)
+    schema::ensure_quarantine_table(conn);
+
+    // Load quarantined file paths
+    auto quarantined = schema::load_quarantine(conn);
+    if (!quarantined.empty()) {
+        std::cerr << "Quarantine: " << quarantined.size() << " file(s) will be skipped\n";
+    }
+
     // Scan repository (T025-T028)
     std::cerr << "Scanning " << repo_root.string() << "...\n";
     Scanner scanner(config);
@@ -119,8 +128,14 @@ inline int run_index(const Config& config) {
     // Merge new + changed into a single work list
     std::vector<ScannedFile> work_list;
     work_list.reserve(changes.new_files.size() + changes.changed_files.size());
-    work_list.insert(work_list.end(), changes.new_files.begin(), changes.new_files.end());
-    work_list.insert(work_list.end(), changes.changed_files.begin(), changes.changed_files.end());
+    for (const auto& f : changes.new_files) {
+        if (!quarantined.count(f.relative_path))
+            work_list.push_back(f);
+    }
+    for (const auto& f : changes.changed_files) {
+        if (!quarantined.count(f.relative_path))
+            work_list.push_back(f);
+    }
 
     if (work_list.empty()) {
         std::cerr << "Nothing to index. Database is up to date.\n";
@@ -164,10 +179,17 @@ inline int run_index(const Config& config) {
     std::cerr << "Indexing " << total << " files with " << thread_count
               << " threads (arena " << config.arena_size_mb << " MB)\n";
 
+    // Safe mode: commit after every file to isolate crashers
+    int effective_batch_size = config.batch_size;
+    if (config.safe_mode) {
+        effective_batch_size = 1;
+        std::cerr << "SAFE MODE: commit after every file\n";
+    }
+
     // --- Bulk load optimization: drop indexes and FTS triggers ---
     // Building indexes on a populated table is 10-50x faster than maintaining
     // them per-insert. FTS rebuild is similarly much faster in one pass.
-    bool bulk_mode = (total > 1000);
+    bool bulk_mode = (total > 1000) && !config.safe_mode;
     if (bulk_mode) {
         std::cerr << "Bulk mode: dropping indexes for fast insert...\n";
         schema::drop_bulk_indexes(conn);
@@ -292,7 +314,7 @@ inline int run_index(const Config& config) {
             errors.fetch_add(1, std::memory_order_relaxed);
         }
 
-        persister.flush_if_needed(config.batch_size);
+        persister.flush_if_needed(effective_batch_size);
 
         // Progress reporting
         int done = i + 1;
