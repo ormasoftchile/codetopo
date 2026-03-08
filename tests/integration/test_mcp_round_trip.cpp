@@ -5,6 +5,7 @@
 #include "db/schema.h"
 #include "db/queries.h"
 #include "mcp/tools.h"
+#include "mcp/error.h"
 #include "util/json.h"
 #include "util/path.h"
 #include <filesystem>
