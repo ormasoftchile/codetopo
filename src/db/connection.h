@@ -39,7 +39,8 @@ public:
             throw std::runtime_error("SQLite open failed: " + msg);
         }
 
-        // PRAGMA setup
+        // PRAGMA setup — page_size MUST be set before first write
+        exec("PRAGMA page_size=32768");
         exec("PRAGMA journal_mode=WAL");
         exec("PRAGMA foreign_keys=ON");
         exec("PRAGMA busy_timeout=5000");

@@ -16,7 +16,7 @@ inline void create_tables(Connection& conn) {
     conn.exec(R"SQL(
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
-            path TEXT UNIQUE NOT NULL,
+            path TEXT NOT NULL,
             language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','javascript','python','rust','java','go','bash','sql','yaml')),
             size_bytes INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
@@ -24,6 +24,7 @@ inline void create_tables(Connection& conn) {
             parse_status TEXT NOT NULL CHECK(parse_status IN ('ok','partial','failed','skipped')),
             parse_error TEXT
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path);
         CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);
     )SQL");
 
@@ -43,8 +44,9 @@ inline void create_tables(Connection& conn) {
             is_definition INTEGER NOT NULL DEFAULT 1,
             visibility TEXT CHECK(visibility IN ('public','protected','private') OR visibility IS NULL),
             doc TEXT,
-            stable_key TEXT NOT NULL UNIQUE
+            stable_key TEXT NOT NULL
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key);
         CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name);
         CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname);
@@ -141,9 +143,11 @@ inline std::string get_kv(Connection& conn, const std::string& key, const std::s
     return result;
 }
 
-// Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
+// Drop ALL indexes (including UNIQUE) for bulk loading. Only PRIMARY KEY remains.
 inline void drop_bulk_indexes(Connection& conn) {
+    conn.exec("DROP INDEX IF EXISTS idx_files_path");
     conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
+    conn.exec("DROP INDEX IF EXISTS idx_nodes_stable_key");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_file_id");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_type_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_qualname");
@@ -155,9 +159,11 @@ inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_edges_dst");
 }
 
-// Rebuild secondary indexes after bulk loading.
+// Rebuild ALL indexes after bulk loading (including UNIQUE constraints).
 inline void rebuild_indexes(Connection& conn) {
+    conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_path ON files(path)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
+    conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");

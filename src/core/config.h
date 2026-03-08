@@ -17,6 +17,7 @@ struct Config {
     int max_file_size_mb = 10;
     int max_symbols_per_file = 50000;
     int max_ast_depth = 500;
+    int max_files = 0;  // 0 = no limit
     bool no_gitignore = false;
 
     // MCP server settings

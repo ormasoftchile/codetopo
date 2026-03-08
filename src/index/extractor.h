@@ -71,7 +71,7 @@ public:
         symbol_count_ = 0;
 
         TSNode root = ts_tree_root_node(tree);
-        visit_node(root, "", 0);
+        visit_tree(root);
 
         // Generate stable keys with collision handling
         std::vector<KeyCandidate> candidates;
@@ -233,60 +233,91 @@ private:
         });
     }
 
-    void visit_node(TSNode node, const std::string& parent_qualname, int depth) {
-        if (ts_node_is_null(node) || depth > max_depth_) return;
-        if (result_->truncated) return;
+    // Iterative AST traversal using tree-sitter cursor.
+    // Eliminates unbounded recursion that caused stack overflow (0xC0000409)
+    // on large files with deep ASTs (e.g., DsMainDev C++ files).
+    void visit_tree(TSNode root) {
+        if (ts_node_is_null(root)) return;
+        uint32_t source_len = static_cast<uint32_t>(source_->size());
 
-        const char* type = ts_node_type(node);
-        if (!type) return;
+        TSTreeCursor cursor = ts_tree_cursor_new(root);
+        int depth = 0;
 
-        std::string type_str(type);
+        for (;;) {
+            if (result_->truncated) break;
 
-        // C/C++ symbol extraction (T031)
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+
+            // Validate node byte range is within source bounds.
+            // Corrupt trees can have nodes pointing outside the source buffer,
+            // which causes access violations in node_text() and ts_node_type().
+            uint32_t node_start = ts_node_start_byte(node);
+            uint32_t node_end = ts_node_end_byte(node);
+            bool node_valid = (node_start <= source_len && node_end <= source_len + 1
+                               && node_start <= node_end);
+
+            if (node_valid && depth <= max_depth_) {
+                const char* type = ts_node_type(node);
+                if (type) {
+                    std::string type_str(type);
+                    dispatch_extract(node, type_str, "");
+                }
+            }
+
+            // Depth-first: try child first (skip children of invalid nodes)
+            if (node_valid && depth < max_depth_ && ts_tree_cursor_goto_first_child(&cursor)) {
+                ++depth;
+                continue;
+            }
+            // Then sibling
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                continue;
+            }
+            // Backtrack until we find an ancestor with a next sibling
+            bool found = false;
+            while (ts_tree_cursor_goto_parent(&cursor)) {
+                --depth;
+                if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) break;
+        }
+
+        ts_tree_cursor_delete(&cursor);
+    }
+
+    void dispatch_extract(TSNode node, const std::string& type_str, const std::string& parent_qn) {
         if (*language_ == "c" || *language_ == "cpp") {
-            extract_c_cpp(node, type_str, parent_qualname);
+            extract_c_cpp(node, type_str, parent_qn);
         }
-        // T032: C# extraction
         else if (*language_ == "csharp") {
-            extract_csharp(node, type_str, parent_qualname);
+            extract_csharp(node, type_str, parent_qn);
         }
-        // T033: TypeScript/JavaScript extraction
         else if (*language_ == "typescript" || *language_ == "javascript") {
-            extract_typescript(node, type_str, parent_qualname);
+            extract_typescript(node, type_str, parent_qn);
         }
-        // T034: Go extraction
         else if (*language_ == "go") {
-            extract_go(node, type_str, parent_qualname);
+            extract_go(node, type_str, parent_qn);
         }
-        // T035: YAML extraction
         else if (*language_ == "yaml") {
-            extract_yaml(node, type_str, parent_qualname);
+            extract_yaml(node, type_str, parent_qn);
         }
-        // T036: Python extraction
         else if (*language_ == "python") {
-            extract_python(node, type_str, parent_qualname);
+            extract_python(node, type_str, parent_qn);
         }
-        // T037: Rust extraction
         else if (*language_ == "rust") {
-            extract_rust(node, type_str, parent_qualname);
+            extract_rust(node, type_str, parent_qn);
         }
-        // T038: Java extraction
         else if (*language_ == "java") {
-            extract_java(node, type_str, parent_qualname);
+            extract_java(node, type_str, parent_qn);
         }
-        // T039: Bash extraction
         else if (*language_ == "bash") {
-            extract_bash(node, type_str, parent_qualname);
+            extract_bash(node, type_str, parent_qn);
         }
-        // T040: SQL extraction
         else if (*language_ == "sql") {
-            extract_sql(node, type_str, parent_qualname);
-        }
-
-        // Recurse into children
-        uint32_t child_count = ts_node_child_count(node);
-        for (uint32_t i = 0; i < child_count; ++i) {
-            visit_node(ts_node_child(node, i), parent_qualname, depth + 1);
+            extract_sql(node, type_str, parent_qn);
         }
     }
 

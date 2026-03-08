@@ -52,10 +52,23 @@ public:
     }
 
     // Parse source code. Returns owned TSTree (caller must free).
-    TSTree* parse(const std::string& source) {
-        return ts_parser_parse_string(parser_, nullptr,
+    // Returns nullptr if parse fails or times out.
+    TSTree* parse(const std::string& source, uint64_t timeout_us = 10'000'000 /*10s*/) {
+        ts_parser_set_timeout_micros(parser_, timeout_us);
+        TSTree* tree = ts_parser_parse_string(parser_, nullptr,
                                        source.c_str(),
                                        static_cast<uint32_t>(source.size()));
+        ts_parser_set_timeout_micros(parser_, 0);
+        if (!tree) return nullptr;
+
+        // Validate tree: root node byte range must be within source bounds
+        TSNode root = ts_tree_root_node(tree);
+        uint32_t end = ts_node_end_byte(root);
+        if (end > source.size() + 1) {
+            ts_tree_delete(tree);
+            return nullptr;
+        }
+        return tree;
     }
 
     // Parse with existing tree (for incremental parsing).

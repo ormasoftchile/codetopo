@@ -8,6 +8,7 @@
 #include "cli/cmd_mcp.h"
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
+#include "cli/cmd_parse_file.h"
 
 // Resolve default db path: <root>/.codetopo/index.sqlite
 static std::string default_db(const std::string& root) {
@@ -58,6 +59,8 @@ int main(int argc, char** argv) {
     sub_index->add_option("--batch-size", index_batch_size, "Files per transaction batch")->default_val(100);
     sub_index->add_option("--max-file-size", index_max_file_size, "Max file size in MB")->default_val(10);
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
+    int index_max_files = 0;
+    sub_index->add_option("--max-files", index_max_files, "Max files to index (0=all)")->default_val(0);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
 
     // --- mcp subcommand ---
@@ -100,6 +103,17 @@ int main(int argc, char** argv) {
     sub_doctor->add_option("--root", doctor_root, "Repository root directory")->default_val(".");
     sub_doctor->add_option("--db", doctor_db, "Database path (default: <root>/.codetopo/index.sqlite)");
 
+    // --- parse-file subcommand (used by subprocess crash isolation) ---
+    auto* sub_parse_file = app.add_subcommand("parse-file", "Parse a single file (subprocess mode)");
+    std::string pf_file, pf_lang, pf_root = ".";
+    int pf_max_symbols = 50000, pf_max_depth = 500;
+
+    sub_parse_file->add_option("--file", pf_file, "File to parse")->required();
+    sub_parse_file->add_option("--lang", pf_lang, "Language")->required();
+    sub_parse_file->add_option("--root", pf_root, "Repository root")->default_val(".");
+    sub_parse_file->add_option("--max-symbols", pf_max_symbols)->default_val(50000);
+    sub_parse_file->add_option("--max-depth", pf_max_depth)->default_val(500);
+
     // --- Parse and dispatch ---
     CLI11_PARSE(app, argc, argv);
 
@@ -114,6 +128,7 @@ int main(int argc, char** argv) {
         cfg.batch_size = index_batch_size;
         cfg.max_file_size_mb = index_max_file_size;
         cfg.max_symbols_per_file = index_max_symbols;
+        cfg.max_files = index_max_files;
         cfg.no_gitignore = index_no_gitignore;
         try {
             return codetopo::run_index(cfg);
@@ -153,6 +168,15 @@ int main(int argc, char** argv) {
         if (doctor_db.empty()) doctor_db = default_db(doctor_root);
         try {
             return codetopo::run_doctor(doctor_db);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (sub_parse_file->parsed()) {
+        try {
+            return codetopo::run_parse_file(pf_file, pf_lang, pf_root,
+                                             pf_max_symbols, pf_max_depth);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;

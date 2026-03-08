@@ -5,9 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Enable async exception handling on MSVC for SEH-to-C++ translation
 if(MSVC)
-    add_compile_options(/EHa)
+    add_compile_options(/EHsc)
 endif()
 
 # --- Dependencies via vcpkg / find_package ---
@@ -352,7 +351,6 @@ endif()
 file(GLOB_RECURSE CODETOPO_SOURCES
     src/*.cpp
 )
-
 add_executable(codetopo ${CODETOPO_SOURCES})
 
 target_include_directories(codetopo PRIVATE
@@ -398,7 +396,6 @@ file(GLOB_RECURSE LIB_SOURCES
     src/*.cpp
 )
 list(FILTER LIB_SOURCES EXCLUDE REGEX "src/main\\.cpp$")
-
 add_executable(codetopo_tests ${TEST_SOURCES} ${LIB_SOURCES})
 
 target_include_directories(codetopo_tests PRIVATE

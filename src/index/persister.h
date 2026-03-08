@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <ctime>
 #include <sstream>
@@ -16,6 +17,16 @@
 #include <iostream>
 
 namespace codetopo {
+
+// Result of parsing + extracting a single file (produced on worker threads).
+struct ParsedFile {
+    ScannedFile file;
+    ExtractionResult extraction;
+    std::string content_hash;
+    std::string parse_status;
+    std::string parse_error;
+    bool has_error = false;
+};
 
 // T039: Cross-file reference resolver (simplified: name-match only for v1)
 // T040: SQLite batch persister with per-file transactions and cascade
@@ -35,7 +46,16 @@ struct IndexProgress {
 
 class Persister {
 public:
-    explicit Persister(Connection& conn) : conn_(conn) {}
+    explicit Persister(Connection& conn) : conn_(conn) {
+        // Prepare all statements once — reused across all persist_file calls.
+        // SQLITE_STATIC is safe because we bind+step within the same scope
+        // where the source strings are alive.
+        prepare_statements();
+    }
+
+    ~Persister() {
+        finalize_statements();
+    }
 
     // --- Batch transaction management for bulk loading ---
     void begin_batch() {
@@ -55,12 +75,15 @@ public:
     }
 
     // Flush if batch_size reached. Call after each persist_file.
-    void flush_if_needed(int batch_size) {
+    // Returns true if a batch was committed.
+    bool flush_if_needed(int batch_size) {
         if (in_batch_ && ++batch_count_ >= batch_size) {
             conn_.exec("COMMIT");
             conn_.exec("BEGIN TRANSACTION");
             batch_count_ = 0;
+            return true;
         }
+        return false;
     }
 
     // T041: Delete files that no longer exist on disk
@@ -83,165 +106,187 @@ public:
         return count;
     }
 
-    // T040: Persist a single file's extraction results.
-    // When used with begin_batch/commit_batch, caller manages the transaction.
-    // When used standalone, wraps in its own transaction.
-    bool persist_file(const ScannedFile& file,
-                      const ExtractionResult& extraction,
-                      const std::string& content_hash,
-                      const std::string& parse_status,
-                      const std::string& parse_error = "") {
-        bool own_txn = !in_batch_;
-        if (own_txn) conn_.exec("BEGIN TRANSACTION");
+    // Symbol map built during persist — used for in-memory resolve.
+    // Avoids re-reading all symbols from DB after persist.
+    struct SymEntry { int64_t id; int64_t file_id; bool is_def; };
+    std::unordered_map<std::string, SymEntry> sym_map_;
+    // file path → file_node_id, built during persist
+    std::unordered_map<std::string, int64_t> file_node_map_;
+    // file path → file_id
+    std::unordered_map<std::string, int64_t> file_id_map_;
 
-        try {
-            // Delete existing file record (cascades to nodes → edges, refs)
-            {
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "DELETE FROM files WHERE path = ?", -1, &stmt, nullptr);
-                sqlite3_bind_text(stmt, 1, file.relative_path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-            }
+    // Refs collected during persist for post-persist resolve
+    struct PendingRef { std::string file_path; std::string kind; std::string name; };
+    std::vector<PendingRef> pending_refs_;
 
-            // Insert file record
+    void reserve_maps(size_t file_count) {
+        sym_map_.reserve(file_count * 30);
+        file_node_map_.reserve(file_count);
+        file_id_map_.reserve(file_count);
+        pending_refs_.reserve(file_count * 20);
+    }
+
+    // Next auto-increment IDs (pre-assigned, not from SQLite)
+    int64_t next_file_id_ = 1;
+    int64_t next_node_id_ = 1;
+
+    // Initialize ID counters from existing DB (for incremental mode)
+    void init_id_counters() {
+        sqlite3_stmt* s = nullptr;
+        sqlite3_prepare_v2(conn_.raw(), "SELECT COALESCE(MAX(id),0)+1 FROM files", -1, &s, nullptr);
+        if (sqlite3_step(s) == SQLITE_ROW) next_file_id_ = sqlite3_column_int64(s, 0);
+        sqlite3_finalize(s);
+        sqlite3_prepare_v2(conn_.raw(), "SELECT COALESCE(MAX(id),0)+1 FROM nodes", -1, &s, nullptr);
+        if (sqlite3_step(s) == SQLITE_ROW) next_node_id_ = sqlite3_column_int64(s, 0);
+        sqlite3_finalize(s);
+    }
+
+    // Batch persist: pre-assign IDs, build large INSERT statements, execute few times.
+    // Processes a vector of ParsedFiles in one shot.
+    void batch_persist(std::vector<ParsedFile>& files, int& err_count) {
+        static const std::unordered_set<std::string> skip_kinds = {
+            "variable", "field", "macro", "property"
+        };
+
+        // Pre-assign all IDs and populate maps
+        struct FileEntry {
             int64_t file_id;
-            {
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-                sqlite3_bind_text(stmt, 1, file.relative_path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, file.language.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(stmt, 3, file.size_bytes);
-                sqlite3_bind_int64(stmt, 4, file.mtime_ns);
-                sqlite3_bind_text(stmt, 5, content_hash.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 6, parse_status.c_str(), -1, SQLITE_TRANSIENT);
-                if (parse_error.empty()) {
-                    sqlite3_bind_null(stmt, 7);
-                } else {
-                    sqlite3_bind_text(stmt, 7, parse_error.c_str(), -1, SQLITE_TRANSIENT);
-                }
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-                file_id = sqlite3_last_insert_rowid(conn_.raw());
-            }
-
-            // Insert file node
             int64_t file_node_id;
-            {
-                auto file_key = make_file_stable_key(file.relative_path);
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
-                    "VALUES('file', NULL, 'file', ?, ?)", -1, &stmt, nullptr);
-                sqlite3_bind_text(stmt, 1, file.relative_path.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, file_key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(stmt);
-                sqlite3_finalize(stmt);
-                file_node_id = sqlite3_last_insert_rowid(conn_.raw());
-            }
+            std::vector<int64_t> symbol_ids; // -1 for skipped
+            int pf_idx;
+        };
+        std::vector<FileEntry> entries;
+        entries.reserve(files.size());
 
-            // Insert symbol nodes
-            std::vector<int64_t> symbol_ids;
-            {
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
-                    "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
-                    "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
+        for (int i = 0; i < static_cast<int>(files.size()); ++i) {
+            auto& pf = files[i];
+            if (pf.parse_status == "skipped" && pf.extraction.symbols.empty()) continue;
 
-                for (const auto& sym : extraction.symbols) {
-                    sqlite3_reset(stmt);
-                    sqlite3_bind_int64(stmt, 1, file_id);
-                    sqlite3_bind_text(stmt, 2, sym.kind.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 3, sym.name.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 4, sym.qualname.c_str(), -1, SQLITE_TRANSIENT);
-                    if (sym.signature.empty()) sqlite3_bind_null(stmt, 5);
-                    else sqlite3_bind_text(stmt, 5, sym.signature.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(stmt, 6, sym.start_line);
-                    sqlite3_bind_int(stmt, 7, sym.start_col);
-                    sqlite3_bind_int(stmt, 8, sym.end_line);
-                    sqlite3_bind_int(stmt, 9, sym.end_col);
-                    sqlite3_bind_int(stmt, 10, sym.is_definition ? 1 : 0);
-                    if (sym.visibility.empty()) sqlite3_bind_null(stmt, 11);
-                    else sqlite3_bind_text(stmt, 11, sym.visibility.c_str(), -1, SQLITE_TRANSIENT);
-                    if (sym.doc.empty()) sqlite3_bind_null(stmt, 12);
-                    else sqlite3_bind_text(stmt, 12, sym.doc.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 13, sym.stable_key.c_str(), -1, SQLITE_TRANSIENT);
+            FileEntry fe;
+            fe.pf_idx = i;
+            fe.file_id = next_file_id_++;
+            fe.file_node_id = next_node_id_++;
 
-                    sqlite3_step(stmt);
-                    symbol_ids.push_back(sqlite3_last_insert_rowid(conn_.raw()));
+            file_id_map_[pf.file.relative_path] = fe.file_id;
+            file_node_map_[pf.file.relative_path] = fe.file_node_id;
+
+            fe.symbol_ids.reserve(pf.extraction.symbols.size());
+            for (const auto& sym : pf.extraction.symbols) {
+                if (skip_kinds.count(sym.kind)) {
+                    fe.symbol_ids.push_back(-1);
+                } else {
+                    int64_t sid = next_node_id_++;
+                    fe.symbol_ids.push_back(sid);
+                    auto it = sym_map_.find(sym.name);
+                    if (it == sym_map_.end()) sym_map_[sym.name] = {sid, fe.file_id, sym.is_definition};
+                    else if (!it->second.is_def && sym.is_definition) it->second = {sid, fe.file_id, sym.is_definition};
                 }
-                sqlite3_finalize(stmt);
             }
 
-            // Insert refs
-            {
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-
-                for (const auto& ref : extraction.refs) {
-                    sqlite3_reset(stmt);
-                    sqlite3_bind_int64(stmt, 1, file_id);
-                    sqlite3_bind_text(stmt, 2, ref.kind.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(stmt, 3, ref.name.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int(stmt, 4, ref.start_line);
-                    sqlite3_bind_int(stmt, 5, ref.start_col);
-                    sqlite3_bind_int(stmt, 6, ref.end_line);
-                    sqlite3_bind_int(stmt, 7, ref.end_col);
-                    if (ref.evidence.empty()) sqlite3_bind_null(stmt, 8);
-                    else sqlite3_bind_text(stmt, 8, ref.evidence.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_step(stmt);
-                }
-                sqlite3_finalize(stmt);
+            // Collect refs
+            for (const auto& ref : pf.extraction.refs) {
+                if (ref.kind == "call" || ref.kind == "inherit")
+                    pending_refs_.push_back({pf.file.relative_path, ref.kind, ref.name});
             }
 
-            // Insert edges (containment: file_node → symbol)
-            {
-                sqlite3_stmt* stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-                    "VALUES(?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-
-                for (const auto& edge : extraction.edges) {
-                    int64_t src_id = (edge.src_index < 0) ? file_node_id : symbol_ids[edge.src_index];
-                    int64_t dst_id;
-
-                    if (edge.dst_index >= 0 && edge.dst_index < static_cast<int>(symbol_ids.size())) {
-                        dst_id = symbol_ids[edge.dst_index];
-                    } else {
-                        continue;  // Unresolved cross-file edge — skip for now
-                    }
-
-                    if (edge.confidence < 0.3) continue;  // FR-044
-
-                    sqlite3_reset(stmt);
-                    sqlite3_bind_int64(stmt, 1, src_id);
-                    sqlite3_bind_int64(stmt, 2, dst_id);
-                    sqlite3_bind_text(stmt, 3, edge.kind.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_double(stmt, 4, edge.confidence);
-                    if (edge.evidence.empty()) sqlite3_bind_null(stmt, 5);
-                    else sqlite3_bind_text(stmt, 5, edge.evidence.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_step(stmt);
-                }
-                sqlite3_finalize(stmt);
-            }
-
-            if (own_txn) conn_.exec("COMMIT");
-            return true;
-
-        } catch (...) {
-            if (own_txn || in_batch_) {
-                conn_.exec("ROLLBACK");
-                in_batch_ = false;
-                batch_count_ = 0;
-            }
-            return false;
+            if (pf.has_error) ++err_count;
+            entries.push_back(std::move(fe));
         }
+
+        // Now batch INSERT into SQLite using prepared statements with explicit IDs
+        // Files table
+        {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "INSERT INTO files(id,path,language,size_bytes,mtime_ns,content_hash,parse_status,parse_error) "
+                "VALUES(?,?,?,?,?,?,?,?)", -1, &s, nullptr);
+            for (auto& fe : entries) {
+                auto& pf = files[fe.pf_idx];
+                sqlite3_reset(s);
+                sqlite3_bind_int64(s, 1, fe.file_id);
+                sqlite3_bind_text(s, 2, pf.file.relative_path.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(s, 3, pf.file.language.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(s, 4, pf.file.size_bytes);
+                sqlite3_bind_int64(s, 5, pf.file.mtime_ns);
+                sqlite3_bind_text(s, 6, pf.content_hash.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(s, 7, pf.parse_status.c_str(), -1, SQLITE_STATIC);
+                if (pf.parse_error.empty()) sqlite3_bind_null(s, 8);
+                else sqlite3_bind_text(s, 8, pf.parse_error.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(s);
+            }
+            sqlite3_finalize(s);
+        }
+
+        // File nodes
+        {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
+                "VALUES(?,'file',NULL,'file',?,?)", -1, &s, nullptr);
+            for (auto& fe : entries) {
+                auto& pf = files[fe.pf_idx];
+                auto fk = make_file_stable_key(pf.file.relative_path);
+                sqlite3_reset(s);
+                sqlite3_bind_int64(s, 1, fe.file_node_id);
+                sqlite3_bind_text(s, 2, pf.file.relative_path.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(s, 3, fk.c_str(), -1, SQLITE_STATIC);
+                sqlite3_step(s);
+            }
+            sqlite3_finalize(s);
+        }
+
+        // Symbol nodes — all files' symbols in one loop with one prepared statement
+        {
+            sqlite3_stmt* s = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "INSERT INTO nodes(id,node_type,file_id,kind,name,qualname,signature,"
+                "start_line,start_col,end_line,end_col,is_definition,visibility,doc,stable_key) "
+                "VALUES(?,'symbol',?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &s, nullptr);
+            for (auto& fe : entries) {
+                auto& pf = files[fe.pf_idx];
+                for (size_t si = 0; si < pf.extraction.symbols.size(); ++si) {
+                    if (fe.symbol_ids[si] < 0) continue;
+                    auto& sym = pf.extraction.symbols[si];
+                    sqlite3_reset(s);
+                    sqlite3_bind_int64(s, 1, fe.symbol_ids[si]);
+                    sqlite3_bind_int64(s, 2, fe.file_id);
+                    sqlite3_bind_text(s, 3, sym.kind.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(s, 4, sym.name.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(s, 5, sym.qualname.c_str(), -1, SQLITE_STATIC);
+                    if (sym.signature.empty()) sqlite3_bind_null(s, 6);
+                    else sqlite3_bind_text(s, 6, sym.signature.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_int(s, 7, sym.start_line);
+                    sqlite3_bind_int(s, 8, sym.start_col);
+                    sqlite3_bind_int(s, 9, sym.end_line);
+                    sqlite3_bind_int(s, 10, sym.end_col);
+                    sqlite3_bind_int(s, 11, sym.is_definition ? 1 : 0);
+                    if (sym.visibility.empty()) sqlite3_bind_null(s, 12);
+                    else sqlite3_bind_text(s, 12, sym.visibility.c_str(), -1, SQLITE_STATIC);
+                    if (sym.doc.empty()) sqlite3_bind_null(s, 13);
+                    else sqlite3_bind_text(s, 13, sym.doc.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(s, 14, sym.stable_key.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_step(s);
+                }
+            }
+            sqlite3_finalize(s);
+        }
+    }
+
+    // Legacy single-file persist (for watch mode, tests, suspect files)
+    bool persist_file(const ScannedFile& file, const ExtractionResult& extraction,
+                      const std::string& content_hash, const std::string& parse_status,
+                      const std::string& parse_error = "") {
+        ParsedFile pf;
+        pf.file = file;
+        pf.extraction = extraction;
+        pf.content_hash = content_hash;
+        pf.parse_status = parse_status;
+        pf.parse_error = parse_error;
+        std::vector<ParsedFile> vec;
+        vec.push_back(std::move(pf));
+        int err = 0;
+        batch_persist(vec, err);
+        return true;
     }
 
     // T049: Write kv metadata
@@ -495,6 +540,44 @@ private:
     Connection& conn_;
     bool in_batch_ = false;
     int batch_count_ = 0;
+
+    // Pre-prepared statements — created once, reused for all files
+    sqlite3_stmt* stmt_delete_file_ = nullptr;
+    sqlite3_stmt* stmt_insert_file_ = nullptr;
+    sqlite3_stmt* stmt_insert_file_node_ = nullptr;
+    sqlite3_stmt* stmt_insert_symbol_ = nullptr;
+    sqlite3_stmt* stmt_insert_ref_ = nullptr;
+    sqlite3_stmt* stmt_insert_edge_ = nullptr;
+
+    void prepare_statements() {
+        sqlite3_prepare_v2(conn_.raw(),
+            "DELETE FROM files WHERE path = ?", -1, &stmt_delete_file_, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_file_, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
+            "VALUES('file', NULL, 'file', ?, ?)", -1, &stmt_insert_file_node_, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
+            "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
+            "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_symbol_, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_ref_, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
+            "VALUES(?, ?, ?, ?, ?)", -1, &stmt_insert_edge_, nullptr);
+    }
+
+    void finalize_statements() {
+        if (stmt_delete_file_) sqlite3_finalize(stmt_delete_file_);
+        if (stmt_insert_file_) sqlite3_finalize(stmt_insert_file_);
+        if (stmt_insert_file_node_) sqlite3_finalize(stmt_insert_file_node_);
+        if (stmt_insert_symbol_) sqlite3_finalize(stmt_insert_symbol_);
+        if (stmt_insert_ref_) sqlite3_finalize(stmt_insert_ref_);
+        if (stmt_insert_edge_) sqlite3_finalize(stmt_insert_edge_);
+    }
 };
 
 } // namespace codetopo

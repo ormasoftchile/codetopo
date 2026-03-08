@@ -3,10 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
 #include <vector>
+#include <string>
 
 namespace codetopo {
 
@@ -74,6 +72,7 @@ public:
     size_t used() const { return offset_; }
     size_t remaining() const { return capacity_ - offset_; }
     bool overflowed() const { return false; }  // We return nullptr on overflow
+    uint8_t* buffer_start() { return buffer_; }
 
 private:
     uint8_t* buffer_;
