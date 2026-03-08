@@ -43,8 +43,12 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
         R"J({"type":"object","properties":{}})J");
 
     server.register_tool("symbol_search", tools::symbol_search,
-        "Search for symbols (functions, classes, macros, variables) by name. Returns node_id, kind, name, file_path, span. Use the node_id in other tools like context_for, callers_approx, impact_of.",
-        R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for"},"limit":{"type":"integer","description":"Max results (default 50)"}},"required":["query"])J");
+        "Search for symbols (functions, classes, macros, variables) by name. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns node_id, kind, name, file_path, span. Use the node_id in other tools like context_for, callers_approx, impact_of.",
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for. Use '*' to list all (combine with kind filter)"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, etc."},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["query"]})J");
+
+    server.register_tool("symbol_list", tools::symbol_list,
+        "List and filter symbols without full-text search. Supports filtering by kind (class, struct, function, variable, etc.), file_path, and name_glob (SQLite GLOB pattern). Ideal for enumerating all classes, all structs, or all symbols in a file.",
+        R"J({"type":"object","properties":{"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, macro, etc."},"file_path":{"type":"string","description":"Filter to symbols in this file (relative path)"},"name_glob":{"type":"string","description":"SQLite GLOB pattern for symbol name (e.g. 'Get*', '*Handler')"},"limit":{"type":"integer","description":"Max results (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":[]})J");
 
     server.register_tool("symbol_get", tools::symbol_get,
         "Get detailed information about a specific symbol by node_id, including source code snippet.",
@@ -122,6 +126,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"server_info", tools::server_info},
         {"repo_stats", tools::repo_stats},
         {"symbol_search", tools::symbol_search},
+        {"symbol_list", tools::symbol_list},
         {"symbol_get", tools::symbol_get},
         {"symbol_get_batch", tools::symbol_get_batch},
         {"callers_approx", tools::callers_approx},
