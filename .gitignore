@@ -1,6 +1,7 @@
 # Build output
 build/
 out/
+dist/
 cmake-build-*/
 
 # IDE
@@ -77,3 +78,6 @@ image.png
 
 # Environment
 .env*
+
+# codetopo index (auto-generated)
+.codetopo/

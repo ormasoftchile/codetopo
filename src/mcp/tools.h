@@ -97,33 +97,130 @@ inline std::string symbol_search(yyjson_val* params, Connection& conn,
 
     if (limit > 500) limit = 500;
 
-    // Build FTS5 query: quote the term for exact prefix match on name column
-    // Using name: prefix to target only the name column (fastest)
-    std::string fts_query = "name: \"" + std::string(query) + "\"*";
+    // When query is "*" or empty, skip FTS and query nodes table directly
+    bool wildcard = (strcmp(query, "*") == 0 || strlen(query) == 0);
 
     sqlite3_stmt* stmt = nullptr;
-    if (kind && strlen(kind) > 0) {
-        stmt = cache.get("symbol_search_kind",
-            "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-            "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-            "LEFT JOIN files f ON n.file_id = f.id "
-            "WHERE nodes_fts MATCH ? AND n.kind = ? "
-            "LIMIT ? OFFSET ?");
-    } else {
-        stmt = cache.get("symbol_search",
-            "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-            "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-            "LEFT JOIN files f ON n.file_id = f.id "
-            "WHERE nodes_fts MATCH ? "
-            "LIMIT ? OFFSET ?");
-    }
-
     int bind_idx = 1;
-    sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-    if (kind && strlen(kind) > 0) {
-        sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+
+    if (wildcard) {
+        // Direct table scan — no FTS needed
+        if (kind && strlen(kind) > 0) {
+            stmt = cache.get("symbol_search_wildcard_kind",
+                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+                "WHERE n.kind = ? "
+                "ORDER BY f.path, n.start_line "
+                "LIMIT ? OFFSET ?");
+            sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+        } else {
+            stmt = cache.get("symbol_search_wildcard",
+                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+                "ORDER BY f.path, n.start_line "
+                "LIMIT ? OFFSET ?");
+        }
+    } else {
+        // Build FTS5 query: quote the term for exact prefix match on name column
+        // Using name: prefix to target only the name column (fastest)
+        std::string fts_query = "name: \"" + std::string(query) + "\"*";
+
+        if (kind && strlen(kind) > 0) {
+            stmt = cache.get("symbol_search_kind",
+                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "LEFT JOIN files f ON n.file_id = f.id "
+                "WHERE nodes_fts MATCH ? AND n.kind = ? "
+                "LIMIT ? OFFSET ?");
+        } else {
+            stmt = cache.get("symbol_search",
+                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "LEFT JOIN files f ON n.file_id = f.id "
+                "WHERE nodes_fts MATCH ? "
+                "LIMIT ? OFFSET ?");
+        }
+
+        sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+        if (kind && strlen(kind) > 0) {
+            sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+        }
     }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);  // +1 to detect has_more
+    sqlite3_bind_int64(stmt, bind_idx++, offset);
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    auto* results = doc.new_arr();
+
+    int count = 0;
+    bool has_more = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
+        if (count == limit) { has_more = true; break; }
+        count++;
+
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+        auto* qn = sqlite3_column_text(stmt, 3);
+        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
+        auto* fp = sqlite3_column_text(stmt, 4);
+        if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
+
+        auto* span = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
+        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 6));
+        yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+
+        yyjson_mut_arr_append(results, item);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
+
+    return doc.to_string();
+}
+
+// T062b: symbol_list — list/filter symbols without FTS, supports kind, file, and name-glob filters
+inline std::string symbol_list(yyjson_val* params, Connection& conn,
+                               QueryCache& cache, const std::string& /*repo_root*/) {
+    const char* kind = params ? json_get_str(params, "kind") : nullptr;
+    const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
+    const char* name_glob = params ? json_get_str(params, "name_glob") : nullptr;
+    int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
+    int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+
+    if (limit > 2000) limit = 2000;
+
+    // Build SQL dynamically based on which filters are provided
+    std::string sql =
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE 1=1";
+
+    if (kind && strlen(kind) > 0)       sql += " AND n.kind = ?";
+    if (file_path && strlen(file_path) > 0) sql += " AND f.path = ?";
+    if (name_glob && strlen(name_glob) > 0) sql += " AND n.name GLOB ?";
+    sql += " ORDER BY f.path, n.start_line LIMIT ? OFFSET ?";
+
+    // Use a cache key that encodes which filters are active
+    std::string cache_key = "symbol_list";
+    if (kind && strlen(kind) > 0) cache_key += "_k";
+    if (file_path && strlen(file_path) > 0) cache_key += "_f";
+    if (name_glob && strlen(name_glob) > 0) cache_key += "_g";
+
+    auto* stmt = cache.get(cache_key, sql);
+    int bind_idx = 1;
+    if (kind && strlen(kind) > 0)
+        sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+    if (file_path && strlen(file_path) > 0)
+        sqlite3_bind_text(stmt, bind_idx++, file_path, -1, SQLITE_TRANSIENT);
+    if (name_glob && strlen(name_glob) > 0)
+        sqlite3_bind_text(stmt, bind_idx++, name_glob, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
     JsonMutDoc doc;
