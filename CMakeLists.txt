@@ -1,4 +1,43 @@
 cmake_minimum_required(VERSION 3.20)
+
+# --- Auto-bootstrap vcpkg when no toolchain file is provided ---
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    if(DEFINED ENV{VCPKG_ROOT})
+        set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            CACHE STRING "Vcpkg toolchain file")
+    else()
+        set(_VCPKG_DIR "${CMAKE_SOURCE_DIR}/vcpkg")
+        if(NOT EXISTS "${_VCPKG_DIR}/scripts/buildsystems/vcpkg.cmake")
+            message(STATUS "vcpkg not found — cloning into ${_VCPKG_DIR}...")
+            find_package(Git REQUIRED)
+            execute_process(
+                COMMAND ${GIT_EXECUTABLE} clone --filter=blob:none
+                    https://github.com/microsoft/vcpkg.git "${_VCPKG_DIR}"
+                RESULT_VARIABLE _vcpkg_clone_result
+            )
+            if(NOT _vcpkg_clone_result EQUAL 0)
+                message(FATAL_ERROR "Failed to clone vcpkg. Check your network connection.")
+            endif()
+            message(STATUS "Bootstrapping vcpkg...")
+            if(WIN32)
+                set(_VCPKG_BOOTSTRAP "${_VCPKG_DIR}/bootstrap-vcpkg.bat")
+            else()
+                set(_VCPKG_BOOTSTRAP "${_VCPKG_DIR}/bootstrap-vcpkg.sh")
+            endif()
+            execute_process(
+                COMMAND "${_VCPKG_BOOTSTRAP}" -disableMetrics
+                WORKING_DIRECTORY "${_VCPKG_DIR}"
+                RESULT_VARIABLE _vcpkg_bs_result
+            )
+            if(NOT _vcpkg_bs_result EQUAL 0)
+                message(FATAL_ERROR "Failed to bootstrap vcpkg.")
+            endif()
+        endif()
+        set(CMAKE_TOOLCHAIN_FILE "${_VCPKG_DIR}/scripts/buildsystems/vcpkg.cmake"
+            CACHE STRING "Vcpkg toolchain file")
+    endif()
+endif()
+
 project(codetopo VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
