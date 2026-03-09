@@ -20,12 +20,21 @@
 namespace codetopo {
 namespace fs = std::filesystem;
 
-enum class FileEvent { Created, Modified, Deleted };
+enum class FileEvent { Created, Modified, Deleted, BranchSwitch };
 
 struct WatchEvent {
     FileEvent type;
     fs::path path;
 };
+
+// Detect .git/HEAD or .git/refs/ changes (branch switch indicators).
+// The watcher is not git-aware — it just classifies these paths specially.
+// The callback consumer interprets the meaning.
+inline bool is_git_head_change(const fs::path& p) {
+    auto s = p.generic_string();
+    return s.find(".git/HEAD") != std::string::npos
+        || s.find(".git/refs/") != std::string::npos;
+}
 
 using WatchCallback = std::function<void(const std::vector<WatchEvent>&)>;
 
@@ -133,6 +142,12 @@ private:
                     reinterpret_cast<char*>(info) + info->NextEntryOffset);
             }
 
+            // Classify .git/HEAD and .git/refs/ changes as branch switches
+            for (auto& ev : events) {
+                if (is_git_head_change(ev.path))
+                    ev.type = FileEvent::BranchSwitch;
+            }
+
             // Debounce: wait for more events before dispatching
             std::this_thread::sleep_for(debounce_);
 
@@ -164,6 +179,25 @@ private:
             std::vector<WatchEvent> events;
             std::unordered_set<std::string> current_files;
 
+            // Explicit .git/HEAD stat check for branch switch detection
+            {
+                auto git_head = root_ / ".git" / "HEAD";
+                std::error_code ec2;
+                if (fs::exists(git_head, ec2)) {
+                    auto mtime = fs::last_write_time(git_head, ec2);
+                    if (!ec2) {
+                        auto key = git_head.string();
+                        auto it = known_files.find(key);
+                        if (it != known_files.end() && it->second != mtime) {
+                            events.push_back({FileEvent::BranchSwitch, git_head});
+                            it->second = mtime;
+                        } else if (it == known_files.end()) {
+                            known_files[key] = mtime;
+                        }
+                    }
+                }
+            }
+
             for (auto& entry : fs::recursive_directory_iterator(root_, ec)) {
                 if (!entry.is_regular_file(ec)) continue;
                 auto path_str = entry.path().string();
@@ -188,6 +222,12 @@ private:
                 } else {
                     ++it;
                 }
+            }
+
+            // Classify .git/HEAD and .git/refs/ changes as branch switches
+            for (auto& ev : events) {
+                if (is_git_head_change(ev.path))
+                    ev.type = FileEvent::BranchSwitch;
             }
 
             if (!events.empty() && running_.load()) {
