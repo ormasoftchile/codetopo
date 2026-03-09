@@ -7,6 +7,8 @@
 
 namespace codetopo {
 
+enum class FreshnessPolicy { eager, normal, lazy, off };
+
 struct Config {
     // Indexer settings
     std::filesystem::path repo_root = ".";
@@ -24,6 +26,8 @@ struct Config {
     // MCP server settings
     int tool_timeout_s = 10;
     int idle_timeout_s = 1800;  // 30 minutes
+    FreshnessPolicy freshness = FreshnessPolicy::normal;
+    int debounce_ms = 1000;
 
     // Logging settings
     int64_t log_max_size_bytes = 50 * 1024 * 1024;  // 50 MB

@@ -1,9 +1,11 @@
 #pragma once
 
 #include "db/connection.h"
+#include "index/scanner.h"
 #include <string>
 #include <unordered_set>
 #include <ctime>
+#include <vector>
 
 namespace codetopo {
 
@@ -271,6 +273,54 @@ inline int quarantine_count(Connection& conn) {
     if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
     sqlite3_finalize(stmt);
     return count;
+}
+
+// Rehabilitate quarantined files whose content has changed (e.g. after branch switch).
+// Returns count of files removed from quarantine.
+inline int rehab_quarantine(Connection& conn, const std::vector<ScannedFile>& scanned) {
+    auto quarantined = load_quarantine(conn);
+    if (quarantined.empty()) return 0;
+
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(conn.raw(),
+        "SELECT path, mtime_ns, size_bytes FROM files WHERE path = ?",
+        -1, &stmt, nullptr);
+
+    std::vector<std::string> rehab_paths;
+
+    for (const auto& file : scanned) {
+        if (!quarantined.count(file.relative_path)) continue;
+
+        sqlite3_reset(stmt);
+        sqlite3_bind_text(stmt, 1, file.relative_path.c_str(), -1, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t old_mtime = sqlite3_column_int64(stmt, 1);
+            int64_t old_size = sqlite3_column_int64(stmt, 2);
+
+            if (old_mtime != file.mtime_ns || old_size != file.size_bytes) {
+                rehab_paths.push_back(file.relative_path);
+            }
+        } else {
+            // File not in DB (new on this branch) — rehab
+            rehab_paths.push_back(file.relative_path);
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (!rehab_paths.empty()) {
+        sqlite3_stmt* del = nullptr;
+        sqlite3_prepare_v2(conn.raw(),
+            "DELETE FROM quarantine WHERE path = ?", -1, &del, nullptr);
+        for (const auto& path : rehab_paths) {
+            sqlite3_reset(del);
+            sqlite3_bind_text(del, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(del);
+        }
+        sqlite3_finalize(del);
+    }
+
+    return static_cast<int>(rehab_paths.size());
 }
 
 } // namespace schema

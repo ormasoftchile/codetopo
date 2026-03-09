@@ -23,6 +23,14 @@ public:
     QueryCache(const QueryCache&) = delete;
     QueryCache& operator=(const QueryCache&) = delete;
 
+    // Invalidate all cached prepared statements (e.g. after re-index).
+    void clear() {
+        for (auto& [key, stmt] : cache_) {
+            sqlite3_finalize(stmt);
+        }
+        cache_.clear();
+    }
+
     // Get or prepare a statement. Resets it if already prepared.
     sqlite3_stmt* get(const std::string& name, const std::string& sql) {
         auto it = cache_.find(name);
