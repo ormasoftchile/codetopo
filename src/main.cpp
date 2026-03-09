@@ -5,37 +5,12 @@
 #include <fstream>
 #include "core/config.h"
 #include "cli/cmd_index.h"
+#include "cli/cmd_init.h"
 #include "cli/cmd_mcp.h"
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
 #include "index/supervisor.h"
-
-// Resolve default db path: <root>/.codetopo/index.sqlite
-static std::string default_db(const std::string& root) {
-    return (std::filesystem::path(root) / ".codetopo" / "index.sqlite").string();
-}
-
-// Create .codetopo/ dir and auto-add to .gitignore
-static void ensure_codetopo_dir(const std::string& root) {
-    namespace fs = std::filesystem;
-    auto dir = fs::path(root) / ".codetopo";
-    if (!fs::exists(dir)) fs::create_directories(dir);
-
-    auto gitignore = fs::path(root) / ".gitignore";
-    bool needs = true;
-    if (fs::exists(gitignore)) {
-        std::ifstream fin(gitignore);
-        std::string line;
-        while (std::getline(fin, line)) {
-            while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
-            if (line == ".codetopo/" || line == ".codetopo") { needs = false; break; }
-        }
-    }
-    if (needs) {
-        std::ofstream fout(gitignore, std::ios::app);
-        if (fout) fout << "\n# codetopo index (auto-generated)\n.codetopo/\n";
-    }
-}
+#include "util/repo.h"
 
 int main(int argc, char** argv) {
     CLI::App app{"codetopo — local code graph indexer + MCP server"};
@@ -64,6 +39,27 @@ int main(int argc, char** argv) {
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
+
+    // --- init subcommand ---
+    auto* sub_init = app.add_subcommand("init", "Index a repository and configure editors for MCP");
+    std::string init_root = ".";
+    std::string init_editors = "auto";
+    int init_threads = 0;
+    int init_arena_size = 128;
+    int init_max_file_size = 10;
+    bool init_watch = true;
+    std::string init_freshness = "normal";
+
+    sub_init->add_option("--root", init_root, "Repository root directory")->default_val(".");
+    sub_init->add_option("--editors", init_editors,
+        "Comma-separated editors: vscode,cursor,windsurf,claude,auto")->default_val("auto");
+    sub_init->add_option("--threads", init_threads, "Worker thread count (0=auto)")->default_val(0);
+    sub_init->add_option("--arena-size", init_arena_size, "Arena size in MB per thread")->default_val(128);
+    sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in MB")->default_val(10);
+    sub_init->add_flag("--watch,!--no-watch", init_watch,
+        "Include --watch in MCP config (default: true)")->default_val(true);
+    sub_init->add_option("--freshness", init_freshness,
+        "Freshness policy for MCP config: eager|normal|lazy|off")->default_val("normal");
 
     // --- mcp subcommand ---
     auto* sub_mcp = app.add_subcommand("mcp", "Start MCP server over stdio");
@@ -120,8 +116,8 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     if (sub_index->parsed()) {
-        if (index_db.empty()) index_db = default_db(index_root);
-        ensure_codetopo_dir(index_root);
+        if (index_db.empty()) index_db = codetopo::default_db(index_root);
+        codetopo::ensure_codetopo_dir(index_root);
         codetopo::Config cfg;
         cfg.repo_root = index_root;
         cfg.db_path = index_db;
@@ -146,8 +142,19 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (sub_init->parsed()) {
+        try {
+            return codetopo::run_init(init_root, init_editors,
+                                      init_threads, init_arena_size,
+                                      init_max_file_size,
+                                      init_watch, init_freshness);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
     if (sub_mcp->parsed()) {
-        if (mcp_db.empty()) mcp_db = default_db(mcp_root);
+        if (mcp_db.empty()) mcp_db = codetopo::default_db(mcp_root);
 
         // R9: Parse freshness policy string
         codetopo::FreshnessPolicy freshness = codetopo::FreshnessPolicy::normal;
@@ -166,7 +173,7 @@ int main(int argc, char** argv) {
         }
     }
     if (sub_watch->parsed()) {
-        if (watch_db.empty()) watch_db = default_db(watch_root);
+        if (watch_db.empty()) watch_db = codetopo::default_db(watch_root);
         try {
             return codetopo::run_watch(watch_root, watch_db);
         } catch (const std::exception& e) {
@@ -175,7 +182,7 @@ int main(int argc, char** argv) {
         }
     }
     if (sub_query->parsed()) {
-        if (query_db.empty()) query_db = default_db(query_root);
+        if (query_db.empty()) query_db = codetopo::default_db(query_root);
         try {
             return codetopo::run_query(query_db, query_tool, query_params);
         } catch (const std::exception& e) {
@@ -184,7 +191,7 @@ int main(int argc, char** argv) {
         }
     }
     if (sub_doctor->parsed()) {
-        if (doctor_db.empty()) doctor_db = default_db(doctor_root);
+        if (doctor_db.empty()) doctor_db = codetopo::default_db(doctor_root);
         try {
             return codetopo::run_doctor(doctor_db);
         } catch (const std::exception& e) {
