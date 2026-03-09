@@ -15,6 +15,7 @@
 #include "index/extractor.h"
 #include "index/persister.h"
 #include "util/hash.h"
+#include "util/git.h"
 #include "util/lock.h"
 #include <iostream>
 #include <mutex>
@@ -119,6 +120,21 @@ int run_index(const Config& config) {
     std::cerr << "New: " << changes.new_files.size()
               << " Changed: " << changes.changed_files.size()
               << " Deleted: " << changes.deleted_paths.size() << "\n";
+
+    // R7: Quarantine rehab on branch switch — give quarantined files another
+    // chance if the git HEAD changed (content may differ on the new branch).
+    auto old_head = schema::get_kv(conn, "git_head", "");
+    auto new_head = get_git_head(repo_root.string());
+    bool head_changed = (!old_head.empty() && !new_head.empty() && old_head != new_head);
+
+    if (head_changed) {
+        int rehabbed = schema::rehab_quarantine(conn, scanned_files);
+        if (rehabbed > 0) {
+            std::cerr << "Quarantine rehab: " << rehabbed
+                      << " file(s) given another chance after branch switch\n";
+            quarantined = schema::load_quarantine(conn);  // Refresh after rehab
+        }
+    }
 
     // Prune deleted files (T041)
     Persister persister(conn);

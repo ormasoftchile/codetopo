@@ -4,6 +4,7 @@
 #include "index/extractor.h"
 #include "index/scanner.h"
 #include "util/hash.h"
+#include "util/git.h"
 #include "db/schema.h"
 #include <sqlite3.h>
 #include <string>
@@ -262,6 +263,11 @@ public:
         schema::set_kv(conn_, "repo_root", repo_root);
         schema::set_kv(conn_, "last_index_time", time_ss.str());
         schema::set_kv(conn_, "language_coverage", "c,cpp,csharp,typescript,go,yaml");
+
+        auto head = get_git_head(repo_root);
+        auto branch = get_git_branch(repo_root);
+        if (!head.empty()) schema::set_kv(conn_, "git_head", head);
+        if (!branch.empty()) schema::set_kv(conn_, "git_branch", branch);
     }
 
     // T039: Post-index cross-file reference resolution.

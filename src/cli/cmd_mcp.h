@@ -5,13 +5,57 @@
 #include "db/schema.h"
 #include "mcp/server.h"
 #include "mcp/tools.h"
+#include "util/process.h"
+#include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
+#include <thread>
+#include <atomic>
+#include <functional>
+#include <memory>
 
 namespace codetopo {
 
+// R8: Manages a spawned child indexer — deduplicates rapid triggers, monitors completion.
+struct ReindexState {
+    std::atomic<bool> running{false};
+    std::atomic<bool> queued{false};
+    std::thread monitor_thread;
+
+    ~ReindexState() {
+        // Detached threads manage their own lifetime; if still joinable, detach.
+        if (monitor_thread.joinable()) monitor_thread.detach();
+    }
+
+    void trigger(const std::string& root, const std::string& db,
+                 std::function<void()> on_complete) {
+        if (running.exchange(true)) {
+            queued = true;  // collapse into next run
+            return;
+        }
+        if (monitor_thread.joinable()) monitor_thread.detach();
+        monitor_thread = std::thread([=, this]() {
+            do {
+                queued = false;
+                auto exe = get_self_executable_path();
+                int rc = spawn_and_wait(exe,
+                    {"index", "--root", root, "--db", db, "--supervised"});
+                if (rc == 0 && on_complete) on_complete();
+            } while (queued.load());
+            running = false;
+        });
+        monitor_thread.detach();
+    }
+};
+
 // T075: Wire cmd_mcp — start MCP server over stdio.
-inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeout) {
+// R8+R9: Updated to accept freshness policy and debounce, with startup reconciliation.
+// P2: --watch flag embeds filesystem watcher for auto-reindex.
+inline int run_mcp(const std::string& db_path, const std::string& root_hint,
+                   int tool_timeout, int idle_timeout,
+                   FreshnessPolicy freshness = FreshnessPolicy::normal,
+                   int debounce_ms = 1000,
+                   bool watch = false) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(db_path)) {
@@ -30,6 +74,36 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
     }
 
     auto repo_root = schema::get_kv(conn, "repo_root", ".");
+
+    // R8: Startup reconciliation — spawn codetopo index to catch up on missed changes.
+    // Behavior depends on freshness policy (R9):
+    //   eager:  block until child finishes — guaranteed fresh on first query
+    //   normal: spawn in background — first queries may be stale, fresh within seconds
+    //   lazy/off: skip startup reindex
+    ReindexState reindex;
+    if (freshness == FreshnessPolicy::eager) {
+        std::cerr << "Freshness=eager: blocking on startup reindex...\n";
+        auto exe = get_self_executable_path();
+        int rc = spawn_and_wait(exe,
+            {"index", "--root", repo_root, "--db", db_path, "--supervised"});
+        if (rc != 0) {
+            std::cerr << "WARNING: startup reindex exited with code " << rc << "\n";
+        }
+        // QueryCache is constructed fresh with the connection below, so no clear() needed.
+    } else if (freshness == FreshnessPolicy::normal) {
+        std::cerr << "Freshness=normal: background startup reindex...\n";
+        reindex.trigger(repo_root, db_path, [&]() {
+            // Note: The child wrote to the DB. Since we open conn read-only and
+            // SQLite WAL allows concurrent readers, the next query will pick up
+            // fresh data once the read transaction is renewed. QueryCache::clear()
+            // would help if the MCP held long-lived prepared statements across
+            // reindex boundaries — but the cache is per-Connection and the conn
+            // is opened once, so clearing is a no-op here. Future watch mode (P2)
+            // will need to integrate cache invalidation more tightly.
+            std::cerr << "Background reindex completed.\n";
+        });
+    }
+    // lazy and off: no startup reindex
 
     McpServer server(conn, repo_root, tool_timeout, idle_timeout);
 
@@ -110,8 +184,37 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
         "Find types that implement or inherit from a given base type/interface. Uses 'inherits' edges in the code graph.",
         R"J({"type":"object","properties":{"symbol":{"type":"string","description":"Name of the base type, interface, or trait to find implementations of"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}},"required":["symbol"]})J");
 
-    std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root << ")\n";
-    return server.run();
+    std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
+              << " freshness=" << static_cast<int>(freshness)
+              << " debounce=" << debounce_ms << "ms"
+              << " watch=" << (watch ? "on" : "off") << ")\n";
+
+    // P2: Start filesystem watcher for auto-reindex when --watch is enabled.
+    // The watcher fires on any file change; the child indexer handles filtering.
+    // Cross-thread contract: watcher thread -> reindex monitor thread -> atomic flag
+    //   -> main thread picks up flag before next tool dispatch.
+    std::unique_ptr<Watcher> watcher;
+    if (watch && freshness != FreshnessPolicy::off) {
+        auto debounce = std::chrono::milliseconds(debounce_ms);
+        watcher = std::make_unique<Watcher>(
+            repo_root,
+            [&](const std::vector<WatchEvent>& /*events*/) {
+                reindex.trigger(repo_root, db_path, [&]() {
+                    server.request_refresh();
+                    std::cerr << "Watcher-triggered reindex completed, cache invalidated.\n";
+                });
+            },
+            debounce
+        );
+        watcher->start();
+        std::cerr << "Filesystem watcher started (debounce=" << debounce_ms << "ms)\n";
+    }
+
+    int rc = server.run();
+
+    // Watcher::~Watcher() calls stop(), but be explicit about shutdown order.
+    if (watcher) watcher->stop();
+    return rc;
 }
 
 // T076: Wire cmd_query — CLI wrapper for tool invocations.
