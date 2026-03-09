@@ -125,6 +125,7 @@ set(CODETOPO_TEST_SOURCES
     tests/integration/test_crash_recovery.cpp
     tests/integration/test_doctor.cpp
     tests/integration/test_index_real_repo.cpp
+    tests/integration/test_mcp_enhancements.cpp
     tests/integration/test_mcp_round_trip.cpp
     tests/integration/test_watch.cpp
     tests/unit/test_change_detect.cpp
