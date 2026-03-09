@@ -34,6 +34,14 @@ StalenessState is mutex-free (single-threaded stdio loop). Stale notifications i
 **Status:** Established
 Tests use inner-scoped Connection objects + cleanup() helper to avoid WAL file locking on Windows. All DB tests using temp directories must follow this pattern.
 
+### DEC-009: BranchSwitch watcher design — filesystem-only detection (Anders, 2026-03-09)
+**Status:** Implemented, build verified
+`FileEvent::BranchSwitch` added to watcher.h. Detection is purely filesystem-based (path pattern matching on `.git/HEAD` and `.git/refs/`). Watcher does NOT import `git.h` — semantic interpretation belongs to the callback consumer. Quarantine rehab wired into cmd_index.cpp: after change detection and before pruning, compares stored `git_head` with current HEAD; on branch switch calls `rehab_quarantine()` and refreshes the in-memory quarantine set.
+
+### DEC-010: --watch MCP integration — atomic bool cross-thread bridge (Booch, 2026-03-09)
+**Status:** Implemented, build verified
+`--watch` CLI flag on the `mcp` subcommand embeds the filesystem watcher into the MCP server. Watcher triggers `ReindexState` child processes; on completion sets `std::atomic<bool>` that the main stdio loop checks before each tool dispatch to clear QueryCache. No mutexes — cross-thread communication entirely via atomics. Watcher lifecycle tied to `server.run()`.
+
 ## Governance
 
 - All meaningful changes require team consensus
