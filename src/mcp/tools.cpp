@@ -4,6 +4,7 @@
 #include "mcp/tools.h"
 
 #include "util/path.h"
+#include "util/git.h"
 #include "mcp/error.h"
 #include "db/schema.h"
 #include <sqlite3.h>
@@ -13,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <unordered_set>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +51,39 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
 
     yyjson_mut_obj_add_strcpy(doc.doc, root, "repo_root", repo_root.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "db_status", db_status.c_str());
+
+    // R5: Freshness metadata — indexed vs current git state
+    auto indexed_branch = schema::get_kv(conn, "git_branch", "");
+    auto indexed_commit = schema::get_kv(conn, "git_head", "");
+    auto current_branch = get_git_branch(repo_root);
+    auto current_commit = get_git_head(repo_root);
+    bool stale = !indexed_commit.empty() && indexed_commit != current_commit;
+
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "indexed_branch", indexed_branch.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "indexed_commit", indexed_commit.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "current_branch", current_branch.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "current_commit", current_commit.c_str());
+    yyjson_mut_obj_add_bool(doc.doc, root, "stale", stale);
+
+    // Compute index_age_seconds from last_index_time
+    int64_t index_age_seconds = -1;
+    if (!last_index.empty()) {
+        struct tm tm_parsed = {};
+        // Cross-platform ISO 8601 parse (strptime unavailable on MSVC)
+        if (sscanf(last_index.c_str(), "%d-%d-%dT%d:%d:%d",
+                   &tm_parsed.tm_year, &tm_parsed.tm_mon, &tm_parsed.tm_mday,
+                   &tm_parsed.tm_hour, &tm_parsed.tm_min, &tm_parsed.tm_sec) == 6) {
+            tm_parsed.tm_year -= 1900;
+            tm_parsed.tm_mon -= 1;
+            tm_parsed.tm_isdst = -1;
+            time_t indexed_time = mktime(&tm_parsed);
+            if (indexed_time != -1) {
+                time_t now = time(nullptr);
+                index_age_seconds = static_cast<int64_t>(difftime(now, indexed_time));
+            }
+        }
+    }
+    yyjson_mut_obj_add_int(doc.doc, root, "index_age_seconds", index_age_seconds);
 
     return doc.to_string();
 }

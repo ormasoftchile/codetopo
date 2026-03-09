@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/json.h"
+#include "util/git.h"
 #include "mcp/error.h"
 #include "db/connection.h"
 #include "db/schema.h"
@@ -11,6 +12,8 @@
 #include <iostream>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <atomic>
 
 namespace codetopo {
 
@@ -19,6 +22,15 @@ namespace codetopo {
 using ToolHandler = std::function<std::string(yyjson_val* params, Connection& conn,
                                                QueryCache& cache, const std::string& repo_root)>;
 
+// R2: Lightweight staleness state — stat() only on hot path, git process only on mtime change.
+struct StalenessState {
+    std::filesystem::file_time_type last_head_mtime{};
+    std::string indexed_head;
+    std::string indexed_branch;
+    bool stale = false;
+    std::string current_branch;
+};
+
 class McpServer {
 public:
     McpServer(Connection& conn, const std::string& repo_root,
@@ -26,6 +38,12 @@ public:
         : conn_(conn), repo_root_(repo_root)
         , tool_timeout_s_(tool_timeout_s), idle_timeout_s_(idle_timeout_s)
         , cache_(conn), start_time_(std::chrono::steady_clock::now()) {}
+
+    // P2: Thread-safe flag — set from watcher's reindex-complete callback,
+    // consumed on the main stdio thread before each tool dispatch.
+    void request_refresh() {
+        needs_refresh_.store(true);
+    }
 
     void register_tool(const std::string& name, ToolHandler handler,
                        const std::string& description = "",
@@ -111,6 +129,15 @@ public:
                     continue;
                 }
 
+                // P2: If watcher-triggered reindex completed, clear cached state
+                if (needs_refresh_.exchange(false)) {
+                    cache_.clear();
+                    staleness_.last_head_mtime = {};  // force re-read of git state
+                }
+
+                // R2: Per-request staleness check (cheap stat)
+                check_staleness();
+
                 auto it = tools_.find(tool_name);
                 if (it == tools_.end()) {
                     write_error(id, -32601, "invalid_input", std::string("Unknown tool: ") + tool_name);
@@ -125,7 +152,7 @@ public:
                         result = truncate_response(result);
                     }
 
-                    write_result(id, result);
+                    write_result(id, result, staleness_.stale ? &staleness_ : nullptr);
                 } catch (const std::exception& e) {
                     write_error(id, -32603, "db_error", e.what());
                 }
@@ -159,6 +186,8 @@ private:
     std::unordered_map<std::string, std::string> tool_descriptions_;
     std::unordered_map<std::string, std::string> tool_schemas_;
     bool initialized_ = false;
+    StalenessState staleness_;
+    std::atomic<bool> needs_refresh_{false};
 
     void handle_initialize(int64_t id) {
         JsonMutDoc doc;
@@ -235,7 +264,8 @@ private:
         json_write_line(doc.to_string());
     }
 
-    void write_result(int64_t id, const std::string& content_json) {
+    void write_result(int64_t id, const std::string& content_json,
+                       const StalenessState* staleness = nullptr) {
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
@@ -251,6 +281,20 @@ private:
         yyjson_mut_obj_add_strcpy(doc.doc, text_item, "text", content_json.c_str());
         yyjson_mut_arr_append(content_arr, text_item);
         yyjson_mut_obj_add_val(doc.doc, result, "content", content_arr);
+
+        // R2: Inject _meta with staleness info when index is stale
+        if (staleness) {
+            auto* meta = doc.new_obj();
+            yyjson_mut_obj_add_bool(doc.doc, meta, "stale", true);
+            yyjson_mut_obj_add_strcpy(doc.doc, meta, "indexed_branch",
+                                     staleness->indexed_branch.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, meta, "indexed_commit",
+                                     staleness->indexed_head.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, meta, "current_branch",
+                                     staleness->current_branch.c_str());
+            yyjson_mut_obj_add_val(doc.doc, result, "_meta", meta);
+        }
+
         yyjson_mut_obj_add_val(doc.doc, root, "result", result);
 
         json_write_line(doc.to_string());
@@ -274,6 +318,33 @@ private:
         yyjson_mut_obj_add_str(doc.doc, root, "truncated_reason", "response_size");
         yyjson_mut_obj_add_str(doc.doc, root, "message", "Response exceeded 512 KB limit");
         return doc.to_string();
+    }
+
+    // R2: Stat .git/HEAD to cheaply detect branch switches / new commits.
+    // Only spawns git processes when mtime has actually changed.
+    void check_staleness() {
+        namespace fs = std::filesystem;
+        auto head_path = fs::path(repo_root_) / ".git" / "HEAD";
+
+        std::error_code ec;
+        auto mtime = fs::last_write_time(head_path, ec);
+        if (ec) return;  // no .git/HEAD — not a git repo, skip
+
+        // Fast path: mtime unchanged since last check
+        if (mtime == staleness_.last_head_mtime) return;
+        staleness_.last_head_mtime = mtime;
+
+        // Mtime changed — read current git state (spawns git processes)
+        auto current_head = get_git_head(repo_root_);
+        staleness_.current_branch = get_git_branch(repo_root_);
+
+        // Read indexed state from DB
+        staleness_.indexed_head = schema::get_kv(conn_, "git_head", "");
+        staleness_.indexed_branch = schema::get_kv(conn_, "git_branch", "");
+
+        // Stale if indexed head is known and differs from current
+        staleness_.stale = !staleness_.indexed_head.empty()
+                        && staleness_.indexed_head != current_head;
     }
 };
 

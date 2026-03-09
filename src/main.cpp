@@ -77,6 +77,17 @@ int main(int argc, char** argv) {
     sub_mcp->add_option("--tool-timeout", mcp_tool_timeout, "Tool timeout in seconds")->default_val(10);
     sub_mcp->add_option("--idle-timeout", mcp_idle_timeout, "Idle timeout in seconds (0=disable)")->default_val(1800);
 
+    // R9: Freshness policy and debounce tuning
+    std::string mcp_freshness = "normal";
+    int mcp_debounce = 1000;
+    bool mcp_watch = false;
+    sub_mcp->add_option("--freshness", mcp_freshness,
+        "Index freshness policy: eager|normal|lazy|off")->default_val("normal");
+    sub_mcp->add_option("--debounce", mcp_debounce,
+        "Watcher debounce in ms")->default_val(1000);
+    sub_mcp->add_flag("--watch", mcp_watch,
+        "Enable filesystem watcher for auto-reindex");
+
     // --- watch subcommand ---
     auto* sub_watch = app.add_subcommand("watch", "Watch for file changes and re-index");
     std::string watch_root = ".";
@@ -137,8 +148,18 @@ int main(int argc, char** argv) {
     }
     if (sub_mcp->parsed()) {
         if (mcp_db.empty()) mcp_db = default_db(mcp_root);
+
+        // R9: Parse freshness policy string
+        codetopo::FreshnessPolicy freshness = codetopo::FreshnessPolicy::normal;
+        if (mcp_freshness == "eager") freshness = codetopo::FreshnessPolicy::eager;
+        else if (mcp_freshness == "lazy") freshness = codetopo::FreshnessPolicy::lazy;
+        else if (mcp_freshness == "off") freshness = codetopo::FreshnessPolicy::off;
+        // else: remains "normal" (the default)
+
         try {
-            return codetopo::run_mcp(mcp_db, mcp_tool_timeout, mcp_idle_timeout);
+            return codetopo::run_mcp(mcp_db, mcp_root, mcp_tool_timeout,
+                                     mcp_idle_timeout, freshness, mcp_debounce,
+                                     mcp_watch);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
