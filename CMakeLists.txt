@@ -129,6 +129,7 @@ set(CODETOPO_TEST_SOURCES
     tests/integration/test_watch.cpp
     tests/unit/test_change_detect.cpp
     tests/unit/test_cli_exit_codes.cpp
+    tests/unit/test_freshness.cpp
     tests/unit/test_fts_search.cpp
     tests/unit/test_gitignore.cpp
     tests/unit/test_lock.cpp
