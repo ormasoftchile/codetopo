@@ -67,12 +67,12 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
         R"J({"type":"object","properties":{"node_ids":{"type":"array","items":{"type":"integer"},"description":"Array of node_ids to fetch"}},"required":["node_ids"])J");
 
     server.register_tool("callers_approx", tools::callers_approx,
-        "Find all functions/files that call or reference the given symbol. Returns caller names, file paths, and confidence scores.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callers for"}},"required":["node_id"])J");
+        "Find all functions/files that call or reference the given symbol. Returns caller names, file paths, and confidence scores. Optionally group results by file, module, or symbol.",
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callers for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."}},"required":["node_id"]})J");
 
     server.register_tool("callees_approx", tools::callees_approx,
-        "Find all functions/symbols that the given symbol calls or references.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callees for"}},"required":["node_id"])J");
+        "Find all functions/symbols that the given symbol calls or references. Optionally group results by file, module, or symbol.",
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callees for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."}},"required":["node_id"]})J");
 
     server.register_tool("references", tools::references,
         "Find all references to a symbol across the codebase.",
@@ -83,12 +83,12 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
         R"J({"type":"object","properties":{"file_path":{"type":"string","description":"Relative file path within the repository"}},"required":["file_path"])J");
 
     server.register_tool("context_for", tools::context_for,
-        "Get the full structural context of a symbol: its definition, source snippet, callers, and callees. Best for understanding what a symbol does and how it connects to the codebase. Takes an internal node_id handle — never expose this to users.",
+        "Get the full structural context of a symbol: its definition, source snippet, callers, callees, container (enclosing type/namespace), sibling members, and base/implements types. Best for understanding what a symbol does and how it connects to the codebase. Takes an internal node_id handle — never expose this to users.",
         R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"}},"required":["node_id"])J");
 
     server.register_tool("entrypoints", tools::entrypoints,
-        "Find entry point functions (main, DllMain, etc.) in the codebase.",
-        R"J({"type":"object","properties":{}})J");
+        "Find entry point functions (main, DllMain, etc.) in the codebase. Optionally scope to a file path or directory prefix.",
+        R"J({"type":"object","properties":{"scope":{"type":"string","description":"Optional file path or directory prefix to restrict results (e.g. 'src/mcp/' or 'src/cli/main.cpp')"},"limit":{"type":"integer","description":"Max results (default 20)"}},"required":[]})J");
 
     server.register_tool("impact_of", tools::impact_of,
         "Compute the blast radius of changing a symbol: all transitive dependents up to a given depth.",
@@ -99,12 +99,16 @@ inline int run_mcp(const std::string& db_path, int tool_timeout, int idle_timeou
         R"J({"type":"object","properties":{"file_path":{"type":"string","description":"Relative file path"}},"required":["file_path"])J");
 
     server.register_tool("subgraph", tools::subgraph,
-        "Extract a local dependency neighborhood graph around one or more seed symbols.",
-        R"J({"type":"object","properties":{"seed_symbols":{"type":"array","items":{"type":"integer"},"description":"Array of node_ids to use as seeds"},"depth":{"type":"integer","description":"Graph traversal depth (default 2)"}},"required":["seed_symbols"])J");
+        "Extract a local dependency neighborhood graph around one or more seed symbols. Optionally filter by edge kinds.",
+        R"J({"type":"object","properties":{"seed_symbols":{"type":"array","items":{"type":"integer"},"description":"Array of node_ids to use as seeds"},"depth":{"type":"integer","description":"Graph traversal depth (default 2)"},"edge_kinds":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Filter traversal to specific edge kinds (e.g. 'calls', 'inherits', 'contains', 'references'). Omit to traverse all."}},"required":["seed_symbols"]})J");
 
     server.register_tool("shortest_path", tools::shortest_path,
-        "Find the shortest dependency path between two symbols in the code graph.",
-        R"J({"type":"object","properties":{"src_id":{"type":"integer","description":"Source node_id"},"dst_id":{"type":"integer","description":"Destination node_id"}},"required":["src_id","dst_id"])J");
+        "Find the shortest dependency path between two symbols in the code graph. Supports multiple candidate paths and relation type filtering.",
+        R"J({"type":"object","properties":{"src_id":{"type":"integer","description":"Source node_id"},"dst_id":{"type":"integer","description":"Destination node_id"},"max_paths":{"type":"integer","description":"Number of diverse paths to return (default 1, max 5). When >1, returns 'paths' array instead of single 'path'."},"relation_types":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Restrict traversal to specific edge kinds (e.g. 'calls', 'inherits'). Omit for all."}},"required":["src_id","dst_id"]})J");
+
+    server.register_tool("find_implementations", tools::find_implementations,
+        "Find types that implement or inherit from a given base type/interface. Uses 'inherits' edges in the code graph.",
+        R"J({"type":"object","properties":{"symbol":{"type":"string","description":"Name of the base type, interface, or trait to find implementations of"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}},"required":["symbol"]})J");
 
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root << ")\n";
     return server.run();
@@ -149,6 +153,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"file_deps", tools::file_deps},
         {"subgraph", tools::subgraph},
         {"shortest_path", tools::shortest_path},
+        {"find_implementations", tools::find_implementations},
     };
 
     auto it = all_tools.find(tool_name);

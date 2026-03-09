@@ -87,5 +87,9 @@ std::string subgraph(yyjson_val* params, Connection& conn,
 std::string shortest_path(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root);
 
+// T089: find_implementations — find types that inherit from a base
+std::string find_implementations(yyjson_val* params, Connection& conn,
+                                 QueryCache& cache, const std::string& repo_root);
+
 } // namespace tools
 } // namespace codetopo
