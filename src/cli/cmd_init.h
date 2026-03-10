@@ -14,9 +14,7 @@
 #include <yyjson.h>
 #include <sqlite3.h>
 
-#ifdef _WIN32
-#include <cstdlib>  // _dupenv_s
-#endif
+#include <cstdlib>  // std::getenv (all platforms), _dupenv_s (Windows)
 
 namespace codetopo {
 

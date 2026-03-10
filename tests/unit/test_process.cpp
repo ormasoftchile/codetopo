@@ -74,6 +74,9 @@ TEST_CASE("spawn_and_wait works with no arguments", "[process]") {
     // cmd.exe /c with no further args exits 0
     int rc = spawn_and_wait("cmd.exe", {"/c"});
     REQUIRE(rc == 0);
+#elif defined(__APPLE__)
+    int rc = spawn_and_wait("/usr/bin/true", {});
+    REQUIRE(rc == 0);
 #else
     int rc = spawn_and_wait("/bin/true", {});
     REQUIRE(rc == 0);

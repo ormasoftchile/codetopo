@@ -12,6 +12,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
