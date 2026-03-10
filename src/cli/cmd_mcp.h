@@ -190,15 +190,32 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
               << " watch=" << (watch ? "on" : "off") << ")\n";
 
     // P2: Start filesystem watcher for auto-reindex when --watch is enabled.
-    // The watcher fires on any file change; the child indexer handles filtering.
     // Cross-thread contract: watcher thread -> reindex monitor thread -> atomic flag
     //   -> main thread picks up flag before next tool dispatch.
+    // CRITICAL: Filter out .codetopo/ and .git/ (except .git/HEAD) events to avoid
+    // infinite reindex loop (indexer writes to .codetopo/index.sqlite which the
+    // watcher would see as a change, triggering another reindex, ad infinitum).
     std::unique_ptr<Watcher> watcher;
     if (watch && freshness != FreshnessPolicy::off) {
         auto debounce = std::chrono::milliseconds(debounce_ms);
         watcher = std::make_unique<Watcher>(
             repo_root,
-            [&](const std::vector<WatchEvent>& /*events*/) {
+            [&](const std::vector<WatchEvent>& events) {
+                // Filter: ignore .codetopo/ writes (our own DB) and .git/ internals
+                // (except .git/HEAD which signals branch switch)
+                bool has_relevant = false;
+                for (const auto& ev : events) {
+                    auto s = ev.path.generic_string();
+                    if (s.find(".codetopo/") != std::string::npos) continue;
+                    if (s.find(".codetopo\\") != std::string::npos) continue;
+                    if (ev.type == FileEvent::BranchSwitch) { has_relevant = true; break; }
+                    // Skip .git/ internals (pack files, index, refs updates, etc.)
+                    if (s.find(".git/") != std::string::npos || s.find(".git\\") != std::string::npos) continue;
+                    has_relevant = true;
+                    break;
+                }
+                if (!has_relevant) return;
+
                 reindex.trigger(repo_root, db_path, [&]() {
                     server.request_refresh();
                     std::cerr << "Watcher-triggered reindex completed, cache invalidated.\n";

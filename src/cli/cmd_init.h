@@ -4,6 +4,7 @@
 #include "index/supervisor.h"
 #include "util/repo.h"
 #include "util/json.h"
+#include "util/process.h"
 #include "db/connection.h"
 #include <string>
 #include <vector>
@@ -172,9 +173,12 @@ inline bool write_workspace_mcp_config(const std::filesystem::path& config_path,
     // Remove existing codetopo entry if present
     yyjson_mut_obj_remove_key(servers, "codetopo");
 
-    // Build codetopo server entry
+    // Build codetopo server entry — use absolute path to current binary
+    // so the MCP config works regardless of PATH configuration.
     auto* entry = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, entry, "command", "codetopo");
+    auto exe_path = get_self_executable_path();
+    yyjson_mut_obj_add_strcpy(doc, entry, "command",
+        exe_path.empty() ? "codetopo" : exe_path.c_str());
 
     // Workspace-local configs use relative root "."
     auto* args = yyjson_mut_arr(doc);
@@ -222,9 +226,11 @@ inline bool write_claude_mcp_config(const std::filesystem::path& repo_root,
     // Remove existing codetopo entry if present
     yyjson_mut_obj_remove_key(servers, "codetopo");
 
-    // Build codetopo server entry with absolute path
+    // Build codetopo server entry — use absolute path to current binary
     auto* entry = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, entry, "command", "codetopo");
+    auto exe_path = get_self_executable_path();
+    yyjson_mut_obj_add_strcpy(doc, entry, "command",
+        exe_path.empty() ? "codetopo" : exe_path.c_str());
 
     auto* args = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, args, "mcp");
