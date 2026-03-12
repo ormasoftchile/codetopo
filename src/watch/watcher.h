@@ -42,11 +42,13 @@ using WatchCallback = std::function<void(const std::vector<WatchEvent>&)>;
 class Watcher {
 public:
     Watcher(const fs::path& root, WatchCallback callback,
-            std::chrono::milliseconds debounce = std::chrono::milliseconds(1000))
+            std::chrono::milliseconds debounce = std::chrono::milliseconds(1000),
+            bool verbose = false)
         : root_(fs::canonical(root))
         , callback_(std::move(callback))
         , debounce_(debounce)
-        , running_(false) {}
+        , running_(false)
+        , verbose_(verbose) {}
 
     ~Watcher() { stop(); }
 
@@ -67,6 +69,7 @@ private:
     WatchCallback callback_;
     std::chrono::milliseconds debounce_;
     std::atomic<bool> running_;
+    bool verbose_;
     std::thread watch_thread_;
 
     void run() {
@@ -89,7 +92,11 @@ private:
             nullptr
         );
 
-        if (dir_handle == INVALID_HANDLE_VALUE) return;
+        if (dir_handle == INVALID_HANDLE_VALUE) {
+            std::cerr << "Watcher: CreateFileW FAILED (error " << GetLastError() << ")\n";
+            return;
+        }
+        if (verbose_) std::cerr << "Watcher: directory handle opened for " << root_.string() << "\n";
 
         OVERLAPPED overlapped = {};
         overlapped.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -107,16 +114,28 @@ private:
                 nullptr, &overlapped, nullptr
             );
 
-            if (!success) break;
+            if (!success) {
+                if (verbose_) std::cerr << "Watcher: ReadDirectoryChangesW FAILED (error " << GetLastError() << ")\n";
+                break;
+            }
 
             DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 1000);
             if (wait_result == WAIT_TIMEOUT) continue;
-            if (wait_result != WAIT_OBJECT_0) break;
-
-            if (!GetOverlappedResult(dir_handle, &overlapped, &bytes_returned, FALSE))
+            if (wait_result != WAIT_OBJECT_0) {
+                if (verbose_) std::cerr << "Watcher: WaitForSingleObject unexpected result: " << wait_result
+                              << " (error " << GetLastError() << ")\n";
                 break;
+            }
 
-            if (bytes_returned == 0) continue;
+            if (!GetOverlappedResult(dir_handle, &overlapped, &bytes_returned, FALSE)) {
+                if (verbose_) std::cerr << "Watcher: GetOverlappedResult FAILED (error " << GetLastError() << ")\n";
+                break;
+            }
+
+            if (bytes_returned == 0) {
+                if (verbose_) std::cerr << "Watcher: buffer overflow — events lost\n";
+                continue;
+            }
 
             // Parse the notification buffer
             std::vector<WatchEvent> events;
@@ -153,10 +172,13 @@ private:
             std::this_thread::sleep_for(debounce_);
 
             if (!events.empty() && running_.load()) {
+                if (verbose_) std::cerr << "Watcher: dispatching " << events.size() << " events (first: "
+                              << events[0].path.string() << ")\n";
                 callback_(events);
             }
         }
 
+        if (verbose_) std::cerr << "Watcher: loop exited, running=" << running_.load() << "\n";
         CloseHandle(overlapped.hEvent);
         CloseHandle(dir_handle);
     }

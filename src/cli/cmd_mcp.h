@@ -55,7 +55,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                    int tool_timeout, int idle_timeout,
                    FreshnessPolicy freshness = FreshnessPolicy::normal,
                    int debounce_ms = 1000,
-                   bool watch = false) {
+                   bool watch = false,
+                   bool verbose = false) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(db_path)) {
@@ -199,12 +200,14 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         watcher = std::make_unique<Watcher>(
             repo_root,
             [&](const std::vector<WatchEvent>& /*events*/) {
+                if (verbose) std::cerr << "Watcher: change detected, triggering reindex...\n";
                 reindex.trigger(repo_root, db_path, [&]() {
                     server.request_refresh();
-                    std::cerr << "Watcher-triggered reindex completed, cache invalidated.\n";
+                    if (verbose) std::cerr << "Watcher-triggered reindex completed, cache invalidated.\n";
                 });
             },
-            debounce
+            debounce,
+            verbose
         );
         watcher->start();
         std::cerr << "Filesystem watcher started (debounce=" << debounce_ms << "ms)\n";
