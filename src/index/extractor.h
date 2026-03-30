@@ -35,6 +35,7 @@ struct ExtractedRef {
     int end_line = 0;
     int end_col = 0;
     std::string evidence;
+    int containing_symbol_index = -1;  // Index into symbols array of enclosing method/function
 };
 
 struct ExtractedEdge {
@@ -67,6 +68,7 @@ private:
     int max_symbols_;
     int max_depth_;
     int symbol_count_ = 0;
+    std::vector<int> symbol_stack_;  // Stack of enclosing symbol indices
     const std::string* source_ = nullptr;
     ExtractionResult* result_ = nullptr;
     const std::string* rel_path_ = nullptr;

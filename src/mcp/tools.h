@@ -91,5 +91,17 @@ std::string shortest_path(yyjson_val* params, Connection& conn,
 std::string find_implementations(yyjson_val* params, Connection& conn,
                                  QueryCache& cache, const std::string& repo_root);
 
+// T090: method_fields — field accesses and calls made by a method
+std::string method_fields(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root);
+
+// T091: dependency_cluster — group methods by shared field access, weighted by read/write
+std::string dependency_cluster(yyjson_val* params, Connection& conn,
+                               QueryCache& cache, const std::string& repo_root);
+
+// T092: refactor_plan — generate a phased extraction plan for a large class/file
+std::string refactor_plan(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root);
+
 } // namespace tools
 } // namespace codetopo

@@ -182,8 +182,8 @@ public:
             {
                 sqlite3_stmt* stmt = nullptr;
                 sqlite3_prepare_v2(conn_.raw(),
-                    "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
+                    "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
 
                 for (const auto& ref : extraction.refs) {
                     sqlite3_reset(stmt);
@@ -196,6 +196,11 @@ public:
                     sqlite3_bind_int(stmt, 7, ref.end_col);
                     if (ref.evidence.empty()) sqlite3_bind_null(stmt, 8);
                     else sqlite3_bind_text(stmt, 8, ref.evidence.c_str(), -1, SQLITE_TRANSIENT);
+                    if (ref.containing_symbol_index >= 0 &&
+                        ref.containing_symbol_index < static_cast<int>(symbol_ids.size()))
+                        sqlite3_bind_int64(stmt, 9, symbol_ids[ref.containing_symbol_index]);
+                    else
+                        sqlite3_bind_null(stmt, 9);
                     sqlite3_step(stmt);
                 }
                 sqlite3_finalize(stmt);

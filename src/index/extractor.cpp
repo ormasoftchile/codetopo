@@ -17,6 +17,7 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
     rel_path_ = &rel_path;
     language_ = &language;
     symbol_count_ = 0;
+    symbol_stack_.clear();
 
     TSNode root = ts_tree_root_node(tree);
     visit_node(root, "", 0);
@@ -174,12 +175,13 @@ void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode
                          const std::string& evidence) {
     TSPoint start = ts_node_start_point(node);
     TSPoint end = ts_node_end_point(node);
+    int containing = symbol_stack_.empty() ? -1 : symbol_stack_.back();
 
     result_->refs.push_back({
         kind, name,
         static_cast<int>(start.row + 1), static_cast<int>(start.column),
         static_cast<int>(end.row + 1), static_cast<int>(end.column),
-        evidence
+        evidence, containing
     });
 }
 
@@ -198,6 +200,10 @@ void Extractor::visit_node(TSNode node, const std::string& parent_qualname, int 
     if (!type) return;
 
     std::string type_str(type);
+
+    // Snapshot symbol count before the language extractor so we can detect
+    // whether this node introduced a new scoping symbol.
+    int sym_before = static_cast<int>(result_->symbols.size());
 
     if (*language_ == "c" || *language_ == "cpp") {
         extract_c_cpp(node, type_str, parent_qualname);
@@ -230,10 +236,17 @@ void Extractor::visit_node(TSNode node, const std::string& parent_qualname, int 
         extract_sql(node, type_str, parent_qualname);
     }
 
+    // If a new symbol was emitted for this node, push it as the containing
+    // scope so that refs found inside its children are attributed to it.
+    bool pushed = static_cast<int>(result_->symbols.size()) > sym_before;
+    if (pushed) symbol_stack_.push_back(sym_before);
+
     uint32_t child_count = ts_node_child_count(node);
     for (uint32_t i = 0; i < child_count; ++i) {
         visit_node(ts_node_child(node, i), parent_qualname, depth + 1);
     }
+
+    if (pushed) symbol_stack_.pop_back();
 }
 
 void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::string& parent_qn) {
@@ -419,6 +432,23 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
         if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call_expression");
+    }
+    else if (type == "member_expression") {
+        // Check if object is `this`
+        auto object = ts_node_child_by_field_name(node, "object", 6);
+        if (!ts_node_is_null(object) && std::string(ts_node_type(object)) == "this") {
+            auto property = ts_node_child_by_field_name(node, "property", 8);
+            if (!ts_node_is_null(property)) {
+                auto parent = ts_node_parent(node);
+                const char* parent_type = ts_node_type(parent);
+                bool is_write = parent_type && (
+                    std::string(parent_type) == "assignment_expression" ||
+                    std::string(parent_type) == "augmented_assignment_expression"
+                ) && ts_node_child(parent, 0).id == node.id; // left side
+                std::string evidence = is_write ? "this_member_write" : "this_member_read";
+                add_ref("field_access", node_text(property), node, evidence);
+            }
+        }
     }
     else if (type == "import_statement") {
         add_ref("include", node_text(node), node, "import");
