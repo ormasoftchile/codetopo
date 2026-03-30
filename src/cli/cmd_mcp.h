@@ -134,7 +134,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("symbol_get", tools::symbol_get,
         "Get detailed information about a specific symbol by its internal node_id handle, including source code snippet. Do not mention node_id to the user.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id from symbol_search results"}},"required":["node_id"])J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id from symbol_search results"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
 
     server.register_tool("symbol_get_batch", tools::symbol_get_batch,
         "Get details for multiple symbols at once by their internal node_id handles. Do not mention node_ids to the user.",
@@ -150,7 +150,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("references", tools::references,
         "Find all references to a symbol across the codebase.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find references for"}},"required":["node_id"])J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find references for"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
 
     server.register_tool("file_summary", tools::file_summary,
         "List all symbols defined in a file: functions, classes, structs, macros, variables.",
@@ -158,7 +158,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("context_for", tools::context_for,
         "Get the full structural context of a symbol: its definition, source snippet, callers, callees, container (enclosing type/namespace), sibling members, and base/implements types. Best for understanding what a symbol does and how it connects to the codebase. Takes an internal node_id handle — never expose this to users.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"}},"required":["node_id"])J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
 
     server.register_tool("entrypoints", tools::entrypoints,
         "Find entry point functions (main, DllMain, etc.) in the codebase. Optionally scope to a file path or directory prefix.",
@@ -183,6 +183,22 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     server.register_tool("find_implementations", tools::find_implementations,
         "Find types that implement or inherit from a given base type/interface. Uses 'inherits' edges in the code graph.",
         R"J({"type":"object","properties":{"symbol":{"type":"string","description":"Name of the base type, interface, or trait to find implementations of"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}},"required":["symbol"]})J");
+
+    server.register_tool("method_fields", tools::method_fields,
+        "List all 'this.X' field accesses (reads and writes) and outgoing calls made by a method, classified as calls_self (same class) or calls_external. Useful for understanding a TypeScript/JavaScript method's state usage.",
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the method symbol to analyze"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}}})J");
+
+    server.register_tool("dependency_cluster", tools::dependency_cluster,
+        "Group methods in a file by shared field access patterns, weighted by read/write direction. Returns clusters with extractability scores (1.0=pure read, easily extractable; 0.0=heavily writes state, tightly coupled). Use to plan refactoring decomposition.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"File path (relative to repo root)"},"class_id":{"type":"integer","description":"Node ID of a class to analyze (alternative to path)"}}})J");
+
+    server.register_tool("refactor_plan", tools::refactor_plan,
+        "Generate a phased extraction plan to decompose a large class/file into smaller modules. "
+        "Analyzes every method's field access pattern (reads vs writes), computes extractability scores, "
+        "clusters methods by shared state, and returns a concrete plan with: which methods to extract, "
+        "into which files, in which order (pure readers first, mutation core second), plus instructions "
+        "and warnings for common pitfalls. Call this FIRST when asked to refactor a large file.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"File path relative to repo root"},"target_max_lines":{"type":"integer","description":"Target maximum lines per file (default 800)"}},"required":["path"]})J");
 
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
               << " freshness=" << static_cast<int>(freshness)

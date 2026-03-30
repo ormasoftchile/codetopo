@@ -13,6 +13,9 @@
 #include <filesystem>
 #include <chrono>
 #include <cstdint>
+#include <set>
+#include <algorithm>
+#include <unordered_set>
 #include <cstring>
 #include <ctime>
 #include <unordered_set>
@@ -22,6 +25,29 @@
 
 namespace codetopo {
 namespace tools {
+
+// Resolve a node by node_id, or by symbol+file name lookup.
+// Allows tools to be called with stable identifiers instead of volatile IDs.
+static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache& cache,
+                                const char* id_param = "node_id") {
+    if (!params) return -1;
+    int64_t id = json_get_int(params, id_param, -1);
+    if (id >= 0) return id;
+
+    auto* sym_val = yyjson_obj_get(params, "symbol");
+    auto* file_val = yyjson_obj_get(params, "file");
+    if (!sym_val || !file_val) return -1;
+
+    auto* stmt = cache.get("resolve_node_by_name_file",
+        "SELECT id FROM nodes WHERE name = ? "
+        "AND file_id = (SELECT id FROM files WHERE path = ?) "
+        "AND node_type = 'symbol' "
+        "ORDER BY is_definition DESC, id ASC LIMIT 1");
+    sqlite3_bind_text(stmt, 1, yyjson_get_str(sym_val), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, yyjson_get_str(file_val), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) == SQLITE_ROW) return sqlite3_column_int64(stmt, 0);
+    return -1;
+}
 
 // T060: server_info
 std::string server_info(yyjson_val* /*params*/, Connection& conn,
@@ -507,7 +533,7 @@ std::string read_source_snippet(const std::string& repo_root,
 // T063: symbol_get
 std::string symbol_get(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     bool include_source = params ? json_get_bool(params, "include_source", true) : true;
@@ -650,7 +676,7 @@ std::string symbol_get_batch(yyjson_val* params, Connection& conn,
 // T066: callers_approx
 std::string callers_approx(yyjson_val* params, Connection& conn,
                                     QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -755,7 +781,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
 // T067: callees_approx
 std::string callees_approx(yyjson_val* params, Connection& conn,
                                     QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -852,7 +878,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
 // T065: references
 std::string references(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -965,7 +991,7 @@ std::string file_summary(yyjson_val* params, Connection& conn,
 // T068: context_for (one-shot symbol understanding)
 std::string context_for(yyjson_val* params, Connection& conn,
                                 QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t max_callers = params ? json_get_int(params, "max_callers", 10) : 10;
@@ -1249,7 +1275,7 @@ std::string entrypoints(yyjson_val* params, Connection& conn,
 // T085: impact_of — transitive dependents via BFS
 std::string impact_of(yyjson_val* params, Connection& conn,
                               QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = params ? json_get_int(params, "node_id", -1) : -1;
+    int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t depth = params ? json_get_int(params, "depth", 2) : 2;
@@ -1760,6 +1786,654 @@ std::string find_implementations(yyjson_val* params, Connection& conn,
     }
 
     yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+    return doc.to_string();
+}
+
+// T090: method_fields — field accesses and calls made by a method
+std::string method_fields(yyjson_val* params, Connection& conn,
+                                  QueryCache& cache, const std::string& /*repo_root*/) {
+    int64_t node_id = resolve_node_id(params, conn, cache);
+    if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_int(doc.doc, root, "node_id", node_id);
+
+    // Method name
+    {
+        auto* name_stmt = cache.get("method_fields_name",
+            "SELECT name FROM nodes WHERE id = ?");
+        sqlite3_bind_int64(name_stmt, 1, node_id);
+        if (sqlite3_step(name_stmt) == SQLITE_ROW) {
+            yyjson_mut_obj_add_strcpy(doc.doc, root, "method_name",
+                reinterpret_cast<const char*>(sqlite3_column_text(name_stmt, 0)));
+        }
+    }
+
+    // --- Field accesses (this.X) ---
+    // Group by name: collect read/write counts and earliest line
+    {
+        struct FieldEntry {
+            int reads = 0;
+            int writes = 0;
+            int first_line = INT_MAX;
+        };
+        std::unordered_map<std::string, FieldEntry> field_map;
+        // preserve insertion order for stable output
+        std::vector<std::string> field_order;
+
+        auto* fa_stmt = cache.get("method_fields_fa",
+            "SELECT r.name, r.evidence, r.start_line "
+            "FROM refs r "
+            "WHERE r.containing_node_id = ? AND r.kind = 'field_access' "
+            "ORDER BY r.name, r.start_line");
+        sqlite3_bind_int64(fa_stmt, 1, node_id);
+
+        while (sqlite3_step(fa_stmt) == SQLITE_ROW) {
+            std::string name(reinterpret_cast<const char*>(sqlite3_column_text(fa_stmt, 0)));
+            auto* ev_raw = sqlite3_column_text(fa_stmt, 1);
+            std::string ev = ev_raw ? reinterpret_cast<const char*>(ev_raw) : "";
+            int line = sqlite3_column_int(fa_stmt, 2);
+
+            if (!field_map.count(name)) {
+                field_order.push_back(name);
+                field_map[name] = {};
+            }
+            auto& fe = field_map[name];
+            if (ev == "this_member_write") fe.writes++;
+            else fe.reads++;  // this_member_read or unknown
+            if (line < fe.first_line) fe.first_line = line;
+        }
+
+        auto* fields_arr = doc.new_arr();
+        for (const auto& fname : field_order) {
+            const auto& fe = field_map[fname];
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", fname.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "reads", fe.reads);
+            yyjson_mut_obj_add_int(doc.doc, item, "writes", fe.writes);
+            if (fe.first_line != INT_MAX)
+                yyjson_mut_obj_add_int(doc.doc, item, "first_line", fe.first_line);
+            yyjson_mut_arr_append(fields_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "fields", fields_arr);
+    }
+
+    // --- Calls from this method: classify as calls_self vs calls_external ---
+    // calls_self = callee name matches a symbol contained by the same parent class
+    {
+        struct CallEntry {
+            int count = 0;
+            int first_line = INT_MAX;
+            std::string relationship;
+        };
+        std::unordered_map<std::string, CallEntry> call_map;
+        std::vector<std::string> call_order;
+
+        auto* call_stmt = cache.get("method_fields_calls",
+            "SELECT r.name, r.start_line, "
+            "CASE WHEN EXISTS("
+            "  SELECT 1 FROM edges e1 JOIN edges e2 ON e1.src_id = e2.src_id"
+            "  JOIN nodes sib ON e2.dst_id = sib.id"
+            "  WHERE e1.dst_id = ? AND e1.kind = 'contains'"
+            "  AND e2.kind = 'contains' AND sib.name = "
+            "  CASE WHEN r.name LIKE 'this.%' AND INSTR(SUBSTR(r.name,6),'.')=0"
+            "  THEN SUBSTR(r.name,6) ELSE r.name END"
+            ") THEN 'calls_self' ELSE 'calls_external' END AS relationship "
+            "FROM refs r "
+            "WHERE r.containing_node_id = ? AND r.kind = 'call' "
+            "ORDER BY r.name, r.start_line");
+        sqlite3_bind_int64(call_stmt, 1, node_id);
+        sqlite3_bind_int64(call_stmt, 2, node_id);
+
+        while (sqlite3_step(call_stmt) == SQLITE_ROW) {
+            std::string name(reinterpret_cast<const char*>(sqlite3_column_text(call_stmt, 0)));
+            int line = sqlite3_column_int(call_stmt, 1);
+            std::string rel(reinterpret_cast<const char*>(sqlite3_column_text(call_stmt, 2)));
+
+            if (!call_map.count(name)) {
+                call_order.push_back(name);
+                call_map[name] = {};
+                call_map[name].relationship = rel;
+            }
+            auto& ce = call_map[name];
+            ce.count++;
+            if (line < ce.first_line) ce.first_line = line;
+        }
+
+        auto* calls_arr = doc.new_arr();
+        for (const auto& cname : call_order) {
+            const auto& ce = call_map[cname];
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", cname.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "relationship", ce.relationship.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "count", ce.count);
+            if (ce.first_line != INT_MAX)
+                yyjson_mut_obj_add_int(doc.doc, item, "first_line", ce.first_line);
+            yyjson_mut_arr_append(calls_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "calls", calls_arr);
+    }
+
+    return doc.to_string();
+}
+
+// T091: dependency_cluster — group methods by shared field access with read/write weighting
+std::string dependency_cluster(yyjson_val* params, Connection& conn,
+                               QueryCache& cache, const std::string& /*repo_root*/) {
+    // Accept either file path or class node_id
+    auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
+    int64_t class_id = params ? json_get_int(params, "class_id", -1) : -1;
+
+    if (!path_val && class_id < 0)
+        return McpError::invalid_input("Provide 'path' (file path) or 'class_id'").to_json_rpc(0);
+
+    // Resolve file_id
+    int64_t file_id = -1;
+    if (path_val) {
+        std::string path(yyjson_get_str(path_val));
+        auto* f_stmt = cache.get("dc_file", "SELECT id FROM files WHERE path = ?");
+        sqlite3_bind_text(f_stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(f_stmt) == SQLITE_ROW) file_id = sqlite3_column_int64(f_stmt, 0);
+        else return McpError::invalid_input("File not found: " + path).to_json_rpc(0);
+    }
+
+    // Get all methods in the file/class
+    struct MethodInfo {
+        int64_t id;
+        std::string name;
+        int lines;
+    };
+    std::vector<MethodInfo> methods;
+    {
+        std::string sql = class_id >= 0
+            ? "SELECT n.id, n.name, n.end_line - n.start_line + 1 FROM nodes n "
+              "JOIN edges e ON e.dst_id = n.id WHERE e.src_id = ? AND e.kind = 'contains' "
+              "AND n.kind = 'method' ORDER BY n.start_line"
+            : "SELECT n.id, n.name, n.end_line - n.start_line + 1 FROM nodes n "
+              "WHERE n.file_id = ? AND n.kind = 'method' ORDER BY n.start_line";
+        auto* stmt = cache.get("dc_methods", sql.c_str());
+        sqlite3_bind_int64(stmt, 1, class_id >= 0 ? class_id : file_id);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            methods.push_back({
+                sqlite3_column_int64(stmt, 0),
+                std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
+                sqlite3_column_int(stmt, 2)
+            });
+        }
+    }
+
+    // Build method name set for filtering self-method refs
+    std::unordered_set<std::string> method_names;
+    for (const auto& m : methods) method_names.insert(m.name);
+
+    // Build method→{field→(reads,writes)} map
+    struct FieldAccess { int reads = 0; int writes = 0; };
+    std::unordered_map<int64_t, std::unordered_map<std::string, FieldAccess>> method_field_map;
+
+    auto* fa_stmt = cache.get("dc_fa",
+        "SELECT r.containing_node_id, r.name, r.evidence FROM refs r "
+        "WHERE r.file_id = ? AND r.kind = 'field_access'");
+    sqlite3_bind_int64(fa_stmt, 1, file_id >= 0 ? file_id : 0);
+    // If using class_id, we need file_id from any method
+    if (file_id < 0 && !methods.empty()) {
+        sqlite3_reset(fa_stmt);
+        auto* fid_stmt = cache.get("dc_fid", "SELECT file_id FROM nodes WHERE id = ?");
+        sqlite3_bind_int64(fid_stmt, 1, methods[0].id);
+        if (sqlite3_step(fid_stmt) == SQLITE_ROW) file_id = sqlite3_column_int64(fid_stmt, 0);
+        sqlite3_bind_int64(fa_stmt, 1, file_id);
+    }
+
+    while (sqlite3_step(fa_stmt) == SQLITE_ROW) {
+        int64_t containing = sqlite3_column_int64(fa_stmt, 0);
+        std::string field(reinterpret_cast<const char*>(sqlite3_column_text(fa_stmt, 1)));
+        auto* ev = sqlite3_column_text(fa_stmt, 2);
+        std::string evidence = ev ? std::string(reinterpret_cast<const char*>(ev)) : "";
+
+        if (method_names.count(field)) continue; // skip self-method refs
+
+        auto& fa = method_field_map[containing][field];
+        if (evidence == "this_member_write") fa.writes++;
+        else fa.reads++;
+    }
+
+    // Compute weighted coupling between method pairs
+    // Weight: read-only=0.3, write-only=1.0, read+write=1.5
+    auto field_weight = [](const FieldAccess& fa) -> double {
+        if (fa.writes > 0 && fa.reads > 0) return 1.5;
+        if (fa.writes > 0) return 1.0;
+        return 0.3;
+    };
+
+    // For each method, compute total write count (extractability signal)
+    struct MethodScore {
+        int total_reads = 0;
+        int total_writes = 0;
+        int field_count = 0;
+        double extractability = 0.0; // 0=deeply coupled, 1=pure read
+    };
+    std::unordered_map<int64_t, MethodScore> scores;
+    for (const auto& m : methods) {
+        auto it = method_field_map.find(m.id);
+        if (it == method_field_map.end()) continue;
+        auto& ms = scores[m.id];
+        for (const auto& [field, fa] : it->second) {
+            ms.total_reads += fa.reads;
+            ms.total_writes += fa.writes;
+            ms.field_count++;
+        }
+        int total = ms.total_reads + ms.total_writes;
+        ms.extractability = total > 0 ? static_cast<double>(ms.total_reads) / total : 1.0;
+    }
+
+    // Greedy clustering by weighted Jaccard on field access
+    std::vector<bool> assigned(methods.size(), false);
+    struct Cluster {
+        std::vector<size_t> members; // indices into methods
+        std::set<std::string> shared_fields;
+        std::set<std::string> all_fields;
+        double avg_extractability = 0.0;
+    };
+    std::vector<Cluster> clusters;
+
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (assigned[i]) continue;
+        auto it_i = method_field_map.find(methods[i].id);
+        if (it_i == method_field_map.end() || it_i->second.size() < 2) {
+            // Singleton — only cluster if ≥2 fields
+            Cluster c;
+            c.members.push_back(i);
+            if (it_i != method_field_map.end()) {
+                for (const auto& [f, _] : it_i->second) c.all_fields.insert(f);
+                c.shared_fields = c.all_fields;
+            }
+            auto sit = scores.find(methods[i].id);
+            c.avg_extractability = sit != scores.end() ? sit->second.extractability : 1.0;
+            clusters.push_back(std::move(c));
+            assigned[i] = true;
+            continue;
+        }
+
+        Cluster c;
+        c.members.push_back(i);
+        assigned[i] = true;
+
+        for (size_t j = i + 1; j < methods.size(); ++j) {
+            if (assigned[j]) continue;
+            auto it_j = method_field_map.find(methods[j].id);
+            if (it_j == method_field_map.end()) continue;
+
+            // Weighted Jaccard
+            std::set<std::string> all_fields;
+            for (const auto& [f, _] : it_i->second) all_fields.insert(f);
+            for (const auto& [f, _] : it_j->second) all_fields.insert(f);
+
+            double intersection_w = 0, union_w = 0;
+            for (const auto& f : all_fields) {
+                auto fi = it_i->second.find(f);
+                auto fj = it_j->second.find(f);
+                double wi = fi != it_i->second.end() ? field_weight(fi->second) : 0;
+                double wj = fj != it_j->second.end() ? field_weight(fj->second) : 0;
+                union_w += std::max(wi, wj);
+                if (wi > 0 && wj > 0) intersection_w += std::min(wi, wj);
+            }
+            double sim = union_w > 0 ? intersection_w / union_w : 0;
+            if (sim >= 0.20) {
+                c.members.push_back(j);
+                assigned[j] = true;
+            }
+        }
+
+        // Compute shared/all fields
+        for (size_t mi : c.members) {
+            auto it = method_field_map.find(methods[mi].id);
+            if (it != method_field_map.end())
+                for (const auto& [f, _] : it->second) c.all_fields.insert(f);
+        }
+        if (c.members.size() > 1) {
+            c.shared_fields = c.all_fields; // start with all, intersect
+            for (size_t mi : c.members) {
+                std::set<std::string> mf;
+                auto it = method_field_map.find(methods[mi].id);
+                if (it != method_field_map.end())
+                    for (const auto& [f, _] : it->second) mf.insert(f);
+                std::set<std::string> isect;
+                std::set_intersection(c.shared_fields.begin(), c.shared_fields.end(),
+                                      mf.begin(), mf.end(), std::inserter(isect, isect.begin()));
+                c.shared_fields = isect;
+            }
+        } else {
+            c.shared_fields = c.all_fields;
+        }
+
+        // Average extractability
+        double sum = 0;
+        for (size_t mi : c.members) {
+            auto sit = scores.find(methods[mi].id);
+            sum += sit != scores.end() ? sit->second.extractability : 1.0;
+        }
+        c.avg_extractability = c.members.empty() ? 0 : sum / c.members.size();
+
+        clusters.push_back(std::move(c));
+    }
+
+    // Sort clusters: most extractable first
+    std::sort(clusters.begin(), clusters.end(), [](const Cluster& a, const Cluster& b) {
+        return a.avg_extractability > b.avg_extractability;
+    });
+
+    // Build response
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_int(doc.doc, root, "method_count", static_cast<int>(methods.size()));
+    yyjson_mut_obj_add_int(doc.doc, root, "cluster_count", static_cast<int>(clusters.size()));
+
+    auto* clusters_arr = doc.new_arr();
+    for (const auto& c : clusters) {
+        auto* cobj = doc.new_obj();
+
+        auto* members_arr = doc.new_arr();
+        for (size_t mi : c.members) {
+            auto* mobj = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, mobj, "node_id", methods[mi].id);
+            yyjson_mut_obj_add_strcpy(doc.doc, mobj, "name", methods[mi].name.c_str());
+            yyjson_mut_obj_add_int(doc.doc, mobj, "lines", methods[mi].lines);
+            auto sit = scores.find(methods[mi].id);
+            if (sit != scores.end()) {
+                yyjson_mut_obj_add_int(doc.doc, mobj, "reads", sit->second.total_reads);
+                yyjson_mut_obj_add_int(doc.doc, mobj, "writes", sit->second.total_writes);
+                yyjson_mut_obj_add_real(doc.doc, mobj, "extractability", sit->second.extractability);
+            }
+            yyjson_mut_arr_append(members_arr, mobj);
+        }
+        yyjson_mut_obj_add_val(doc.doc, cobj, "members", members_arr);
+
+        auto* shared_arr = doc.new_arr();
+        for (const auto& f : c.shared_fields)
+            yyjson_mut_arr_add_strcpy(doc.doc, shared_arr, f.c_str());
+        yyjson_mut_obj_add_val(doc.doc, cobj, "shared_fields", shared_arr);
+
+        yyjson_mut_obj_add_int(doc.doc, cobj, "total_fields", static_cast<int>(c.all_fields.size()));
+        yyjson_mut_obj_add_real(doc.doc, cobj, "avg_extractability", c.avg_extractability);
+
+        yyjson_mut_arr_append(clusters_arr, cobj);
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "clusters", clusters_arr);
+
+    return doc.to_string();
+}
+
+// T092: refactor_plan — generate a full phased extraction plan for a large file
+std::string refactor_plan(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& /*repo_root*/) {
+    auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
+    if (!path_val) return McpError::invalid_input("Missing 'path'").to_json_rpc(0);
+    std::string path(yyjson_get_str(path_val));
+
+    int target_max = params ? static_cast<int>(json_get_int(params, "target_max_lines", 800)) : 800;
+
+    // Resolve file
+    int64_t file_id = -1;
+    {
+        auto* stmt = cache.get("rp_file", "SELECT id FROM files WHERE path = ?");
+        sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) file_id = sqlite3_column_int64(stmt, 0);
+        else return McpError::invalid_input("File not found: " + path).to_json_rpc(0);
+    }
+
+    // Get total lines
+    int total_lines = 0;
+    {
+        auto* stmt = cache.get("rp_lines", "SELECT MAX(end_line) FROM nodes WHERE file_id = ?");
+        sqlite3_bind_int64(stmt, 1, file_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) total_lines = sqlite3_column_int(stmt, 0);
+    }
+
+    // Get all methods with sizes
+    struct MethodInfo {
+        int64_t id;
+        std::string name;
+        int lines;
+        int reads = 0;
+        int writes = 0;
+        double extractability = 1.0;
+    };
+    std::vector<MethodInfo> methods;
+
+    {
+        auto* stmt = cache.get("rp_methods",
+            "SELECT id, name, end_line - start_line + 1 FROM nodes "
+            "WHERE file_id = ? AND kind = 'method' ORDER BY start_line");
+        sqlite3_bind_int64(stmt, 1, file_id);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            MethodInfo m;
+            m.id = sqlite3_column_int64(stmt, 0);
+            m.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            m.lines = sqlite3_column_int(stmt, 2);
+            methods.push_back(m);
+        }
+    }
+
+    // Get method name set for filtering self-refs
+    std::unordered_set<std::string> method_names;
+    for (const auto& m : methods) method_names.insert(m.name);
+
+    // Compute reads/writes per method
+    for (auto& m : methods) {
+        auto* stmt = cache.get("rp_rw",
+            "SELECT "
+            "SUM(CASE WHEN evidence = 'this_member_read' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN evidence = 'this_member_write' THEN 1 ELSE 0 END) "
+            "FROM refs WHERE containing_node_id = ? AND kind = 'field_access'");
+        sqlite3_bind_int64(stmt, 1, m.id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            m.reads = sqlite3_column_int(stmt, 0);
+            m.writes = sqlite3_column_int(stmt, 1);
+        }
+        int total = m.reads + m.writes;
+        m.extractability = total > 0 ? static_cast<double>(m.reads) / total : 1.0;
+    }
+
+    // Classify into phases
+    struct PlannedExtraction {
+        std::string module_name;
+        std::string description;
+        std::vector<size_t> method_indices;
+        int total_lines = 0;
+    };
+
+    // Phase 1: pure readers (extractability >= 0.8, not tiny getters)
+    std::vector<PlannedExtraction> phase1;
+    std::vector<bool> assigned(methods.size(), false);
+
+    // Group extractable methods by shared field patterns using simple heuristic
+    // Collect field sets per method
+    std::unordered_map<size_t, std::set<std::string>> method_field_sets;
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (methods[i].extractability < 0.8 || methods[i].lines < 5) continue;
+        auto* stmt = cache.get("rp_fields",
+            "SELECT DISTINCT name FROM refs WHERE containing_node_id = ? AND kind = 'field_access'");
+        sqlite3_bind_int64(stmt, 1, methods[i].id);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::string fname(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+            if (!method_names.count(fname)) {
+                method_field_sets[i].insert(fname);
+            }
+        }
+    }
+
+    // Greedy clustering of phase 1 methods
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (assigned[i] || methods[i].extractability < 0.8 || methods[i].lines < 5) continue;
+        PlannedExtraction pe;
+        pe.method_indices.push_back(i);
+        pe.total_lines = methods[i].lines;
+        assigned[i] = true;
+
+        auto& fields_i = method_field_sets[i];
+        for (size_t j = i + 1; j < methods.size(); ++j) {
+            if (assigned[j] || methods[j].extractability < 0.8 || methods[j].lines < 5) continue;
+            auto& fields_j = method_field_sets[j];
+            // Compute overlap
+            int shared = 0;
+            for (const auto& f : fields_i) {
+                if (fields_j.count(f)) shared++;
+            }
+            int total = static_cast<int>(fields_i.size() + fields_j.size()) - shared;
+            double jaccard = total > 0 ? static_cast<double>(shared) / total : 0;
+            if (jaccard >= 0.2) {
+                pe.method_indices.push_back(j);
+                pe.total_lines += methods[j].lines;
+                assigned[j] = true;
+            }
+        }
+
+        // Name the module based on shared fields or first method
+        if (pe.method_indices.size() == 1) {
+            pe.module_name = methods[pe.method_indices[0]].name + ".ts";
+        } else {
+            // Use a descriptive name based on first method
+            pe.module_name = methods[pe.method_indices[0]].name + "_group.ts";
+        }
+        pe.description = "Pure reader methods (extractability >= 0.8)";
+        phase1.push_back(std::move(pe));
+    }
+
+    // Phase 2: mutation core (extractability < 0.8, large methods)
+    std::vector<PlannedExtraction> phase2;
+    for (size_t i = 0; i < methods.size(); ++i) {
+        if (assigned[i]) continue;
+        if (methods[i].lines < 50) continue; // skip tiny methods
+        PlannedExtraction pe;
+        pe.method_indices.push_back(i);
+        pe.total_lines = methods[i].lines;
+        pe.module_name = methods[i].name + ".ts";
+        pe.description = methods[i].extractability < 0.5
+            ? "Mutation core — extract as function taking mutable state"
+            : "Mixed read/write — extract with care";
+        assigned[i] = true;
+        phase2.push_back(std::move(pe));
+    }
+
+    // Build response
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "file", path.c_str());
+    yyjson_mut_obj_add_int(doc.doc, root, "current_lines", total_lines);
+    yyjson_mut_obj_add_int(doc.doc, root, "target_max_lines", target_max);
+    yyjson_mut_obj_add_int(doc.doc, root, "method_count", static_cast<int>(methods.size()));
+
+    int extractable_lines = 0;
+    for (const auto& pe : phase1) extractable_lines += pe.total_lines;
+    for (const auto& pe : phase2) extractable_lines += pe.total_lines;
+    yyjson_mut_obj_add_int(doc.doc, root, "extractable_lines", extractable_lines);
+
+    int remaining = total_lines - extractable_lines;
+    yyjson_mut_obj_add_int(doc.doc, root, "estimated_shell_lines", remaining > 0 ? remaining : 100);
+
+    // Phases array
+    auto* phases_arr = doc.new_arr();
+
+    // Phase 1
+    if (!phase1.empty()) {
+        auto* p1 = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, p1, "phase", 1);
+        yyjson_mut_obj_add_strcpy(doc.doc, p1, "description", "Extract pure reader methods as standalone functions");
+
+        auto* modules = doc.new_arr();
+        for (const auto& pe : phase1) {
+            auto* mod = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, mod, "output_file", pe.module_name.c_str());
+            yyjson_mut_obj_add_int(doc.doc, mod, "total_lines", pe.total_lines);
+
+            auto* meths = doc.new_arr();
+            for (size_t mi : pe.method_indices) {
+                auto* mobj = doc.new_obj();
+                yyjson_mut_obj_add_strcpy(doc.doc, mobj, "name", methods[mi].name.c_str());
+                yyjson_mut_obj_add_int(doc.doc, mobj, "lines", methods[mi].lines);
+                yyjson_mut_obj_add_real(doc.doc, mobj, "extractability", methods[mi].extractability);
+                yyjson_mut_obj_add_int(doc.doc, mobj, "reads", methods[mi].reads);
+                yyjson_mut_obj_add_int(doc.doc, mobj, "writes", methods[mi].writes);
+                yyjson_mut_arr_append(meths, mobj);
+            }
+            yyjson_mut_obj_add_val(doc.doc, mod, "methods", meths);
+            yyjson_mut_arr_append(modules, mod);
+        }
+        yyjson_mut_obj_add_val(doc.doc, p1, "modules", modules);
+        yyjson_mut_arr_append(phases_arr, p1);
+    }
+
+    // Phase 2
+    if (!phase2.empty()) {
+        auto* p2 = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, p2, "phase", 2);
+        yyjson_mut_obj_add_strcpy(doc.doc, p2, "description", "Extract remaining large methods (mutation core)");
+
+        auto* modules = doc.new_arr();
+        for (const auto& pe : phase2) {
+            auto* mod = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, mod, "output_file", pe.module_name.c_str());
+            yyjson_mut_obj_add_int(doc.doc, mod, "total_lines", pe.total_lines);
+            yyjson_mut_obj_add_strcpy(doc.doc, mod, "note", pe.description.c_str());
+
+            auto* meths = doc.new_arr();
+            for (size_t mi : pe.method_indices) {
+                auto* mobj = doc.new_obj();
+                yyjson_mut_obj_add_strcpy(doc.doc, mobj, "name", methods[mi].name.c_str());
+                yyjson_mut_obj_add_int(doc.doc, mobj, "lines", methods[mi].lines);
+                yyjson_mut_obj_add_real(doc.doc, mobj, "extractability", methods[mi].extractability);
+                yyjson_mut_obj_add_int(doc.doc, mobj, "reads", methods[mi].reads);
+                yyjson_mut_obj_add_int(doc.doc, mobj, "writes", methods[mi].writes);
+                yyjson_mut_arr_append(meths, mobj);
+            }
+            yyjson_mut_obj_add_val(doc.doc, mod, "methods", meths);
+            yyjson_mut_arr_append(modules, mod);
+        }
+        yyjson_mut_obj_add_val(doc.doc, p2, "modules", modules);
+        yyjson_mut_arr_append(phases_arr, p2);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "phases", phases_arr);
+
+    // Instructions
+    auto* instructions = doc.new_arr();
+    yyjson_mut_arr_add_strcpy(doc.doc, instructions,
+        "Step 1: Create types.ts with a state interface listing all class fields");
+    yyjson_mut_arr_add_strcpy(doc.doc, instructions,
+        "Step 2: For each method to extract, call context_for(symbol=name, file=path) to get the body");
+    yyjson_mut_arr_add_strcpy(doc.doc, instructions,
+        "Step 3: Transform: replace 'this.extractedMethod(args)' with 'extractedMethod(p, args)', "
+        "replace 'this.field' with 'p.field', replace bare 'this' with 'p'");
+    yyjson_mut_arr_add_strcpy(doc.doc, instructions,
+        "Step 4: Rewrite index.ts as a thin shell: fields + constructor + one-liner delegations");
+    yyjson_mut_arr_add_strcpy(doc.doc, instructions,
+        "Step 5: Build and fix type errors after each phase");
+    yyjson_mut_obj_add_val(doc.doc, root, "instructions", instructions);
+
+    // Warnings from lessons learned
+    auto* warnings = doc.new_arr();
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "Use parameter name 'p' (not 's') for the state parameter to avoid shadowing "
+        "inner loop variables like 'for (const s of items)'");
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "Pure utility functions (0 field access) should NOT get a state parameter — "
+        "keep their original signature");
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "When extracting HTML template methods, keep <style>/<script> tags in the template "
+        "and extract only the content into string constants");
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "async methods need Promise<T> return type, not bare T");
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "Class methods called by extracted functions (updateWebview, loadAnnotations) "
+        "must be added to the state interface");
+    yyjson_mut_arr_add_strcpy(doc.doc, warnings,
+        "After renaming/moving files, node_ids change — use symbol+file lookup instead "
+        "of cached node_ids");
+    yyjson_mut_obj_add_val(doc.doc, root, "warnings", warnings);
+
     return doc.to_string();
 }
 

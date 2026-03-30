@@ -66,11 +66,13 @@ inline void create_tables(Connection& conn) {
             end_line INTEGER,
             end_col INTEGER,
             resolved_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
-            evidence TEXT
+            evidence TEXT,
+            containing_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL
         );
         CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id);
         CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name);
         CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id);
+        CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id);
     )SQL");
 
     conn.exec(R"SQL(
