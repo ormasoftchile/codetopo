@@ -192,13 +192,16 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Group methods in a file by shared field access patterns, weighted by read/write direction. Returns clusters with extractability scores (1.0=pure read, easily extractable; 0.0=heavily writes state, tightly coupled). Use to plan refactoring decomposition.",
         R"J({"type":"object","properties":{"path":{"type":"string","description":"File path (relative to repo root)"},"class_id":{"type":"integer","description":"Node ID of a class to analyze (alternative to path)"}}})J");
 
-    server.register_tool("refactor_plan", tools::refactor_plan,
-        "Generate a phased extraction plan to decompose a large class/file into smaller modules. "
-        "Analyzes every method's field access pattern (reads vs writes), computes extractability scores, "
-        "clusters methods by shared state, and returns a concrete plan with: which methods to extract, "
-        "into which files, in which order (pure readers first, mutation core second), plus instructions "
-        "and warnings for common pitfalls. Call this FIRST when asked to refactor a large file.",
-        R"J({"type":"object","properties":{"path":{"type":"string","description":"File path relative to repo root"},"target_max_lines":{"type":"integer","description":"Target maximum lines per file (default 800)"}},"required":["path"]})J");
+    server.register_tool("reindex",
+        [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
+                                          QueryCache& cache, const std::string& /*root*/) -> std::string {
+            reindex.trigger(repo_root, db_path, [&cache]() {
+                cache.clear();
+            });
+            return R"({"status":"started","message":"Re-indexing in background. Queries will reflect updated state once complete."})";
+        },
+        "Trigger a re-index of the repository. Runs in the background — subsequent tool calls will use fresh data once complete. Call this after making file changes (renames, moves, extractions) to ensure the index is up to date.",
+        R"J({"type":"object","properties":{}})J");
 
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
               << " freshness=" << static_cast<int>(freshness)

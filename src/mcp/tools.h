@@ -99,9 +99,5 @@ std::string method_fields(yyjson_val* params, Connection& conn,
 std::string dependency_cluster(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root);
 
-// T092: refactor_plan — generate a phased extraction plan for a large class/file
-std::string refactor_plan(yyjson_val* params, Connection& conn,
-                          QueryCache& cache, const std::string& repo_root);
-
 } // namespace tools
 } // namespace codetopo

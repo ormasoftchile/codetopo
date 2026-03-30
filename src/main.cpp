@@ -9,6 +9,7 @@
 #include "cli/cmd_mcp.h"
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
+#include "cli/cmd_skills.h"
 #include "index/supervisor.h"
 #include "util/repo.h"
 
@@ -112,6 +113,16 @@ int main(int argc, char** argv) {
     sub_doctor->add_option("--root", doctor_root, "Repository root directory")->default_val(".");
     sub_doctor->add_option("--db", doctor_db, "Database path (default: <root>/.codetopo/index.sqlite)");
 
+    // --- skills subcommand ---
+    auto* sub_skills = app.add_subcommand("skills", "Install agent skill files into a repository");
+    std::string skills_action;
+    std::string skills_name;
+    std::string skills_root = ".";
+
+    sub_skills->add_option("action", skills_action, "Action: list or install")->required();
+    sub_skills->add_option("name", skills_name, "Skill name (or 'all')");
+    sub_skills->add_option("--root", skills_root, "Repository root directory")->default_val(".");
+
     // --- Parse and dispatch ---
     CLI11_PARSE(app, argc, argv);
 
@@ -198,6 +209,9 @@ int main(int argc, char** argv) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
         }
+    }
+    if (sub_skills->parsed()) {
+        return codetopo::run_skills(skills_action, skills_name, skills_root);
     }
 
     return 0;
