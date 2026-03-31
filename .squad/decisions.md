@@ -126,6 +126,26 @@ Examined 6 changed files line-by-line. Arena fast-path adds ~20µs/file (extra b
 **Status:** Actionable findings  
 Per-phase profiling on 4145 C# files. With max-file-size 256KB: 829 files/s, zero contention — engine is fine for normal files. With max-file-size 1024KB: 45 files/s — extract blew up 13x (7.4s→98.7s thread-time) from unbounded extraction on large-AST files. Regression is tail-latency from ~0.1% pathological files. R1: add extraction timeout (highest priority). R2: lower default max-file-size to 512KB. R3: remove redundant tree-sitter set_timeout(30s). R4: log slow files.
 
+### DEC-029: Extraction timeout implementation — all R1-R4 recommendations (Grag, 2026-03-31)
+**Status:** Implemented, build + tests verified  
+Implemented all four DEC-028 recommendations. R1: Added `Config::extraction_timeout_s = 10` and `--extract-timeout` CLI flag on index and init subcommands; supervisor plumbs to child; Extractor constructor receives extraction-specific timeout. R2: Lowered `max_file_size_kb` default from 10240 to 512. R3: Removed redundant `parser.set_timeout(30s)` from cmd_index.cpp worker lambda (parse averages 1.8ms/file, never bottleneck). R4: Added `extract_us` field to ParsedFile; files exceeding 2 seconds log `[SLOW]` tag with timing and symbol count; summary line includes slow file count. Enabled Joan's blocked test (Scenario 4). Release build: 0 errors, 0 warnings. All 185 tests pass (964 assertions), up from 179 (939).
+
+### DEC-030: Extraction timeout test coverage — proactive suite (Joan, 2026-03-31)
+**Status:** Implemented, 6 tests passing  
+Added test_extraction_timeout.cpp with 6 test cases (5 live + 1 gated). Coverage: deadline truncation via cancel_flag (deterministic, 1000 functions → 20K+ nodes), generous timeout no-truncation, Config default max_file_size_kb==512 (R2), Config extraction_timeout_s field (R1), timeout_s=0 unlimited, truncated results contain partial data. Deterministic testing pattern: pre-set cancel_flag=1 to guarantee parse returns nullptr on first check, avoiding hardware variance. Tests validated R2-R5 immediately; test 4 gated until Grag added R1, then unblocked and passing. All 185 tests pass (964 assertions).
+
+### DEC-031: Profiling infrastructure — --max-files flag and profile_subset.bat (Otho, 2026-03-31)
+**Status:** Implemented, build + tests verified  
+Added `--max-files N` CLI flag on index and init subcommands to truncate scanned file list (0=unlimited); plumbed through Config → Scanner → Supervisor. Added profile_subset.bat with presets (tiny/small/fsm/medium/large/full) for fast iteration on large repos. Design: truncation after scanning (simpler, no scan loop changes). For large git repos, `--root` to subdirectory preferred over `--max-files` alone (avoids 72s git ls-files overhead). Profiling script deletes DB before each run for clean cold-index benchmarks. Validated: tiny (500 files, 10.4s), fsm (4145 files, 39.4s). All 179 tests pass (939 assertions).
+
+### DEC-032: Persist pipeline optimization — R3 batch drain + R4 cold index skip (Grag, 2026-03-31)
+**Status:** Implemented, build + benchmark verified  
+R3: Batch drain — main thread dequeues ALL available results from completion queue under a single lock instead of one-at-a-time. R4: Cold index flag — `enable_cold_index_if_empty()` queries files table; when empty, skips DELETE step in persist_file() (no-op on empty tables but has B-tree + FK cascade overhead). Benchmark (fsm, 4145 files): wall 36.2s→20.5s (-43%), persist 13.7s→6.2s (-55%, 3.3→1.5ms/file), overall 114→200 files/s (+76%). Contention rose from 0.1s→6.4s as expected — persist no longer dominant bottleneck; workers (parse+extract) now constrain pipeline.
+
+### DEC-033: Persist pipeline test conventions — WAL-safe temp directory pattern (Joan, 2026-03-31)
+**Status:** Implemented, 18 tests passing
+Key finding: Stale temp directories from previous test runs prevent deletion on Windows; Connection opens stale DB; ensure_schema silently preserves old data → false test failures. Established pattern: use `make_test_dir(name)` helper that cleanup BEFORE create_directories (in addition to existing DEC-008 cleanup-at-end pattern). This is backward-compatible with DEC-008. All DB-based tests now use this pattern. Added 18 comprehensive test cases (132 assertions) in `test_persist_pipeline.cpp` covering cold index, warm index, correctness, batch atomicity, and out-of-order drain scenarios. Full suite: 203 tests, 1096 assertions, all green.
+
 ## Governance
 
 - All meaningful changes require team consensus
