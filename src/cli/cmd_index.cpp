@@ -17,8 +17,12 @@
 #include "util/hash.h"
 #include "util/git.h"
 #include "util/lock.h"
+#include "util/profiler.h"
 #include <iostream>
+#include <iomanip>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -65,6 +69,7 @@ struct ParsedFile {
     std::string parse_status;   // ok, partial, failed, skipped
     std::string parse_error;
     bool has_error = false;
+    int64_t extract_us = 0;    // per-file extraction time for slow-file logging (R4)
 };
 
 // T045-T050: Full index command implementation with parallel parse.
@@ -89,6 +94,11 @@ int run_index(const Config& config) {
     // Register arena allocator with Tree-sitter (T008)
     register_arena_allocator();
 
+    // Profiler — activated by --profile flag
+    Profiler profiler;
+    profiler.enabled = config.profile;
+    auto pipeline_start = std::chrono::steady_clock::now();
+
     // Open DB and ensure schema (T010, T011)
     Connection conn(db_path);
     int schema_rc = schema::ensure_schema(conn);
@@ -110,12 +120,20 @@ int run_index(const Config& config) {
     // Scan repository (T025-T028)
     std::cerr << "Scanning " << repo_root.string() << "...\n";
     Scanner scanner(config);
-    auto scanned_files = scanner.scan();
+    std::vector<ScannedFile> scanned_files;
+    {
+        ScopedPhase _sp(profiler.scan);
+        scanned_files = scanner.scan();
+    }
     std::cerr << "Found " << scanned_files.size() << " source files\n";
 
     // Detect changes (T029)
     ChangeDetector detector(conn);
-    auto changes = detector.detect(scanned_files);
+    ChangeDetector::ChangeResult changes;
+    {
+        ScopedPhase _sp(profiler.change_detect);
+        changes = detector.detect(scanned_files);
+    }
 
     std::cerr << "New: " << changes.new_files.size()
               << " Changed: " << changes.changed_files.size()
@@ -139,6 +157,7 @@ int run_index(const Config& config) {
     // Prune deleted files (T041)
     Persister persister(conn);
     if (!changes.deleted_paths.empty()) {
+        ScopedPhase _sp(profiler.prune);
         int pruned = persister.prune_deleted(changes.deleted_paths);
         std::cerr << "Pruned " << pruned << " deleted files\n";
     }
@@ -176,12 +195,10 @@ int run_index(const Config& config) {
     }
 
     // --- T045: Parallel parse, pipelined persist ---
-    // Architecture: submit ALL files to thread pool up front. Workers parse
-    // continuously. Main thread consumes futures in order and persists each
-    // result. Workers never stall waiting for a batch boundary — they always
-    // have work queued. Arena pool is 2x thread count so workers can lease
-    // arenas even while main thread holds completed ParsedFile objects that
-    // haven't been persisted yet (those arenas are already returned).
+    // Architecture: workers push results to a queue as they complete.
+    // Main thread drains the queue and persists in completion order.
+    // No head-of-line blocking: a stuck file only wastes one thread,
+    // not the entire pipeline.
     int thread_count = config.effective_thread_count();
     size_t arena_size = config.arena_size_bytes();
     ArenaPool arena_pool(thread_count * 2, arena_size);
@@ -191,8 +208,8 @@ int run_index(const Config& config) {
 
     auto start_time = std::chrono::steady_clock::now();
 
-    // Progress: every 1% or every 500 files, whichever is smaller
-    int progress_interval = (std::max)(1, (std::min)(total / 100, 500));
+    // Progress: every 1% of total files
+    int progress_interval = (std::max)(1, total / 100);
 
     std::cerr << "Indexing " << total << " files with " << thread_count
               << " threads (arena " << config.arena_size_mb << " MB)\n";
@@ -218,135 +235,216 @@ int run_index(const Config& config) {
 
     ThreadPool pool(thread_count);
 
-    // 1) Submit ALL parse tasks up front — thread pool queues them internally.
-    //    Workers will process them continuously without batch stalls.
-    std::vector<std::future<ParsedFile>> futures;
-    futures.reserve(total);
+    // Result queue: workers push here, main thread drains.
+    std::mutex result_mutex;
+    std::condition_variable result_cv;
+    std::queue<ParsedFile> result_queue;
 
+    // Parse one file — pure function, returns result.
+    // Uses profiler phase accumulators for cross-thread timing.
+    auto parse_one = [&arena_pool, &config, &profiler]
+        (const ScannedFile& file) -> ParsedFile {
+        using clock = std::chrono::steady_clock;
+        ParsedFile result;
+        result.file = file;
+
+#ifdef _WIN32
+        _set_se_translator(seh_translator);
+#endif
+        try {
+
+        auto t0 = clock::now();
+        ArenaLease lease(arena_pool);
+        set_thread_arena(lease.get());
+        auto t1 = clock::now();
+        profiler.arena_lease.add(std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+        if (static_cast<size_t>(file.size_bytes) > config.max_file_size_bytes()) {
+            result.content_hash = hash_file(file.absolute_path);
+            result.parse_status = "partial";
+            result.parse_error = "file exceeds max size";
+            return result;
+        }
+
+        size_t arena_cap = lease.get()->capacity();
+        if (static_cast<size_t>(file.size_bytes) * 30 > arena_cap) {
+            result.content_hash = hash_file(file.absolute_path);
+            result.parse_status = "partial";
+            result.parse_error = "file too large for arena (" +
+                std::to_string(file.size_bytes / (1024*1024)) + "MB file, " +
+                std::to_string(arena_cap / (1024*1024)) + "MB arena)";
+            return result;
+        }
+
+        auto t_rd0 = clock::now();
+        auto content = read_file_content(file.absolute_path);
+        auto t_rd1 = clock::now();
+        profiler.file_read.add(std::chrono::duration_cast<std::chrono::microseconds>(t_rd1 - t_rd0).count());
+        if (content.empty()) {
+            result.parse_status = "failed";
+            result.parse_error = "could not read file";
+            result.has_error = true;
+            return result;
+        }
+
+        auto t_h0 = clock::now();
+        result.content_hash = hash_string(content);
+        auto t_h1 = clock::now();
+        profiler.hash.add(std::chrono::duration_cast<std::chrono::microseconds>(t_h1 - t_h0).count());
+
+        Parser parser;
+        if (!parser.set_language(file.language)) {
+            result.parse_status = "skipped";
+            result.parse_error = "language grammar not available";
+            return result;
+        }
+
+        // DEC-028 R3: tree-sitter set_timeout removed — parse phase is fast
+        // (1.8ms/file avg). Extraction timeout (R1) is the real defense against
+        // tail-latency from large-AST files.
+
+        auto t_p0 = clock::now();
+        auto tree = TreeGuard(parser.parse(content));
+        auto t_p1 = clock::now();
+        profiler.parse.add(std::chrono::duration_cast<std::chrono::microseconds>(t_p1 - t_p0).count());
+        if (!tree) {
+            result.parse_status = "failed";
+            result.parse_error = config.parse_timeout_s > 0
+                ? "tree-sitter parse failed (possible timeout)"
+                : "tree-sitter parse failed";
+            result.has_error = true;
+            return result;
+        }
+
+        Extractor extractor(config.max_symbols_per_file, config.max_ast_depth,
+                            config.extraction_timeout_s);
+        auto t_e0 = clock::now();
+        result.extraction = extractor.extract(tree.tree, content, file.language, file.relative_path);
+        auto t_e1 = clock::now();
+        auto extract_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(t_e1 - t_e0).count();
+        profiler.extract.add(extract_elapsed);
+        result.extract_us = extract_elapsed;
+
+        result.parse_status = result.extraction.truncated ? "partial" : "ok";
+        result.parse_error = result.extraction.truncated ? result.extraction.truncation_reason : "";
+
+#ifdef _WIN32
+        } catch (const SehException& e) {
+            char buf[64]; snprintf(buf, sizeof(buf), "SEH 0x%08X during parse/extract", e.code);
+            result.parse_status = "failed";
+            result.parse_error = buf;
+            result.has_error = true;
+#endif
+        } catch (const std::exception& e) {
+            result.parse_status = "failed";
+            result.parse_error = std::string("exception: ") + e.what();
+            result.has_error = true;
+        }
+
+        return result;
+    };
+
+    // 1) Submit ALL parse tasks. Workers push results to queue as they complete.
     for (int i = 0; i < total; ++i) {
         auto& file = work_list[i];
-        futures.push_back(pool.submit([&file, &arena_pool, &config]() -> ParsedFile {
-            ParsedFile result;
-            result.file = file;
-
-#ifdef _WIN32
-            // Install per-thread SEH translator so access violations become C++ exceptions
-            _set_se_translator(seh_translator);
-#endif
-            try {
-
-            // Lease arena for this thread
-            ArenaLease lease(arena_pool);
-            set_thread_arena(lease.get());
-
-            // Check file size limit (T043)
-            if (static_cast<size_t>(file.size_bytes) > config.max_file_size_bytes()) {
-                result.content_hash = hash_file(file.absolute_path);
-                result.parse_status = "partial";
-                result.parse_error = "file exceeds max size";
-                return result;
+        pool.submit([&file, &parse_one, &result_mutex, &result_cv, &result_queue]() -> ParsedFile {
+            auto result = parse_one(file);
+            {
+                std::lock_guard<std::mutex> lk(result_mutex);
+                result_queue.push(std::move(result));
             }
-
-            // Check file vs arena capacity: tree-sitter needs ~20-50x file size in arena.
-            // Skip files that would overflow the arena to prevent crashes.
-            size_t arena_cap = lease.get()->capacity();
-            if (static_cast<size_t>(file.size_bytes) * 30 > arena_cap) {
-                result.content_hash = hash_file(file.absolute_path);
-                result.parse_status = "partial";
-                result.parse_error = "file too large for arena (" +
-                    std::to_string(file.size_bytes / (1024*1024)) + "MB file, " +
-                    std::to_string(arena_cap / (1024*1024)) + "MB arena)";
-                return result;
-            }
-
-            // Read file content
-            auto content = read_file_content(file.absolute_path);
-            if (content.empty()) {
-                result.parse_status = "failed";
-                result.parse_error = "could not read file";
-                result.has_error = true;
-                return result;
-            }
-
-            result.content_hash = hash_string(content);
-
-            // Parse with Tree-sitter (T030)
-            Parser parser;
-            if (!parser.set_language(file.language)) {
-                result.parse_status = "skipped";
-                result.parse_error = "language grammar not available";
-                return result;
-            }
-
-            auto tree = TreeGuard(parser.parse(content));
-            if (!tree) {
-                result.parse_status = "failed";
-                result.parse_error = "tree-sitter parse failed";
-                result.has_error = true;
-                return result;
-            }
-
-            // Extract symbols, refs, edges (T031-T037)
-            Extractor extractor(config.max_symbols_per_file, config.max_ast_depth);
-            result.extraction = extractor.extract(tree.tree, content, file.language, file.relative_path);
-
-            result.parse_status = result.extraction.truncated ? "partial" : "ok";
-            result.parse_error = result.extraction.truncated ? result.extraction.truncation_reason : "";
-
-#ifdef _WIN32
-            } catch (const SehException& e) {
-                char buf[64]; snprintf(buf, sizeof(buf), "SEH 0x%08X during parse/extract", e.code);
-                result.parse_status = "failed";
-                result.parse_error = buf;
-                result.has_error = true;
-#endif
-            } catch (const std::exception& e) {
-                result.parse_status = "failed";
-                result.parse_error = std::string("exception: ") + e.what();
-                result.has_error = true;
-            }
-
-            return result;
-            // Arena resets automatically via ArenaLease destructor
-        }));
+            result_cv.notify_one();
+            return ParsedFile{};
+        });
     }
 
-    // 2) Main thread: consume futures in order, persist each result.
-    //    Workers are continuously parsing ahead while we persist here.
-    //    Batch transactions: commit every batch_size files instead of per-file.
+    // 2) Main thread: drain results as they complete (no ordering).
+    //    R3: Batch drain — dequeue ALL available results under a single lock,
+    //    reducing lock/unlock cycles and condition variable overhead.
+    //    R4: Cold index — skip DELETE when DB has no existing files.
+    persister.enable_cold_index_if_empty();
+    if (persister.is_cold_index()) {
+        std::cerr << "Cold index: skipping DELETE phase\n";
+    }
     persister.begin_batch();
-    for (int i = 0; i < total; ++i) {
-        // Print current file BEFORE get() so we know which file crashes
-        std::cerr << "\r[" << (i+1) << "/" << total << "] "
-                  << work_list[i].relative_path << std::flush;
+    int done = 0;
+    double total_wait_ms = 0;
+    int wait_count = 0;       // times main thread had to wait (queue was empty)
+    int timeouts = 0;         // files that hit extraction timeout
+    int slow_files = 0;       // R4: files that took >2s to extract
+    constexpr int64_t slow_threshold_us = 2000000;  // 2 seconds
 
-        auto result = futures[i].get();
+    std::vector<ParsedFile> drain_batch;
+    drain_batch.reserve((std::min)(total, thread_count * 4));
 
-        if (result.has_error) {
-            errors.fetch_add(1, std::memory_order_relaxed);
+    while (done < total) {
+        // R3: Drain all available results under a single lock
+        {
+            auto wait_start = std::chrono::steady_clock::now();
+            std::unique_lock<std::mutex> lk(result_mutex);
+            result_cv.wait(lk, [&] { return !result_queue.empty(); });
+            auto wait_end = std::chrono::steady_clock::now();
+            auto wait_us = std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start).count();
+            double wait_ms = static_cast<double>(wait_us) / 1000.0;
+            total_wait_ms += wait_ms;
+            if (wait_ms > 1.0) {
+                wait_count++;
+                profiler.contention.add(wait_us);
+            }
+            while (!result_queue.empty()) {
+                drain_batch.push_back(std::move(result_queue.front()));
+                result_queue.pop();
+            }
         }
 
-        if (!persister.persist_file(result.file, result.extraction,
-                                    result.content_hash, result.parse_status,
-                                    result.parse_error)) {
-            errors.fetch_add(1, std::memory_order_relaxed);
-        }
+        // Process the entire batch outside the lock
+        for (auto& result : drain_batch) {
+            if (result.has_error) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (result.parse_error.find("timeout") != std::string::npos) {
+                timeouts++;
+            }
 
-        persister.flush_if_needed(effective_batch_size);
+            // DEC-028 R4: Log slow files so users can identify pathological files
+            if (result.extract_us > slow_threshold_us) {
+                slow_files++;
+                std::cerr << "\n  [SLOW] " << result.file.relative_path
+                          << " extract=" << (result.extract_us / 1000) << "ms"
+                          << " (" << result.extraction.symbols.size() << " symbols"
+                          << (result.extraction.truncated ? ", truncated" : "")
+                          << ")\n";
+            }
 
-        // Progress reporting
-        int done = i + 1;
-        if (done % progress_interval == 0 || done == total) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            double rate = elapsed_s > 0 ? static_cast<double>(done) / elapsed_s : 0;
-            int pct = static_cast<int>(100.0 * done / total);
-            std::cerr << "[" << done << "/" << total << "] "
-                      << pct << "% "
-                      << elapsed_s << "s "
-                      << static_cast<int>(rate) << " files/s"
-                      << "\n";
+            {
+                ScopedPhase _sp(profiler.persist);
+                if (!persister.persist_file(result.file, result.extraction,
+                                            result.content_hash, result.parse_status,
+                                            result.parse_error)) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            {
+                ScopedPhase _sp(profiler.flush);
+                persister.flush_if_needed(effective_batch_size);
+            }
+            done++;
+
+            // Progress reporting
+            if (done % progress_interval == 0 || done == total) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                double rate = elapsed_s > 0 ? static_cast<double>(done) / elapsed_s : 0;
+                int pct = static_cast<int>(100.0 * done / total);
+                std::cerr << "\r\033[K[" << done << "/" << total << "] "
+                          << pct << "% "
+                          << elapsed_s << "s "
+                          << static_cast<int>(rate) << " files/s"
+                          << std::flush;
+            }
         }
+        drain_batch.clear();
     }
     persister.commit_batch();
 
@@ -354,35 +452,84 @@ int run_index(const Config& config) {
     auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
     double rate = elapsed_s > 0 ? static_cast<double>(total) / elapsed_s : 0;
 
-    std::cerr << "Done: " << total << " files in " << elapsed_s << "s"
+    std::cerr << "\nDone: " << total << " files in " << elapsed_s << "s"
               << " (" << static_cast<int>(rate) << " files/s)";
     if (errors > 0) std::cerr << " [" << errors << " errors]";
+    if (timeouts > 0) std::cerr << " [" << timeouts << " timeouts]";
+    if (slow_files > 0) std::cerr << " [" << slow_files << " slow]";
     std::cerr << "\n";
+    std::cerr << "Contention: main thread waited "
+              << std::fixed << std::setprecision(1) << (total_wait_ms / 1000.0)
+              << "s across " << wait_count << " stalls\n";
 
-    // --- Rebuild indexes after bulk insert (much faster than maintaining during insert) ---
+    // Per-phase profiling report (always printed — lightweight summary)
+    int64_t pf = profiler.extract.load_count();
+    if (pf > 0) {
+        auto us_to_s = [](int64_t us) { return static_cast<double>(us) / 1000000.0; };
+        auto avg_us = [pf](int64_t us) { return static_cast<double>(us) / pf; };
+        std::cerr << "Profile (" << pf << " files): "
+                  << "arena=" << std::setprecision(1) << us_to_s(profiler.arena_lease.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.arena_lease.load_us()) << "us/f) "
+                  << "read=" << std::setprecision(1) << us_to_s(profiler.file_read.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.file_read.load_us()) << "us/f) "
+                  << "hash=" << std::setprecision(1) << us_to_s(profiler.hash.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.hash.load_us()) << "us/f) "
+                  << "parse=" << std::setprecision(1) << us_to_s(profiler.parse.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.parse.load_us()) << "us/f) "
+                  << "extract=" << std::setprecision(1) << us_to_s(profiler.extract.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.extract.load_us()) << "us/f) "
+                  << "persist=" << std::setprecision(1) << us_to_s(profiler.persist.load_us()) << "s "
+                  << "(" << std::setprecision(0) << avg_us(profiler.persist.load_us()) << "us/f)\n";
+    }
+
+    // --- Rebuild read-path indexes (needed by resolve_references) ---
     if (bulk_mode) {
-        std::cerr << "Rebuilding indexes...\n";
+        std::cerr << "Rebuilding read-path indexes...\n";
         auto idx_start = std::chrono::steady_clock::now();
-        schema::rebuild_indexes(conn);
+        {
+            ScopedPhase _sp(profiler.idx_read);
+            schema::rebuild_read_indexes(conn);
+        }
         auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - idx_start).count();
-        std::cerr << "Indexes rebuilt in " << idx_elapsed << "s\n";
+        std::cerr << "Read indexes rebuilt in " << idx_elapsed << "s\n";
     }
 
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     std::cerr << "Resolving cross-file references...\n";
     auto resolve_start = std::chrono::steady_clock::now();
-    auto [refs_resolved, edges_created] = persister.resolve_references();
+    std::pair<int,int> resolve_result;
+    {
+        ScopedPhase _sp(profiler.resolve_refs);
+        resolve_result = persister.resolve_references();
+    }
+    auto [refs_resolved, edges_created] = resolve_result;
     auto resolve_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - resolve_start).count();
     std::cerr << "Resolved " << refs_resolved << " refs, created "
               << edges_created << " edges in " << resolve_elapsed << "s\n";
 
+    // --- Rebuild write-path indexes (after resolver — avoids per-row maintenance cost) ---
+    if (bulk_mode) {
+        std::cerr << "Rebuilding write-path indexes...\n";
+        auto widx_start = std::chrono::steady_clock::now();
+        {
+            ScopedPhase _sp(profiler.idx_write);
+            schema::rebuild_write_indexes(conn);
+        }
+        auto widx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - widx_start).count();
+        std::cerr << "Write indexes rebuilt in " << widx_elapsed << "s\n";
+    }
+
     // Rebuild FTS5 index in one pass (much faster than per-row triggers)
     if (bulk_mode) {
         std::cerr << "Rebuilding FTS5 index...\n";
         auto fts_start = std::chrono::steady_clock::now();
-        fts::rebuild(conn);
+        {
+            ScopedPhase _sp(profiler.fts_rebuild);
+            fts::rebuild(conn);
+        }
         auto fts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - fts_start).count();
         std::cerr << "FTS5 rebuilt in " << fts_elapsed << "s\n";
@@ -392,10 +539,22 @@ int run_index(const Config& config) {
     fts::create_sync_triggers(conn);
 
     // Write metadata (T049)
-    persister.write_metadata(repo_root.string());
+    {
+        ScopedPhase _sp(profiler.metadata);
+        persister.write_metadata(repo_root.string());
+    }
 
     // WAL checkpoint (T050)
-    conn.wal_checkpoint();
+    {
+        ScopedPhase _sp(profiler.wal_ckpt);
+        conn.wal_checkpoint();
+    }
+
+    // Comprehensive profiling report (only with --profile)
+    auto pipeline_end = std::chrono::steady_clock::now();
+    auto pipeline_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        pipeline_end - pipeline_start).count();
+    profiler.print_report(pipeline_us, total, thread_count);
 
     return errors > 0 ? 1 : 0;
 }
