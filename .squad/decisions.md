@@ -98,6 +98,18 @@ Parser timeout and extractor timeout infrastructure existed but were never calle
 **Status:** Implemented, build verified, all tests pass  
 Reverted cmd_index.cpp from SlotState/windowed submission (690 lines) to simple futures (545 lines, 21% reduction). Removed: SlotState struct, IndexedResult queue, try_submit_one(), window budgeting, complex watchdog. Restored: ThreadPool pool(thread_count) + futures.reserve(total) + sequential futures[i].get(). Added: WatchdogEntry struct (~30 lines) with thread_local slot, atomic timestamps, cancel flags. All prior arena/sort/batch/deferred-index work preserved.
 
+### DEC-025: Extractor deadline check frequency 0xFFFF→0xFFF (Grag, 2026-03-31)
+**Status:** Implemented, build + tests + benchmark verified  
+Extractor's deadline check was firing every 65536 nodes (0xFFFF mask), meaning large-AST files with 500K+ nodes only checked ~8 times — the deadline could be exceeded by 10-15 seconds before detection, tanking throughput to 213 files/s. Changed to every 4096 nodes (0xFFF mask). `steady_clock::now()` costs ~15ns so overhead is negligible (~60ns per 4096-node batch). `cancel_flag_` confirmed not wired up from cmd_index.cpp — deadline is sole enforcement and sufficient. DFS truncation correctly halts the walk via `result_->truncated` check. Benchmark: 55792 files at 395 files/s (up from 213), 12 timeouts caught, extract time 2609us/f. All 179 tests pass (939 assertions).
+
+### DEC-026: Remaining throughput gap analysis — 278 vs 829 files/s (Otho, 2026-03-31)
+**Status:** Analysis complete, recommendations pending implementation  
+Workers (16 threads) produce at 2,100+ files/s but single-threaded SQLite persist caps pipeline at 278 files/s. Per-file persist costs 3.6ms (5 re-prepared SQL statements, SQLITE_TRANSIENT string copies, DELETE-cascade on cold index). Recommendations ranked: R1 cache prepared statements + R2 SQLITE_STATIC (quick wins, +25-40%), R3 pipelined drain (moderate, +10-20%), R4 skip DELETE on cold index, R7 parallel WAL persist (nuclear option for >500 files/s). Worker optimization is exhausted — next gains must come from persist side.
+
+### DEC-027: SQLite prepared statement caching + SQLITE_STATIC (Grag, 2026-03-31)
+**Status:** Implemented and verified  
+Cached 6 prepared statements in Persister (lazily prepared, reused via `sqlite3_reset()` + `sqlite3_clear_bindings()`, finalized in destructor). Switched all `persist_file()` string binds from SQLITE_TRANSIENT to SQLITE_STATIC (source data lives through `sqlite3_step()`). Class now non-copyable/non-movable for RAII. Benchmark: 200s→136s wall time (-32%), 278→410 files/s (+47%). Contention spike from 0.9s→87.7s is expected — workers now outpace persist more, proving persist was the bottleneck. All 179 tests pass (939 assertions).
+
 ### DEC-025: Thread pool sizing error — 72 threads created instead of 18 (Otho, 2026-03-30)
 **Status:** Analysis complete, actionable  
 ThreadPool constructed with `window_size` (72) instead of `thread_count` (18). Creates 4x oversubscription: 72 OS threads on 18 cores, 576MB committed stacks, 32 threads permanently blocked on arena pool. Context switching destroys cache locality for tree-sitter's memory-intensive parsing. One-line fix: `ThreadPool worker_pool(thread_count, 8*1024*1024)`. Also recommends `STACK_SIZE_PARAM_IS_A_RESERVATION` flag in `_beginthreadex` to reserve rather than commit stack memory.
