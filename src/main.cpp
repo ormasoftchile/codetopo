@@ -10,6 +10,7 @@
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
 #include "cli/cmd_skills.h"
+#include "cli/cmd_parse_file.h"
 #include "index/supervisor.h"
 #include "util/repo.h"
 
@@ -23,23 +24,43 @@ int main(int argc, char** argv) {
     std::string index_db;
     int index_threads = 0;
     int index_arena_size = 128;
-    int index_batch_size = 100;
-    int index_max_file_size = 10;
+    int index_large_arena_size = 0;
+    int index_large_file_threshold = 0;
+    int index_batch_size = 500;
+    int index_max_file_size = 10240;
     int index_max_symbols = 50000;
     bool index_no_gitignore = false;
+    bool index_turbo = false;
+    std::vector<std::string> index_exclude;
     bool index_supervised = false;
     bool index_safe_mode = false;
+    bool index_resume = false;
+    bool index_profile = false;
+    int index_max_files = 0;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
     sub_index->add_option("--threads", index_threads, "Worker thread count (0=auto)")->default_val(0);
     sub_index->add_option("--arena-size", index_arena_size, "Arena size in MB per thread")->default_val(128);
-    sub_index->add_option("--batch-size", index_batch_size, "Files per transaction batch")->default_val(100);
-    sub_index->add_option("--max-file-size", index_max_file_size, "Max file size in MB")->default_val(10);
+    sub_index->add_option("--large-arena-size", index_large_arena_size, "Large arena size in MB for oversized files (0=disabled)")->default_val(0);
+    sub_index->add_option("--large-file-threshold", index_large_file_threshold, "File size in KB above which the large arena is used (0=auto: arena/30)")->default_val(0);
+    sub_index->add_option("--batch-size", index_batch_size, "Files per transaction batch")->default_val(500);
+    sub_index->add_flag("--turbo", index_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
+    int index_parse_timeout = 30;
+    sub_index->add_option("--max-file-size", index_max_file_size, "Max file size in KB")->default_val(10240);
+    sub_index->add_option("--parse-timeout", index_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(30);
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
+    sub_index->add_option("--exclude", index_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
+    sub_index->add_flag("--profile", index_profile, "Print detailed per-phase profiling report");
+    sub_index->add_option("--max-files", index_max_files, "Limit total files to index (0=unlimited, for profiling)")->default_val(0);
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
+    sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
+    int index_progress_offset = 0;
+    int index_progress_total = 0;
+    sub_index->add_option("--progress-offset", index_progress_offset, "Files already done (internal)")->group("");
+    sub_index->add_option("--progress-total", index_progress_total, "Original total (internal)")->group("");
 
     // --- init subcommand ---
     auto* sub_init = app.add_subcommand("init", "Index a repository and configure editors for MCP");
@@ -47,8 +68,14 @@ int main(int argc, char** argv) {
     std::string init_editors = "auto";
     int init_threads = 0;
     int init_arena_size = 128;
-    int init_max_file_size = 10;
+    int init_large_arena_size = 0;
+    int init_large_file_threshold = 0;
+    int init_max_file_size = 10240;
     bool init_watch = true;
+    bool init_turbo = false;
+    bool init_profile = false;
+    int init_max_files = 0;
+    std::vector<std::string> init_exclude;
     std::string init_freshness = "normal";
 
     sub_init->add_option("--root", init_root, "Repository root directory")->default_val(".");
@@ -56,7 +83,15 @@ int main(int argc, char** argv) {
         "Comma-separated editors: vscode,cursor,windsurf,claude,auto")->default_val("auto");
     sub_init->add_option("--threads", init_threads, "Worker thread count (0=auto)")->default_val(0);
     sub_init->add_option("--arena-size", init_arena_size, "Arena size in MB per thread")->default_val(128);
-    sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in MB")->default_val(10);
+    sub_init->add_option("--large-arena-size", init_large_arena_size, "Large arena size in MB for oversized files (0=disabled)")->default_val(0);
+    sub_init->add_option("--large-file-threshold", init_large_file_threshold, "File size in KB above which the large arena is used (0=auto: arena/30)")->default_val(0);
+    int init_parse_timeout = 30;
+    sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in KB")->default_val(10240);
+    sub_init->add_option("--parse-timeout", init_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(30);
+    sub_init->add_flag("--turbo", init_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
+    sub_init->add_flag("--profile", init_profile, "Print detailed per-phase profiling report");
+    sub_init->add_option("--max-files", init_max_files, "Limit total files to index (0=unlimited, for profiling)")->default_val(0);
+    sub_init->add_option("--exclude", init_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
     sub_init->add_flag("--watch,!--no-watch", init_watch,
         "Include --watch in MCP config (default: true)")->default_val(true);
     sub_init->add_option("--freshness", init_freshness,
@@ -123,6 +158,24 @@ int main(int argc, char** argv) {
     sub_skills->add_option("name", skills_name, "Skill name (or 'all')");
     sub_skills->add_option("--root", skills_root, "Repository root directory")->default_val(".");
 
+    // --- parse-file subcommand ---
+    auto* sub_parse_file = app.add_subcommand("parse-file", "Parse a single file and show detailed diagnostics");
+    std::string pf_file;
+    int pf_arena_size = 1024;
+    int pf_timeout = 0;
+    int pf_max_symbols = 50000;
+    bool pf_symbols = false;
+    bool pf_refs = false;
+    bool pf_edges = false;
+
+    sub_parse_file->add_option("file", pf_file, "File path to parse")->required();
+    sub_parse_file->add_option("--arena-size", pf_arena_size, "Arena size in MB")->default_val(1024);
+    sub_parse_file->add_option("--parse-timeout", pf_timeout, "Parse timeout in seconds (0=no limit)")->default_val(0);
+    sub_parse_file->add_option("--max-symbols", pf_max_symbols, "Max symbols to extract")->default_val(50000);
+    sub_parse_file->add_flag("--symbols", pf_symbols, "Show all extracted symbols");
+    sub_parse_file->add_flag("--refs", pf_refs, "Show all extracted references");
+    sub_parse_file->add_flag("--edges", pf_edges, "Show all extracted edges");
+
     // --- Parse and dispatch ---
     CLI11_PARSE(app, argc, argv);
 
@@ -134,12 +187,22 @@ int main(int argc, char** argv) {
         cfg.db_path = index_db;
         cfg.thread_count = index_threads;
         cfg.arena_size_mb = index_arena_size;
+        cfg.large_arena_size_mb = index_large_arena_size;
+        cfg.large_file_threshold_kb = index_large_file_threshold;
         cfg.batch_size = index_batch_size;
-        cfg.max_file_size_mb = index_max_file_size;
+        cfg.max_file_size_kb = index_max_file_size;
+        cfg.parse_timeout_s = index_parse_timeout;
         cfg.max_symbols_per_file = index_max_symbols;
         cfg.no_gitignore = index_no_gitignore;
+        cfg.turbo = index_turbo;
+        cfg.exclude_patterns = index_exclude;
+        cfg.profile = index_profile;
+        cfg.max_files = index_max_files;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
+        cfg.resume = index_resume;
+        cfg.progress_offset = index_progress_offset;
+        cfg.progress_total = index_progress_total;
         try {
             if (cfg.supervised) {
                 // Running as a supervised child — index directly
@@ -157,7 +220,12 @@ int main(int argc, char** argv) {
         try {
             return codetopo::run_init(init_root, init_editors,
                                       init_threads, init_arena_size,
+                                      init_large_arena_size,
+                                      init_large_file_threshold,
                                       init_max_file_size,
+                                      init_parse_timeout,
+                                      init_turbo, init_profile,
+                                       init_max_files, init_exclude,
                                       init_watch, init_freshness);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
@@ -212,6 +280,22 @@ int main(int argc, char** argv) {
     }
     if (sub_skills->parsed()) {
         return codetopo::run_skills(skills_action, skills_name, skills_root);
+    }
+    if (sub_parse_file->parsed()) {
+        codetopo::ParseFileConfig pf_cfg;
+        pf_cfg.file_path = pf_file;
+        pf_cfg.arena_size_mb = pf_arena_size;
+        pf_cfg.parse_timeout_s = pf_timeout;
+        pf_cfg.max_symbols = pf_max_symbols;
+        pf_cfg.show_symbols = pf_symbols;
+        pf_cfg.show_refs = pf_refs;
+        pf_cfg.show_edges = pf_edges;
+        try {
+            return codetopo::run_parse_file(pf_cfg);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
     }
 
     return 0;
