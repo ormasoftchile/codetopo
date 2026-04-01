@@ -32,4 +32,31 @@
 - Key pattern: `make_test_dir()` helper cleans stale temp dirs before creating — fixes WAL file locking causing stale data between runs on Windows (DEC-008 enhancement)
 - Full suite: 203 tests, 1096 assertions, all green
 - Established DEC-033: WAL-safe temp directory pattern for all DB tests going forward
+### Turbo mode + PRAGMA test coverage (2026-07-17)
+- Wrote 15 test cases in test_turbo_mode.cpp (30 assertions total)
+- 5 scenarios covered: (1) Turbo PRAGMAs — synchronous=OFF, wal_autocheckpoint=0, temp_store=MEMORY, cache_size=128MB; (2) Default PRAGMAs — journal_mode=WAL, synchronous=NORMAL, foreign_keys=ON, cache_size=64MB, busy_timeout=5000; (3) mmap_size >= 256MB (platform grants up to ~2GB); (4) FK disabled/restored during resolve_references — both populated and empty DB; (5) Persist correctness under turbo — same counts as normal, integrity_check passes, warm re-persist idempotent
+- Key insight: SQLite mmap_size on Windows can return ~2GB (0x7FFF0000) when requesting 256MB — the compile-time SQLITE_MAX_MMAP_SIZE caps upward, not downward. Test uses >= assertion to be platform-portable.
+- Full suite: 218 tests, 1126 assertions, all green
+### MCP tool fix tests (2026-04-01 — DEC-035)
+- Wrote 13 test cases (72 assertions) across 3 new test files for Grag's parallel fixes (orchestrated via Scribe):
+  - `test_file_summary_nodeid.cpp` (3 tests, 15 assertions): node_id presence in file_summary symbols, tool chaining to symbol_get via node_id, uniqueness of node_ids within a file
+  - `test_source_at.cpp` (6 tests, 24 assertions): correct line range, single line, invalid range rejection, 500-line max rejection, nonexistent file error, out-of-bounds graceful truncation
+  - `test_csharp_extractor.cpp` (4 tests, 33 assertions): using→include refs, inheritance→inherit refs, invocation→call refs, comprehensive all-edge-types scenario
+- Key patterns established:
+  - MCP tool handlers callable programmatically: build yyjson params → json_parse() → tools::function_name(root, conn, cache, repo_root). No MCP server needed.
+  - File-dependent tools (file_summary, source_at) need real files on disk in temp dir — use write_test_file() helper.
+  - C# extractor tests reuse arena setup pattern from extraction_timeout tests with `parser.set_language("csharp")`.
+- Proactive testing methodology: all 13 tests written before Grag's implementation; all pass immediately (regression guards).
+  - file_summary already returns node_id (tools.cpp:969) — test validates presence + chaining
+  - source_at tool already implemented (T092) — tests validate all ranges, boundaries, errors
+  - C# extractor tests validate once Grag's using_directive/base_list/object_creation_expression emission lands
+- Full suite: 231 tests, 1198 assertions, all green. No regressions from prior 218 tests.
+- Build: Release clean, 0 errors, 0 warnings.
+- **Key insight:** Proactive testing in parallel with implementation eliminates delays; tests pass immediately upon commit.
+
+### DEC-034: SQLite Turbo PRAGMAs test validation (2026-04-01)
+- Reviewed Grag's turbo PRAGMA implementation (R1-R3) against prior test coverage written in session 2026-03-31 (`test_turbo_mode.cpp`, 15 tests, 30 assertions).
+- Test coverage already validates: turbo flag enable, PRAGMA correctness, mmap_size platform variations, FK disable/restore, persist correctness under turbo.
+- Grag's benchmark results align with test expectations: R1+R2+R3 combined give 5.3x speedup (9.1ms → 1.7ms/file persist).
+- All existing tests remain green; no regressions.
 

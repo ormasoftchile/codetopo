@@ -4,6 +4,107 @@ Archive of accepted, proposed, and rejected decisions. Decisions are ordered by 
 
 ---
 
+# DEC-035: MCP Tool Gap Fixes — node_id Chaining, C# Extractor Edges, source_at Tool
+
+**Author:** Grag (Systems Engineer)  
+**Coordinator:** Joan (Tester/QA)  
+**Date:** 2026-04-01  
+**Status:** Implemented  
+
+## Summary
+
+Implemented 3 MCP tool fixes identified in design review to close capability gaps and enable better LLM chaining.
+
+## Changes
+
+### Fix 1: file_summary now returns node_id
+- **File:** `src/mcp/tools.cpp` (line ~969)
+- **Change:** Added `id` column to SQL query, included `node_id` in JSON output
+- **Impact:** Enables LLMs to chain file_summary results directly into symbol_get, context_for, callers_approx, etc. Previously required an extra symbol_search roundtrip for every symbol.
+
+### Fix 2: C# extractor — 3 new edge types
+- **File:** `src/index/extractor.cpp`
+- **Changes:**
+  - `using_directive` → `include` refs (enables file_deps for C# files)
+  - `base_list` → `inherit` refs (enables find_implementations, context_for base types)
+  - `object_creation_expression` → `call` refs (enables callers_approx for constructors)
+- **Pattern:** Follows established patterns from C++ and TypeScript extractors.
+
+### Fix 3: source_at MCP tool (T092)
+- **File:** `src/cli/cmd_mcp.h`
+- **Signature:** `source_at(path, start_line, end_line)` → 1-based inclusive, max 500 lines
+- **Implementation:** Reads arbitrary line ranges from source files, path validated via `validate_mcp_path`, reuses `read_source_snippet()`
+- **Impact:** Fills gap between "read whole file" and "symbol_get requires node_id"
+
+## Test Coverage (Joan)
+
+- 13 new test cases across 3 files (72 assertions)
+- `test_file_summary_nodeid.cpp` — node_id presence, tool chaining, uniqueness
+- `test_source_at.cpp` — line range correctness, boundary conditions, error handling
+- `test_csharp_extractor.cpp` — C# edge type emission (using→include, inheritance→inherit, invocation→call)
+- All tests pass immediately (proactive/regression guards)
+
+## Build & Verification
+
+- Release build: clean (0 errors, 0 warnings)
+- Unit tests: 231 pass (1198 assertions)
+- Prior tests: all 218 remain green (no regressions)
+
+## Team Impact
+
+- Joan: No blockers; tests written in parallel and pass immediately
+- Simon: source_at is a new tool surface — stateless, read-only, path-validated. No architecture concerns.
+- Otho: No performance impact — all changes in cold paths (MCP query layer, not indexer hot path)
+
+---
+
+# DEC-034: SQLite Turbo PRAGMAs + FK Disable + 2GB mmap (Grag, 2026-04-01)
+
+**Status:** Implemented, build + benchmark verified
+
+## Summary
+
+Implemented Otho's scaling analysis recommendations R1-R3 to address the 6x persist degradation at 100K+ file scale (1.5ms→9.1ms/file).
+
+## Changes
+
+**R1 — Wire turbo PRAGMAs (connection.h, cmd_index.cpp):**
+- `conn.enable_turbo()` called after `schema::ensure_schema()` when `config.turbo` is true
+- Sets: synchronous=OFF, wal_autocheckpoint=0, temp_store=MEMORY, cache_size=128MB
+- `--turbo` CLI flag was already plumbed through supervisor; this just wires the final call
+
+**R2 — Disable FK during bulk persist (cmd_index.cpp):**
+- `PRAGMA foreign_keys=OFF` before drain loop, `PRAGMA foreign_keys=ON` after `commit_batch()`
+- Same pattern as `resolve_references()` in persister.h (lines 288/527)
+- Unconditional during bulk — FK integrity is preserved by application logic and re-checked post-commit
+
+**R3 — Increase mmap_size to 2GB (connection.h):**
+- Changed Connection constructor: `PRAGMA mmap_size=268435456` → `PRAGMA mmap_size=2147483648`
+- Unconditional — applies to all Connection uses (indexer and MCP server)
+- SQLite only mmaps pages that exist; no memory waste on small DBs
+
+## Benchmark Results (105,694 files, cold index, turbo)
+
+| Metric | Before (Otho baseline) | After | Change |
+|--------|----------------------|-------|--------|
+| Persist/file | 9.1ms | 1.7ms | **-81% (5.3x faster)** |
+| Persist total | ~915s | 173s | **-81%** |
+| Persist % of wall | 62% | 34% | **-28pp** |
+| Indexing rate | ~410 files/s | 438 files/s | **+7%** |
+| Total pipeline | ~1474s | 511s | **-65%** |
+
+Otho predicted 3.5-4.5ms/file persist; actual 1.7ms/file exceeded by 2x. The combined effect of R1+R2+R3 with the earlier R3(batch drain)+R4(cold index) from DEC-032 compounds — turbo PRAGMAs eliminate WAL fsync overhead that was amplifying at scale.
+
+## Constraints Respected
+
+- DEC-018: Largest-first sort unchanged
+- Turbo PRAGMAs only active with `--turbo` flag
+- mmap_size increase is unconditional (always beneficial)
+- FK disable is unconditional during bulk (matches resolve_references pattern)
+- All existing tests pass (122 cases, 524 assertions; pre-existing watchdog flake excluded)
+
+---
+
 # DEC-PROPOSAL: SQLite Persist 6x Scaling Degradation — Root Cause Analysis & Recommendations
 
 **Author:** Otho (Performance Engineer)  
