@@ -64,8 +64,8 @@ TEST_CASE("Extractor handles empty file", "[unit][us1]") {
 
 TEST_CASE("Config max_file_size_bytes calculation", "[unit][us1]") {
     Config cfg;
-    cfg.max_file_size_mb = 10;
-    REQUIRE(cfg.max_file_size_bytes() == 10 * 1024 * 1024);
+    cfg.max_file_size_kb = 10240;
+    REQUIRE(cfg.max_file_size_bytes() == 10240ULL * 1024);
 }
 
 TEST_CASE("Config arena_size_bytes calculation", "[unit][us1]") {

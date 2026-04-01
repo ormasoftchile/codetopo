@@ -60,10 +60,6 @@ static void seh_translator(unsigned int code, EXCEPTION_POINTERS*) {
 
 namespace codetopo {
 
-// Forward declarations for arena thread-local management
-void set_thread_arena(Arena* arena);
-void register_arena_allocator();
-
 // Result of parsing + extracting a single file (produced on worker threads).
 struct ParsedFile {
     ScannedFile file;
@@ -756,6 +752,16 @@ int run_index(const Config& config) {
         std::cerr << "Read-path indexes rebuilt in " << idx_elapsed << "s\n";
     }
 
+    // WAL checkpoint overlap: launch checkpoint on separate connection BEFORE
+    // resolve starts. The bulk-load WAL can be checkpointed while resolve
+    // (CPU-bound hash join) runs. PASSIVE mode won't block the main connection.
+    std::string ckpt_db = db_path.string();
+    std::thread ckpt_thread([&ckpt_db, &profiler]() {
+        ScopedPhase _wc(profiler.wal_ckpt);
+        Connection ckpt_conn(ckpt_db);
+        ckpt_conn.wal_checkpoint();
+    });
+
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     // Disable FK checks — all IDs come from the DB itself, FK validation is pure overhead.
     std::cerr << "Resolving cross-file references...\n";
@@ -770,6 +776,9 @@ int run_index(const Config& config) {
         std::cerr << "Resolved " << refs_resolved << " refs, created "
                   << edges_created << " edges in " << resolve_elapsed << "s\n";
     }
+
+    // Join checkpoint thread — should have finished during resolve
+    ckpt_thread.join();
 
     // --- Rebuild remaining write-path indexes (deferred from above) ---
     if (bulk_mode) {
@@ -802,12 +811,6 @@ int run_index(const Config& config) {
     {
         ScopedPhase _md(profiler.metadata);
         persister.write_metadata(repo_root.string());
-    }
-
-    // WAL checkpoint (T050)
-    {
-        ScopedPhase _wc(profiler.wal_ckpt);
-        conn.wal_checkpoint();
     }
 
     // Remove worklist and progress files on success

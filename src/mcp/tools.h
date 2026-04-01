@@ -99,5 +99,9 @@ std::string method_fields(yyjson_val* params, Connection& conn,
 std::string dependency_cluster(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root);
 
+// T092: source_at — read raw source lines from a file
+std::string source_at(yyjson_val* params, Connection& conn,
+                      QueryCache& cache, const std::string& repo_root);
+
 } // namespace tools
 } // namespace codetopo

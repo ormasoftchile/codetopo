@@ -75,6 +75,12 @@ public:
     size_t remaining() const { return capacity_ - offset_; }
     bool overflowed() const { return false; }  // We return nullptr on overflow
 
+    // Returns true if ptr falls within this arena's buffer.
+    bool contains(const void* ptr) const {
+        auto p = static_cast<const uint8_t*>(ptr);
+        return p >= buffer_ && p < buffer_ + capacity_;
+    }
+
 private:
     uint8_t* buffer_;
     size_t capacity_;
@@ -133,4 +139,18 @@ inline void arena_free(void* /*ptr*/) {
     // No-op — arena reset reclaims all memory
 }
 
+// Thread-local arena accessors (defined in arena.cpp)
+void set_thread_arena(Arena* arena);
+Arena* get_thread_arena();
+void register_arena_allocator();
+
 } // namespace codetopo
+
+// C-linkage wrappers for ts_set_allocator() — implemented in arena.cpp.
+// These dispatch to the thread-local arena via get_thread_arena().
+extern "C" {
+    void* ts_arena_malloc(size_t size);
+    void* ts_arena_calloc(size_t count, size_t size);
+    void* ts_arena_realloc(void* ptr, size_t new_size);
+    void  ts_arena_free(void* ptr);
+}

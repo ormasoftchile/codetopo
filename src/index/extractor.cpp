@@ -1,4 +1,5 @@
 #include "index/extractor.h"
+#include "index/language_id.h"
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -16,6 +17,7 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
     result_ = &result;
     rel_path_ = &rel_path;
     language_ = &language;
+    lang_id_ = lang_id_from_string(language);
     symbol_count_ = 0;
     node_count_ = 0;
     symbol_stack_.clear();
@@ -232,35 +234,41 @@ void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, i
 
         int sym_before = static_cast<int>(result_->symbols.size());
 
-        if (*language_ == "c" || *language_ == "cpp") {
-            extract_c_cpp(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "csharp") {
-            extract_csharp(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "typescript" || *language_ == "javascript") {
-            extract_typescript(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "go") {
-            extract_go(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "yaml") {
-            extract_yaml(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "python") {
-            extract_python(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "rust") {
-            extract_rust(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "java") {
-            extract_java(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "bash") {
-            extract_bash(node, type_str, parent_qualname);
-        }
-        else if (*language_ == "sql") {
-            extract_sql(node, type_str, parent_qualname);
+        switch (lang_id_) {
+            case LanguageId::C:
+            case LanguageId::Cpp:
+                extract_c_cpp(node, type_str, parent_qualname);
+                break;
+            case LanguageId::CSharp:
+                extract_csharp(node, type_str, parent_qualname);
+                break;
+            case LanguageId::TypeScript:
+            case LanguageId::JavaScript:
+                extract_typescript(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Go:
+                extract_go(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Yaml:
+                extract_yaml(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Python:
+                extract_python(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Rust:
+                extract_rust(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Java:
+                extract_java(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Bash:
+                extract_bash(node, type_str, parent_qualname);
+                break;
+            case LanguageId::Sql:
+                extract_sql(node, type_str, parent_qualname);
+                break;
+            default:
+                break;
         }
 
         bool pushed = static_cast<int>(result_->symbols.size()) > sym_before;
@@ -783,13 +791,37 @@ void Extractor::extract_sql(TSNode node, const std::string& type, const std::str
     }
 }
 
-// Free function
+// Free function — pre-allocated read: file_size → resize → read (avoids ostringstream overhead)
 std::string read_file_content(const std::filesystem::path& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto fsize = fs::file_size(path, ec);
+    if (ec || fsize == static_cast<uintmax_t>(-1)) {
+        // Fallback for special files or errors: stream read
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return "";
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    if (fsize == 0) {
+        // Verify file is actually readable (could be a special file reporting 0)
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return "";
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    std::string content;
+    content.resize(static_cast<size_t>(fsize));
     std::ifstream f(path, std::ios::binary);
     if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    f.read(content.data(), static_cast<std::streamsize>(fsize));
+    auto actual = f.gcount();
+    if (actual < static_cast<std::streamsize>(fsize)) {
+        content.resize(static_cast<size_t>(actual));
+    }
+    return content;
 }
 
 } // namespace codetopo

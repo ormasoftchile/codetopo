@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include "index/language_id.h"
 
 namespace codetopo {
 
@@ -47,6 +48,13 @@ public:
     // Set language for the next parse.
     bool set_language(const std::string& lang) {
         const TSLanguage* ts_lang = get_language(lang);
+        if (!ts_lang) return false;
+        return ts_parser_set_language(parser_, ts_lang);
+    }
+
+    // Set language via LanguageId enum (avoids string comparisons).
+    bool set_language(LanguageId id) {
+        const TSLanguage* ts_lang = get_language_by_id(id);
         if (!ts_lang) return false;
         return ts_parser_set_language(parser_, ts_lang);
     }
@@ -97,6 +105,24 @@ private:
         if (lang == "go") return tree_sitter_go();
         if (lang == "yaml") return tree_sitter_yaml();
         return nullptr;
+    }
+
+    static const TSLanguage* get_language_by_id(LanguageId id) {
+        switch (id) {
+            case LanguageId::C:          return tree_sitter_c();
+            case LanguageId::Cpp:        return tree_sitter_cpp();
+            case LanguageId::CSharp:     return tree_sitter_c_sharp();
+            case LanguageId::TypeScript: return tree_sitter_typescript();
+            case LanguageId::JavaScript: return tree_sitter_javascript();
+            case LanguageId::Python:     return tree_sitter_python();
+            case LanguageId::Rust:       return tree_sitter_rust();
+            case LanguageId::Java:       return tree_sitter_java();
+            case LanguageId::Bash:       return tree_sitter_bash();
+            case LanguageId::Sql:        return nullptr;
+            case LanguageId::Go:         return tree_sitter_go();
+            case LanguageId::Yaml:       return tree_sitter_yaml();
+            default:                     return nullptr;
+        }
     }
 };
 

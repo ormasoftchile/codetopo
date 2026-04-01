@@ -325,5 +325,10 @@ inline int rehab_quarantine(Connection& conn, const std::vector<ScannedFile>& sc
     return static_cast<int>(rehab_paths.size());
 }
 
+// Clear all quarantine entries (used on fresh init to reset stale state)
+inline void clear_quarantine(Connection& conn) {
+    conn.exec("DELETE FROM quarantine");
+}
+
 } // namespace schema
 } // namespace codetopo

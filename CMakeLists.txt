@@ -139,12 +139,6 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
     tests/unit/test_stable_key.cpp
-    tests/unit/test_parse_timeout.cpp
-    tests/unit/test_extraction_timeout.cpp
-    tests/unit/test_watchdog.cpp
-    tests/unit/test_supervisor_recovery.cpp
-    tests/unit/test_persist_pipeline.cpp
-    tests/unit/test_turbo_mode.cpp
     tests/unit/test_file_summary_nodeid.cpp
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/config.h"
+#include "index/language_id.h"
 #include "util/path.h"
 #include <filesystem>
 #include <vector>
@@ -24,6 +25,7 @@ struct ScannedFile {
     std::string language;
     int64_t size_bytes;
     int64_t mtime_ns;
+    LanguageId lang_id = LanguageId::Unknown;  // computed from extension at scan time
 };
 
 // Simple gitignore pattern matcher (T026)
@@ -317,7 +319,8 @@ private:
                 norm_rel,
                 language,
                 static_cast<int64_t>(size),
-                mtime_ns
+                mtime_ns,
+                lang_id_from_string(language)
             });
         }
         return files;
@@ -396,7 +399,8 @@ private:
                     rel_path,
                     language,
                     static_cast<int64_t>(size),
-                    mtime_ns
+                    mtime_ns,
+                    lang_id_from_string(language)
                 });
             }
         }

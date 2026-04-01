@@ -306,8 +306,7 @@ inline int run_init(const std::string& root_str,
                     int large_file_threshold,
                     int max_file_size,
                     int parse_timeout,
-                    bool turbo, bool profile,
-                    int max_files,
+                    bool turbo,
                     const std::vector<std::string>& exclude_patterns,
                     bool watch, const std::string& freshness) {
     namespace fs = std::filesystem;
@@ -330,8 +329,8 @@ inline int run_init(const std::string& root_str,
     cfg.max_file_size_kb = max_file_size;
     cfg.parse_timeout_s = parse_timeout;
     cfg.turbo = turbo;
-    cfg.profile = profile;
-    cfg.max_files = max_files;
+    cfg.profile = false;
+    cfg.max_files = 0;
     cfg.exclude_patterns = exclude_patterns;
 
     // Fresh init: clear stale quarantine from previous runs

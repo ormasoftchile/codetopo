@@ -18,9 +18,6 @@
 
 namespace codetopo {
 
-void set_thread_arena(Arena* arena);
-void register_arena_allocator();
-
 // T096: cmd_watch — starts watcher and triggers incremental indexing.
 inline int run_watch(const std::string& root_str, const std::string& db_path_str) {
     namespace fs = std::filesystem;
