@@ -48,3 +48,15 @@
 - **Parallel efficiency 16-50%:** Single-threaded persist wastes 50-84% of available worker parallelism.
 - **Artifacts added:** `--profile`, `--max-files`, `--extract-timeout` CLI flags; `Config::max_files`, `Config::extraction_timeout_s`, `Config::profile`; TreeGuard move-assignment; arena.cpp redefinition fix.
 - **Files changed:** `src/core/config.h`, `src/core/arena.cpp`, `src/main.cpp`, `src/cli/cmd_index.cpp`, `src/index/parser.h`, `src/index/supervisor.cpp`
+
+### 2026-04-01: DEC-034 R2 — Pipelined persist thread architecture (for profiling follow-up)
+- **Architecture:** Grag implemented pipelined persist thread following DEC-034 R2 recommendations from Otho's profiling.
+  - Main thread now: collects worker results, revives slots, refills pool, pushes to persist queue, displays progress only
+  - Dedicated persist thread: owns Persister, calls `begin_batch()`/`commit_batch()`, drains queue in loop
+  - `PersistQueue` (mutex+condvar) with batch drain: consumes ALL available items per wake (not one-at-a-time)
+  - `std::atomic<int> persisted_count`: tracks actual SQLite commits for progress file
+  - Result: Main thread free to loop, waiting for worker results (not blocked on SQLite writes)
+- **Profiler interpretation change:** `contention` phase now measures pure main-thread idle time (waiting for workers), not persist-blocked time. High contention % is expected and healthy in pipelined model.
+- **Benchmark (fsm, 4145 files):** 207 files/s, 20s wall. Persist: 15.5s (4ms/file on dedicated thread, not blocking). Contention: 19.4s (expected).
+- **Also implemented R1:** ThreadPool stack 64→8MB (one-liner, cmd_index.cpp:584). Saves 1.15GB committed memory.
+- **Key insight for next phase:** With persist decoupled, new bottleneck is likely worker throughput. Next profiling should focus on worker efficiency (file_read, parse, extract) to see if stmt caching (DEC-027 pattern) moves the needle further.

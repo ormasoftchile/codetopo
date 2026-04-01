@@ -146,6 +146,20 @@ R3: Batch drain — main thread dequeues ALL available results from completion q
 **Status:** Implemented, 18 tests passing
 Key finding: Stale temp directories from previous test runs prevent deletion on Windows; Connection opens stale DB; ensure_schema silently preserves old data → false test failures. Established pattern: use `make_test_dir(name)` helper that cleanup BEFORE create_directories (in addition to existing DEC-008 cleanup-at-end pattern). This is backward-compatible with DEC-008. All DB-based tests now use this pattern. Added 18 comprehensive test cases (132 assertions) in `test_persist_pipeline.cpp` covering cold index, warm index, correctness, batch atomicity, and out-of-order drain scenarios. Full suite: 203 tests, 1096 assertions, all green.
 
+### DEC-034: ThreadPool stack fix + pipelined persist thread (Grag & Joan, 2026-04-01)
+**Status:** Implemented, build + tests verified
+**R1 (ThreadPool stack 64→8MB):** One-liner in `cmd_index.cpp:584` changing stack size parameter. `_beginthreadex` with `flags=0` commits full stack as physical RAM; 18×64MB=1.15GB → 18×8MB=144MB (saves 1GB+). Zero risk — tree-sitter recursion well within 8MB per profiling analysis. Thread stack sizing is backend-dependent; using `flags=0` (reserved, not committed) or proper flag setting on all platforms critical.
+
+**R2 (Pipelined persist thread):** Architectural refactor decoupling SQLite writes from worker result collection. Added `PersistQueue` (mutex+condvar with batch drain) and `PersistItem` structs in cmd_index.cpp. Dedicated `persist_thread` owns Persister, calls `begin_batch()`/`commit_batch()`, drains queue loop. Main thread: collects results, revives slots, refills pool, pushes queue, displays progress. `std::atomic<int> persisted_count` tracks actual commits. Progress file writes on persist thread after batch commits. Profiler note: `contention` phase now measures pure main-thread idle (waiting for workers), not persist-blocked time. High contention % is expected and healthy.
+
+**Build & Tests:** Release 0 errors/warnings. 208 tests (1112 assertions) all green. Joan also registered missing `test_persist_pipeline.cpp` (18 tests) in CMakeLists.
+
+**Benchmark (fsm, 4145 C# files):** 207 files/s, 20s wall. Persist 15.5s (4ms/file on dedicated thread, not blocking). Contention 19.4s (expected). Baseline DEC-032: 20.5s / 200 files/s. Pipeline maintains throughput while decoupling.
+
+**Finding: File node leak on re-persist (Joan).** Low severity. `persist_file()` cascades delete symbol nodes but file_nodes (file_id=NULL) survive. On re-insert, `stable_key UNIQUE` constraint silent (unchecked). Single-file warm persist harmless (existing tests pass). Batch re-persist: wrong file_node_id can cause edge references. Recommendation: explicit `DELETE FROM nodes WHERE node_type='file'` before file_node INSERT, or use `INSERT OR REPLACE`.
+
+**Next steps:** Prepared statement caching (DEC-027 pattern, ~1.5ms/file target). Cold index skip-DELETE flag. Parallel WAL persist may be unnecessary after caching. Monitor profiler idle vs contention distinction.
+
 ## Governance
 
 - All meaningful changes require team consensus

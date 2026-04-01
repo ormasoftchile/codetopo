@@ -33,3 +33,23 @@
 - **R2 (HIGH):** Pipelined persist thread (eliminate 35% contention, architectural refactor ~200 LOC).
 - **R3 (MEDIUM):** Parallel WAL persist (DEC-026 R7, higher complexity/ceiling).
 - Key for next phase: R1 is blocking the others. Should implement first.
+
+### DEC-034 R1+R2: ThreadPool stack fix + pipelined persist thread (2026-04-01)
+- **R1**: Changed `ThreadPool worker_pool(window_size, 64 * 1024 * 1024)` → `8 * 1024 * 1024` at cmd_index.cpp:584. Saves 1GB+ committed physical RAM (18×64MB→18×8MB).
+- **R2**: Implemented pipelined persist thread architecture. Decouples SQLite writes from worker result collection:
+  - Added `PersistQueue` (mutex+condvar queue with batch drain) and `PersistItem` structs local to `run_index()`.
+  - Dedicated `persist_thread` owns the Persister, calls `begin_batch()`/`commit_batch()`, and runs a drain loop consuming all available items per wake.
+  - Main thread now only: collects results from workers, revives slots, refills worker pool, pushes to persist queue, displays progress.
+  - `std::atomic<int> persisted_count` tracks actual SQLite commits for progress display.
+  - Progress file writes (`config.supervised`) happen on the persist thread after each batch commit.
+  - Main thread joins persist thread after signaling done, then joins watchdog.
+- **Profiler note**: `contention` phase now measures pure main-thread idle time (waiting for worker results), not persist-blocked time. High contention % is expected and healthy — it means the main thread is free.
+- **Benchmark (fsm, 4145 files)**: 207 files/s, 20s wall (comparable to baseline of 200 files/s). Persist runs at 4ms/file on dedicated thread. Pipeline decoupling confirmed working.
+- Key files: `src/cli/cmd_index.cpp` lines 644-798 (persist pipeline), line 584 (stack fix).
+
+### DEC-034 R2 Follow-up: File node leak on re-persist (Joan's finding)
+- **Issue found by Joan during test coverage:** `persist_file()` deletes files with cascade to symbol nodes, but file_nodes (file_id=NULL) survive because NULL doesn't participate in FK cascade.
+- **Impact:** Single-file warm re-persist: harmless (ID collision benign, existing tests pass). Batch re-persist: wrong file_node_id can cause edges to reference incorrect src nodes.
+- **Root cause:** `INSERT INTO nodes(...stable_key...)` hits UNIQUE constraint silently (unchecked `sqlite3_step` return). `sqlite3_last_insert_rowid()` then returns file record ID, colliding with node IDs from different table.
+- **Recommendation:** Add explicit `DELETE FROM nodes WHERE node_type='file' AND name = ?` before file_node INSERT, OR use `INSERT OR REPLACE` for file_node. This also fixes orphaned file_node leak over time.
+- **Priority:** Low (current usage unaffected). Consider for DEC-027 stmt caching phase or separate bug fix.
