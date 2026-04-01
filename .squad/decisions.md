@@ -160,6 +160,43 @@ Key finding: Stale temp directories from previous test runs prevent deletion on 
 
 **Next steps:** Prepared statement caching (DEC-027 pattern, ~1.5ms/file target). Cold index skip-DELETE flag. Parallel WAL persist may be unnecessary after caching. Monitor profiler idle vs contention distinction.
 
+### DEC-035: File Node Leak Fix — Explicit DELETE before INSERT (Grag, 2026-04-01)
+**Status:** Implemented, 207/208 tests pass (1 pre-existing timing flake)
+File nodes (`node_type='file'`, `file_id=NULL`) were not cascade-deleted when `persist_file()` re-persisted the same path. The `DELETE FROM files WHERE path = ?` cascades to symbol nodes (file_id=N) but not file nodes (file_id=NULL) because NULL doesn't participate in FK cascade. On re-insert, `stable_key UNIQUE` constraint silently failed. Batch re-persist scenarios: wrong `file_node_id` could collide with IDs from different tables. **Fix:** Added explicit `DELETE FROM nodes WHERE node_type='file' AND name = ?` immediately before file_node INSERT. Also added `sqlite3_step` return value check to catch and report `SQLITE_CONSTRAINT` errors. Files: `src/db/persister.h`. No prepared statement cache exists yet (DEC-027 pattern pending). Joan identified this issue during pipelined persist testing. **Decision:** Adopt this fix. Prepared statement caching (DEC-027) will reuse the DELETE+INSERT pattern at scale.
+
+### DEC-036: R2 Pipelined Persist Validation — 218 files/s Confirmed (Otho, 2026-04-01)
+**Status:** Profiling complete, recommendations ready
+Validated DEC-034 R2 pipelined persist thread at production scale (fsm, 4145 C# files). **Key metrics:** Indexing rate 218 files/s, persist/worker ratio 1.07:1 (nearly balanced), workers now the true ceiling. **Before vs After:** Persist/worker 2:1→1.07:1, persist % wall 42%→53% (off critical path). **New bottleneck:** WAL checkpoint 4.8s (16% wall), fully synchronous on main thread post-index. **Worker breakdown:** file_read 50% (29ms/file, I/O contention), parse 20% (20ms/file, irreducible tree-sitter), extract 9% (9ms/file, well-controlled). **R3a quick win:** WAL checkpoint during resolve_refs phase (hide 4.8s, low effort). **R3b:** SQLite stmt caching on persist thread (reduce 4→2-3ms/file). **R3c:** file_read prefetch/mmap (ceiling-limited, medium effort). **Scaling:** At 50K files, resolve phase becomes 100–200s offline bottleneck; parallel resolve (#5 in Simon's roadmap) becomes high-ROI. Decision: Implement R3a immediately as quick win.
+
+### DEC-037: Five Optimization Opportunities Ranked — 280–320 files/s Potential (Simon, 2026-04-01)
+**Status:** Analysis complete, Phase 1 ready for implementation
+Analyzed remaining optimization vectors after DEC-034 R1+R2. **Architecture assessment:** Indexer is well-designed. Persist pipeline correctly decoupled. Remaining gains are micro-optimizations: parser allocation, string comparison, I/O buffering — NOT structural changes.
+
+**Five opportunities (ranked by ROI):**
+
+1. **Pre-Allocated File Read Buffer (QUICK WIN)** — Impact: 5ms→3ms/file (40% faster I/O), Effort: 30min, Risk: Very low. Fix: Pre-allocate string to file size, single read instead of ostringstream. Expected +40 files/s.
+
+2. **Parser Object Pooling (SOLID WIN)** — Impact: Eliminate 4145 parser allocations + FFI calls, Effort: 2hr, Risk: Low. Thread-local unordered_map by language. Expected +15 files/s.
+
+3. **Language Dispatch Optimization (SOLID WIN)** — Impact: Eliminate millions of string comparisons in hot loop (extract), Effort: 1hr, Risk: Very low. Pre-compute enum, switch instead of if-chain. Expected +18 files/s (extract 6→5ms).
+
+4. **Thread-Local String Cache for Node Types (DIMINISHING RETURNS)** — Impact: Reduce allocations ~60%, Effort: 1.5hr, Risk: Low. Cache "function_definition" etc. Expected +8 files/s.
+
+5. **Parallel Resolve Phase (ADVANCED)** — Impact: Post-index 10–20s→2–5s offline, Effort: 4hr, Risk: Moderate. Partition refs by file_id. Does not affect indexing speed but improves total CLI latency.
+
+**Deprioritized:** Lazy resolve (architectural shift), Parallel WAL persist (unnecessary after DEC-034 R2, no measured lock contention), Vectored I/O (marginal gains).
+
+**Phase 1 (Quick Wins):** Implement #1, #3, #2 in parallel if possible. Expected 207→260–280 files/s, 3.5hr combined effort, low risk.
+
+**Phase 2 (Refinements):** Implement #4. Prepare #5 for code review. Expected 207→285–300 files/s, 5.5hr combined, low-moderate risk.
+
+**Combined projection:** All five opportunities → 280–320 files/s (+35–55%). Estimated gains conservative (±10%). Next step: Code review of Phase 1 candidates, then profile before/after on fsm (4145 files).
+
+**Design decisions locked in:**
+- **DEC-035a (Parser Reuse Pattern):** Parser objects created once per language, reused across files. Thread-local storage, no locks.
+- **DEC-036a (Language Dispatch Strategy):** Pre-computed enum, no string comparisons in hot loop, all logic via switch.
+- **DEC-037a (File Read Buffering):** Pre-allocate to exact size, no exponential growth, apply to all file sizes.
+
 ## Governance
 
 - All meaningful changes require team consensus

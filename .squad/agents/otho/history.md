@@ -60,3 +60,33 @@
 - **Benchmark (fsm, 4145 files):** 207 files/s, 20s wall. Persist: 15.5s (4ms/file on dedicated thread, not blocking). Contention: 19.4s (expected).
 - **Also implemented R1:** ThreadPool stack 64→8MB (one-liner, cmd_index.cpp:584). Saves 1.15GB committed memory.
 - **Key insight for next phase:** With persist decoupled, new bottleneck is likely worker throughput. Next profiling should focus on worker efficiency (file_read, parse, extract) to see if stmt caching (DEC-027 pattern) moves the needle further.
+
+### 2026-04-01: DEC-034 R2 Validation — Pipeline now nearly balanced
+- **Methodology:** Clean profiling runs on tiny (500), small (2000), fsm (4145) against DsMainDev/Sql/xdb/manifest/svc/mgmt/fsm with `--profile --turbo`.
+- **Key finding: Pipeline is NEARLY BALANCED at scale.** Persist/worker ratio: tiny 1.71:1 (still persist-bound), small 1.07:1, fsm 1.07:1. Pre-R2 was ~2:1 at fsm. Grag's pipelined persist thread eliminated the persist-as-blocking-bottleneck pattern.
+- **Indexing-phase rates confirmed:** tiny 100 files/s, small 181 files/s, fsm 218 files/s. Grag's claimed 207 files/s validated (within run-to-run variance). Total rates lower (87/124/137) due to post-indexing phases.
+- **Contention semantics validated:** 50.5% contention at fsm is HEALTHY — means main thread waiting for workers, not blocked on persist. Pre-R2's 35% contention was persist-blocked time (unhealthy). Apples-to-oranges comparison.
+- **New bottleneck: WAL checkpoint emerged as #3 cost center.** 4.8s (16% wall) at fsm. Fully synchronous, on main thread after indexing. Could be overlapped with resolve_refs phase.
+- **Worker time breakdown (fsm):** file_read 49.6% (29ms), parse 34.5% (20ms), extract 15.9% (9ms). file_read dominates because largest-first sort hits 16-thread disk I/O contention on large files first.
+- **Parallel efficiency:** 41% (tiny), 57% (small), 49% (fsm). Low at tiny because 500 largest files = high per-file cost, bursty waves. Efficiency improves at small where smaller files amortize better, but drops at fsm due to the long tail of initial large-file processing.
+- **Scaling analysis:** Per-file persist cost drops from 8ms (tiny) → 5ms (small) → 4ms (fsm) as batch amortization improves. file_read avg drops 48ms → 42ms → 29ms as file size mix normalizes.
+- **Next optimization targets (priority order):**
+  1. WAL checkpoint overlap — run during resolve_refs to hide 4.8s
+  2. Stmt caching on persist thread — could reduce 4ms/file persist cost
+  3. file_read prefetch or memory-mapped I/O — attack the 29ms/file worker bottleneck
+  4. Parse is irreducible (tree-sitter) — not a practical target
+
+### Simon's Analysis & Five Optimization Vectors (2026-04-01)
+- **Architecture assessment:** Indexer is well-designed. R1+R2 (Grag) correctly fixed structural issues. Remaining bottlenecks are micro-optimizations in parser allocation, string comparison, I/O buffering.
+- **Phase 1 (Quick Wins, 3.5 hours):** Pre-alloc file read (30 min, +40 f/s), language dispatch (1 hr, +18 f/s), parser pooling (2 hr, +15 f/s). Expected cumulative 260–280 files/s.
+- **Phase 2 (Refinements, 5.5 hours):** String cache (1.5 hr, +8 f/s), parallel resolve (4 hr, offline optimization). Expected 285–300 files/s.
+- **Combined potential:** 280–320 files/s (+35–55%). All ranked by ROI and effort.
+- **Deprioritized:** Lazy resolve (architectural shift), parallel WAL persist (R2 solved it, no measured lock contention), vectored I/O (marginal gains for complexity).
+- **Key decision points locked in:** Parser reuse pattern (thread-local, no locks), language dispatch (enum-based switch, no strings in hot loop), file read buffering (pre-alloc exact size).
+
+### Cross-Agent Summary & Next Steps (2026-04-01)
+- **Grag's leak fix validated:** 207/208 tests, build clean. DEC-035 locked.
+- **Otho's validation confirmed:** R2 pipeline nearly balanced at 1.07:1 ratio. Workers now ceiling. R3a (WAL checkpoint) is quick win. DEC-036 locked.
+- **Simon's roadmap ready:** Phase 1 code review → implementation → re-profile. DEC-037 locked.
+- **Build status:** MSVC + CMake clean. 208 tests (1112 assertions), 207 pass (1 pre-existing flake).
+- **Team actions:** Code review Phase 1, implement in parallel if possible, profile before/after on fsm to validate gains.
