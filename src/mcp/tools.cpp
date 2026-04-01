@@ -952,7 +952,7 @@ std::string file_summary(yyjson_val* params, Connection& conn,
 
     // Get symbols
     auto* sym_stmt = cache.get("file_symbols",
-        "SELECT kind, name, qualname, visibility, signature, start_line, end_line "
+        "SELECT id, kind, name, qualname, visibility, signature, start_line, end_line "
         "FROM nodes WHERE file_id = ? AND node_type = 'symbol' ORDER BY start_line");
     sqlite3_bind_int64(sym_stmt, 1, file_id);
 
@@ -966,18 +966,19 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     auto* symbols = doc.new_arr();
     while (sqlite3_step(sym_stmt) == SQLITE_ROW) {
         auto* sym = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, sym, "node_id", sqlite3_column_int64(sym_stmt, 0));
         yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind",
-            reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 0)));
-        yyjson_mut_obj_add_strcpy(doc.doc, sym, "name",
             reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 1)));
-        auto* qn = sqlite3_column_text(sym_stmt, 2);
+        yyjson_mut_obj_add_strcpy(doc.doc, sym, "name",
+            reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 2)));
+        auto* qn = sqlite3_column_text(sym_stmt, 3);
         if (qn) yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", reinterpret_cast<const char*>(qn));
-        auto* vis = sqlite3_column_text(sym_stmt, 3);
+        auto* vis = sqlite3_column_text(sym_stmt, 4);
         if (vis) yyjson_mut_obj_add_strcpy(doc.doc, sym, "visibility", reinterpret_cast<const char*>(vis));
 
         auto* span = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(sym_stmt, 5));
-        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(sym_stmt, 6));
+        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(sym_stmt, 6));
+        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(sym_stmt, 7));
         yyjson_mut_obj_add_val(doc.doc, sym, "span", span);
 
         yyjson_mut_arr_append(symbols, sym);
@@ -2160,6 +2161,42 @@ std::string dependency_cluster(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(clusters_arr, cobj);
     }
     yyjson_mut_obj_add_val(doc.doc, root, "clusters", clusters_arr);
+
+    return doc.to_string();
+}
+
+// T092: source_at — read raw source lines from a file
+std::string source_at(yyjson_val* params, Connection& /*conn*/,
+                      QueryCache& /*cache*/, const std::string& repo_root) {
+    const char* path = params ? json_get_str(params, "path") : nullptr;
+    if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
+
+    int64_t start_line = params ? json_get_int(params, "start_line", -1) : -1;
+    int64_t end_line = params ? json_get_int(params, "end_line", -1) : -1;
+
+    if (start_line <= 0 || end_line <= 0 || end_line < start_line) {
+        return McpError::invalid_input("Invalid parameters: start_line and end_line must be positive and end_line >= start_line.").to_json_rpc(0);
+    }
+
+    if (end_line - start_line > 500) {
+        return McpError::invalid_input("Line range too large. Maximum 500 lines per request.").to_json_rpc(0);
+    }
+
+    auto validated = path_util::validate_mcp_path(path, repo_root);
+    if (validated.empty()) return McpError::invalid_input("Invalid path: rejected by traversal guard").to_json_rpc(0);
+
+    auto source = read_source_snippet(repo_root, path, static_cast<int>(start_line), static_cast<int>(end_line));
+    if (source.empty()) {
+        return McpError::not_found(std::string("Could not read file or line range is out of bounds: ") + path).to_json_rpc(0);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "path", path);
+    yyjson_mut_obj_add_int(doc.doc, root, "start_line", start_line);
+    yyjson_mut_obj_add_int(doc.doc, root, "end_line", end_line);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "source", source.c_str());
 
     return doc.to_string();
 }

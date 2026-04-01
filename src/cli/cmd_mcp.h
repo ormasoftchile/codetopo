@@ -192,6 +192,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Group methods in a file by shared field access patterns, weighted by read/write direction. Returns clusters with extractability scores (1.0=pure read, easily extractable; 0.0=heavily writes state, tightly coupled). Use to plan refactoring decomposition.",
         R"J({"type":"object","properties":{"path":{"type":"string","description":"File path (relative to repo root)"},"class_id":{"type":"integer","description":"Node ID of a class to analyze (alternative to path)"}}})J");
 
+    server.register_tool("source_at", tools::source_at,
+        "Read source code lines from a file. Returns the raw source text for the specified line range. Use when you need to see code at specific locations without knowing the symbol node_id.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Relative file path from repository root"},"start_line":{"type":"integer","description":"First line to read (1-based)"},"end_line":{"type":"integer","description":"Last line to read (1-based, inclusive)"}},"required":["path","start_line","end_line"]})J");
+
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
                                           QueryCache& cache, const std::string& /*root*/) -> std::string {
