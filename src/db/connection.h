@@ -44,6 +44,8 @@ public:
         exec("PRAGMA foreign_keys=ON");
         exec("PRAGMA busy_timeout=5000");
         exec("PRAGMA synchronous=NORMAL");
+        exec("PRAGMA cache_size=-65536");    // 64 MB page cache
+        exec("PRAGMA mmap_size=2147483648");  // 2 GB memory-mapped I/O (R3: covers DB growth to ~2GB at 100K files)
     }
 
     ~Connection() {
@@ -58,6 +60,18 @@ public:
     }
 
     sqlite3* raw() { return db_; }
+
+    // Enable turbo mode for maximum write throughput.
+    // - synchronous=OFF: skip WAL fsync (safe against app crash, not OS crash)
+    // - wal_autocheckpoint=0: no checkpoints during bulk insert (one at end)
+    // - temp_store=MEMORY: temp tables in RAM
+    // - cache_size=128 MB: larger page cache
+    void enable_turbo() {
+        exec("PRAGMA synchronous=OFF");
+        exec("PRAGMA wal_autocheckpoint=0");
+        exec("PRAGMA temp_store=MEMORY");
+        exec("PRAGMA cache_size=-131072");  // 128 MB page cache
+    }
 
     void exec(const char* sql) {
         char* err = nullptr;
@@ -76,11 +90,23 @@ public:
         exec("PRAGMA wal_checkpoint(PASSIVE)");
     }
 
-    // Run PRAGMA integrity_check
+    // Run PRAGMA integrity_check (SLOW — scans every B-tree page, avoid in hot paths)
     std::string integrity_check() {
         std::string result;
         sqlite3_stmt* stmt = nullptr;
         sqlite3_prepare_v2(db_, "PRAGMA integrity_check", -1, &stmt, nullptr);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
+    // Run PRAGMA quick_check — fast subset of integrity_check (no index verification)
+    std::string quick_check() {
+        std::string result;
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(db_, "PRAGMA quick_check", -1, &stmt, nullptr);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             result = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
         }

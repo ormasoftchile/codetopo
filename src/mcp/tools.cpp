@@ -56,10 +56,9 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
     auto idx_version = schema::get_kv(conn, "indexer_version", "unknown");
     auto last_index = schema::get_kv(conn, "last_index_time", "");
 
-    // Check DB status
-    std::string db_status = "ok";
-    auto integrity = conn.integrity_check();
-    if (integrity != "ok") db_status = "error";
+    // Skip integrity/quick_check in MCP hot path — too slow on large DBs (5GB+).
+    // A basic connectivity test via the get_kv calls above is sufficient.
+    std::string db_status = version.empty() ? "error" : "ok";
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();

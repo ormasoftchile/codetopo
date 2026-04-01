@@ -69,7 +69,9 @@ public:
 
             std::string line = json_read_line();
             if (line.empty()) {
-                if (std::cin.eof()) return 0;  // Client closed connection
+                if (std::cin.eof()) {
+                    return 0;
+                }
                 continue;
             }
 
