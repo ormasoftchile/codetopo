@@ -1,0 +1,11 @@
+{
+  "snapshots": [
+    {
+      "assignment_id": "captain-future-2026-03-30",
+      "universe": "Captain Future",
+      "date": "2026-03-30T00:00:00Z",
+      "agents": ["Simon", "Grag", "Otho", "Joan"],
+      "reason": "Initial team creation for codetopo project"
+    }
+  ]
+}

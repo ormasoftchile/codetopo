@@ -1,0 +1,5 @@
+{
+  "universes_allowed": ["Captain Future"],
+  "max_agents_per_universe": 10,
+  "overflow_strategy": "diegetic_expansion"
+}
