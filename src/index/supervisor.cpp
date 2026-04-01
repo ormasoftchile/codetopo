@@ -115,6 +115,10 @@ int run_index_supervisor(const Config& config,
             args.push_back("--max-files");
             args.push_back(std::to_string(config.max_files));
         }
+        if (config.extraction_timeout_s > 0) {
+            args.push_back("--extract-timeout");
+            args.push_back(std::to_string(config.extraction_timeout_s));
+        }
         for (const auto& pat : config.exclude_patterns) {
             args.push_back("--exclude");
             args.push_back(pat);

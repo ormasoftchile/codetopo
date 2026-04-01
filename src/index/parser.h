@@ -51,7 +51,20 @@ public:
         return ts_parser_set_language(parser_, ts_lang);
     }
 
+    // Set per-parse timeout. 0 = no limit.
+    void set_timeout(uint64_t micros) {
+        ts_parser_set_timeout_micros(parser_, micros);
+    }
+
+    // Set cancellation flag pointer. Tree-sitter checks this frequently
+    // during parsing. Set *flag to non-zero from another thread to
+    // hard-cancel the current parse (returns nullptr).
+    void set_cancellation_flag(const size_t* flag) {
+        ts_parser_set_cancellation_flag(parser_, flag);
+    }
+
     // Parse source code. Returns owned TSTree (caller must free).
+    // Returns nullptr if timeout expires.
     TSTree* parse(const std::string& source) {
         return ts_parser_parse_string(parser_, nullptr,
                                        source.c_str(),
@@ -95,6 +108,10 @@ struct TreeGuard {
     TreeGuard(const TreeGuard&) = delete;
     TreeGuard& operator=(const TreeGuard&) = delete;
     TreeGuard(TreeGuard&& o) noexcept : tree(o.tree) { o.tree = nullptr; }
+    TreeGuard& operator=(TreeGuard&& o) noexcept {
+        if (this != &o) { if (tree) ts_tree_delete(tree); tree = o.tree; o.tree = nullptr; }
+        return *this;
+    }
     TSNode root() { return ts_tree_root_node(tree); }
     explicit operator bool() const { return tree != nullptr; }
 };

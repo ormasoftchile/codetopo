@@ -35,8 +35,6 @@ int main(int argc, char** argv) {
     bool index_supervised = false;
     bool index_safe_mode = false;
     bool index_resume = false;
-    bool index_profile = false;
-    int index_max_files = 0;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
@@ -52,15 +50,19 @@ int main(int argc, char** argv) {
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
     sub_index->add_option("--exclude", index_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
-    sub_index->add_flag("--profile", index_profile, "Print detailed per-phase profiling report");
-    sub_index->add_option("--max-files", index_max_files, "Limit total files to index (0=unlimited, for profiling)")->default_val(0);
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
     sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
     int index_progress_offset = 0;
     int index_progress_total = 0;
+    int index_max_files = 0;
+    int index_extract_timeout = 10;
+    bool index_profile = false;
     sub_index->add_option("--progress-offset", index_progress_offset, "Files already done (internal)")->group("");
     sub_index->add_option("--progress-total", index_progress_total, "Original total (internal)")->group("");
+    sub_index->add_option("--max-files", index_max_files, "Max files to index (0=unlimited, for profiling)")->default_val(0);
+    sub_index->add_option("--extract-timeout", index_extract_timeout, "Per-file extraction timeout in seconds (0=no limit)")->default_val(10);
+    sub_index->add_flag("--profile", index_profile, "Enable per-phase profiling output");
 
     // --- init subcommand ---
     auto* sub_init = app.add_subcommand("init", "Index a repository and configure editors for MCP");
@@ -73,8 +75,6 @@ int main(int argc, char** argv) {
     int init_max_file_size = 10240;
     bool init_watch = true;
     bool init_turbo = false;
-    bool init_profile = false;
-    int init_max_files = 0;
     std::vector<std::string> init_exclude;
     std::string init_freshness = "normal";
 
@@ -89,8 +89,6 @@ int main(int argc, char** argv) {
     sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in KB")->default_val(10240);
     sub_init->add_option("--parse-timeout", init_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(30);
     sub_init->add_flag("--turbo", init_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
-    sub_init->add_flag("--profile", init_profile, "Print detailed per-phase profiling report");
-    sub_init->add_option("--max-files", init_max_files, "Limit total files to index (0=unlimited, for profiling)")->default_val(0);
     sub_init->add_option("--exclude", init_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
     sub_init->add_flag("--watch,!--no-watch", init_watch,
         "Include --watch in MCP config (default: true)")->default_val(true);
@@ -196,13 +194,14 @@ int main(int argc, char** argv) {
         cfg.no_gitignore = index_no_gitignore;
         cfg.turbo = index_turbo;
         cfg.exclude_patterns = index_exclude;
-        cfg.profile = index_profile;
-        cfg.max_files = index_max_files;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
         cfg.resume = index_resume;
         cfg.progress_offset = index_progress_offset;
         cfg.progress_total = index_progress_total;
+        cfg.max_files = index_max_files;
+        cfg.extraction_timeout_s = index_extract_timeout;
+        cfg.profile = index_profile;
         try {
             if (cfg.supervised) {
                 // Running as a supervised child — index directly
@@ -224,8 +223,8 @@ int main(int argc, char** argv) {
                                       init_large_file_threshold,
                                       init_max_file_size,
                                       init_parse_timeout,
-                                      init_turbo, init_profile,
-                                       init_max_files, init_exclude,
+                                      init_turbo,
+                                      init_exclude,
                                       init_watch, init_freshness);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";

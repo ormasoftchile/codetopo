@@ -21,16 +21,17 @@ struct Config {
     int batch_size = 500;
     int max_file_size_kb = 10240;  // 10 MB in KB
     int parse_timeout_s = 30;  // Per-file tree-sitter parse timeout in seconds (0=no limit)
+    int extraction_timeout_s = 10;  // Per-file extraction timeout in seconds (0=no limit)
     int max_symbols_per_file = 50000;
     int max_ast_depth = 200;
-    int max_files = 0;  // 0 = unlimited; limit total files scanned (for profiling/subset runs)
+    int max_files = 0;  // 0 = unlimited; truncate scanned file list for profiling
+    bool profile = false;  // Enable per-phase profiling output
     bool no_gitignore = false;
     bool turbo = false;  // Aggressive perf: synchronous=OFF, batch=1000, larger cache
     std::vector<std::string> exclude_patterns;  // Glob patterns to exclude (e.g. **/GlobalSuppressions.cs)
     bool supervised = false;   // True when running as a supervised child process
     bool safe_mode = false;    // True = commit after every file (for crash isolation)
     bool resume = false;       // True = load cached worklist instead of rescanning
-    bool profile = false;      // True = print detailed per-phase profiling report
     int progress_offset = 0;   // Files already completed in prior runs (for display)
     int progress_total = 0;    // Original total file count (0 = use work_list.size())
 

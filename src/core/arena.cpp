@@ -1,5 +1,6 @@
 #include "core/arena.h"
 #include <tree_sitter/api.h>
+#include <cstdlib>
 
 namespace codetopo {
 
@@ -16,25 +17,8 @@ Arena* get_thread_arena() {
     return t_current_arena;
 }
 
-// C-linkage wrappers for ts_set_allocator()
-static void* ts_arena_malloc(size_t size) {
-    if (!t_current_arena) return nullptr;
-    return arena_malloc(*t_current_arena, size);
-}
-
-static void* ts_arena_calloc(size_t count, size_t size) {
-    if (!t_current_arena) return nullptr;
-    return arena_calloc(*t_current_arena, count, size);
-}
-
-static void* ts_arena_realloc(void* ptr, size_t new_size) {
-    if (!t_current_arena) return nullptr;
-    return arena_realloc(*t_current_arena, ptr, new_size);
-}
-
-static void ts_arena_free(void* ptr) {
-    arena_free(ptr);
-}
+// C-linkage wrappers for ts_set_allocator() — inline definitions are in arena.h.
+// This file only provides the thread-local storage, set/get accessors, and registration.
 
 void register_arena_allocator() {
     ts_set_allocator(
