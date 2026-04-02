@@ -217,12 +217,9 @@ int run_index(const Config& config) {
         return 0;
     }
 
-    // Sort largest-first: fail-fast — hit problematic big files immediately
-    // so crashes surface early and iteration is fast.
-    std::sort(work_list.begin(), work_list.end(),
-              [](const ScannedFile& a, const ScannedFile& b) {
-                  return a.size_bytes > b.size_bytes;
-              });
+    // DEC-018 largest-first sort removed: with arena overflow fallback,
+    // fail-fast is unnecessary. Scan order (effectively random) spreads
+    // large files across the run, preventing large-pool contention bursts.
 
     // Save worklist so restarted children can skip scanning
     if (config.supervised && !resumed) {
