@@ -362,15 +362,10 @@ int run_index(const Config& config) {
             return result;
         }
 
-        // Route to large arena ONLY when the file won't fit in a normal arena.
-        // Tree-sitter uses ~30x file size in memory, so the threshold is:
-        //   file_size * 30 > normal_arena_capacity
-        // This keeps all smaller files (even 500KB) on the normal pool
-        // which has thread_count*2 arenas — full parallelism.
-        // The old threshold-based routing sent ALL >180KB files to 4 large
-        // arenas, capping parallelism at 4 instead of 16.
+        // Route to large arena when file exceeds the large-file threshold.
+        // The --large-file-threshold flag (in KB) controls this routing.
         bool actually_needs_large = has_large_pool
-            && (static_cast<size_t>(file.size_bytes) * 30 > arena_size);
+            && (static_cast<size_t>(file.size_bytes) > config.large_file_threshold_bytes());
 
         std::unique_ptr<ArenaLease> lease;
         {
@@ -436,6 +431,20 @@ int run_index(const Config& config) {
             tree = TreeGuard(parser.parse(content));
         }
         // Do NOT reset start_epoch_ms here — watchdog must cover extraction too.
+
+        // Check if arena overflowed during parsing — file needed more memory
+        // than the arena capacity. The parse may have "succeeded" but the tree
+        // is likely corrupt, so discard it.
+        if (lease->get()->overflowed()) {
+            slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
+            result.parse_status = "partial";
+            result.parse_error = "arena overflow (" +
+                std::to_string(lease->get()->used() / (1024*1024)) + "MB used of " +
+                std::to_string(lease->get()->capacity() / (1024*1024)) + "MB arena, " +
+                std::to_string(file.size_bytes / 1024) + "KB file)";
+            result.has_error = true;
+            return result;
+        }
 
         if (!tree || slots[slot].cancel_flag != 0) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
