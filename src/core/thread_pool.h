@@ -14,12 +14,24 @@ namespace codetopo {
 // T009: Worker thread pool using std::jthread with configurable thread count.
 class ThreadPool {
 public:
-    // stack_size is accepted for API compatibility but ignored — std::thread
-    // uses 1MB default stacks on Windows, which is sufficient for tree-sitter.
-    // DEC-034 R1: The original 64MB stacks were from legacy _beginthreadex code.
-    explicit ThreadPool(int thread_count, size_t /*stack_size*/ = 0) : stop_(false) {
+    explicit ThreadPool(int thread_count) : stop_(false) {
         for (int i = 0; i < thread_count; ++i) {
-            workers_.emplace_back([this]() { worker_loop(); });
+            workers_.emplace_back([this]() {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        cv_.wait(lock, [this] {
+                            return stop_ || !tasks_.empty();
+                        });
+                        if (stop_ && tasks_.empty())
+                            return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
         }
     }
 
@@ -52,38 +64,11 @@ public:
         return future;
     }
 
-    // Fire-and-forget task submission (no future returned).
-    template<typename F>
-    void submit_detached(F&& f) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tasks_.emplace(std::forward<F>(f));
-        }
-        cv_.notify_one();
-    }
-
     int thread_count() const {
         return static_cast<int>(workers_.size());
     }
 
 private:
-    void worker_loop() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] {
-                    return stop_ || !tasks_.empty();
-                });
-                if (stop_ && tasks_.empty())
-                    return;
-                task = std::move(tasks_.front());
-                tasks_.pop();
-            }
-            task();
-        }
-    }
-
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
     std::mutex mutex_;

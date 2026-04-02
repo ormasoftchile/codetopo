@@ -376,29 +376,9 @@ int run_index(const Config& config) {
         {
         ScopedPhase _al(profiler.arena_lease);
         if (actually_needs_large) {
-            // Truly huge file — must use large arena. Try non-blocking first.
-            Arena* a = large_pool->try_lease();
-            if (a) {
-                lease = std::make_unique<ArenaLease>(*large_pool, a);
-            } else {
-                lease = std::make_unique<ArenaLease>(*large_pool); // block
-            }
+            lease = std::make_unique<ArenaLease>(*large_pool);
         } else {
-            // Normal file — use normal pool (32 arenas, plenty for 18 slots).
-            // Fall back to large pool only if normal is transiently full.
-            Arena* a = arena_pool.try_lease();
-            if (a) {
-                lease = std::make_unique<ArenaLease>(arena_pool, a);
-            } else if (has_large_pool) {
-                Arena* la = large_pool->try_lease();
-                if (la) {
-                    lease = std::make_unique<ArenaLease>(*large_pool, la);
-                } else {
-                    lease = std::make_unique<ArenaLease>(arena_pool); // block on normal
-                }
-            } else {
-                lease = std::make_unique<ArenaLease>(arena_pool); // block
-            }
+            lease = std::make_unique<ArenaLease>(arena_pool);
         }
         } // ScopedPhase arena_lease
         set_thread_arena(lease->get());
@@ -575,7 +555,7 @@ int run_index(const Config& config) {
 
     // Persistent thread pool with 64MB stacks — reuses threads across all files.
     // Eliminates ~162K thread create/destroy operations (saves 80-160s overhead).
-    ThreadPool worker_pool(window_size, 64 * 1024 * 1024);
+    ThreadPool worker_pool(window_size);
 
     // try_submit_one: submits next file if budget allows.
     // Returns true if submitted (or injected failure), false if deferred.
@@ -631,7 +611,7 @@ int run_index(const Config& config) {
                 result_cv.notify_one();
             }
         };
-        worker_pool.submit_detached(std::move(worker_fn));
+        worker_pool.submit(std::move(worker_fn));
         return true;
     };
 
@@ -752,16 +732,6 @@ int run_index(const Config& config) {
         std::cerr << "Read-path indexes rebuilt in " << idx_elapsed << "s\n";
     }
 
-    // WAL checkpoint overlap: launch checkpoint on separate connection BEFORE
-    // resolve starts. The bulk-load WAL can be checkpointed while resolve
-    // (CPU-bound hash join) runs. PASSIVE mode won't block the main connection.
-    std::string ckpt_db = db_path.string();
-    std::thread ckpt_thread([&ckpt_db, &profiler]() {
-        ScopedPhase _wc(profiler.wal_ckpt);
-        Connection ckpt_conn(ckpt_db);
-        ckpt_conn.wal_checkpoint();
-    });
-
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     // Disable FK checks — all IDs come from the DB itself, FK validation is pure overhead.
     std::cerr << "Resolving cross-file references...\n";
@@ -776,9 +746,6 @@ int run_index(const Config& config) {
         std::cerr << "Resolved " << refs_resolved << " refs, created "
                   << edges_created << " edges in " << resolve_elapsed << "s\n";
     }
-
-    // Join checkpoint thread — should have finished during resolve
-    ckpt_thread.join();
 
     // --- Rebuild remaining write-path indexes (deferred from above) ---
     if (bulk_mode) {
@@ -811,6 +778,12 @@ int run_index(const Config& config) {
     {
         ScopedPhase _md(profiler.metadata);
         persister.write_metadata(repo_root.string());
+    }
+
+    // WAL checkpoint (T050)
+    {
+        ScopedPhase _wc(profiler.wal_ckpt);
+        conn.wal_checkpoint();
     }
 
     // Remove worklist and progress files on success

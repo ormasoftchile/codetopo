@@ -30,15 +30,6 @@ public:
         return arena;
     }
 
-    // Non-blocking lease. Returns nullptr if no arenas available.
-    Arena* try_lease() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (available_.empty()) return nullptr;
-        Arena* arena = available_.back();
-        available_.pop_back();
-        return arena;
-    }
-
     // Return a leased arena to the pool. Resets it first.
     void release(Arena* arena) {
         assert(arena);
@@ -69,10 +60,6 @@ class ArenaLease {
 public:
     explicit ArenaLease(ArenaPool& pool)
         : pool_(pool), arena_(pool.lease()) {}
-
-    // Adopt a pre-leased arena (from try_lease)
-    ArenaLease(ArenaPool& pool, Arena* pre_leased)
-        : pool_(pool), arena_(pre_leased) {}
 
     ~ArenaLease() {
         if (arena_) pool_.release(arena_);

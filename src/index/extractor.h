@@ -81,12 +81,11 @@ private:
     int timeout_s_ = 0;
     size_t* cancel_flag_ = nullptr;
     std::chrono::steady_clock::time_point deadline_;
-    std::vector<int> symbol_stack_;// Stack of enclosing symbol indices
+    std::vector<int> symbol_stack_;  // Stack of enclosing symbol indices
     const std::string* source_ = nullptr;
     ExtractionResult* result_ = nullptr;
     const std::string* rel_path_ = nullptr;
     const std::string* language_ = nullptr;
-    LanguageId lang_id_ = LanguageId::Unknown;
 
     std::string node_text(TSNode node);
     std::string get_name_from_child(TSNode node, const char* field_name);
