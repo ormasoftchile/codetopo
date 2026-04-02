@@ -8,6 +8,7 @@
 #include "db/schema.h"
 #include <sqlite3.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <chrono>
@@ -418,6 +419,8 @@ public:
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
         int call_resolved = 0, include_resolved = 0, inherit_resolved = 0;
+        std::string name;
+        name.reserve(256);  // reuse buffer across iterations
 
         while (sqlite3_step(ref_stmt) == SQLITE_ROW) {
             int64_t ref_id = sqlite3_column_int64(ref_stmt, 0);
@@ -426,16 +429,18 @@ public:
             const char* name_raw = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 3));
             if (!kind_raw || !name_raw) continue;
 
-            std::string kind(kind_raw);
-            std::string name(name_raw);
+            std::string_view kind(kind_raw);
+            name.assign(name_raw);
             int64_t resolved_id = 0;
             bool resolved = false;
+            const char* edge_kind = nullptr;
 
             if (kind == "call") {
                 auto it = symbol_map.find(name);
                 if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
                     resolved_id = it->second.id;
                     resolved = true;
+                    edge_kind = "calls";
                     ++call_resolved;
                 }
             } else if (kind == "include") {
@@ -443,6 +448,7 @@ public:
                 if (it != include_map.end()) {
                     resolved_id = it->second;
                     resolved = true;
+                    edge_kind = "includes";
                     ++include_resolved;
                 }
             } else if (kind == "inherit") {
@@ -450,6 +456,7 @@ public:
                 if (it != class_map.end()) {
                     resolved_id = it->second.id;
                     resolved = true;
+                    edge_kind = "inherits";
                     ++inherit_resolved;
                 }
             }
@@ -461,16 +468,11 @@ public:
                 sqlite3_step(update_stmt);
                 ++total_resolved;
 
-                // Collect edge tuple: file_node → resolved target
+                // Edge tuple: file_node → resolved target (kind already set above)
                 auto path_it = fileid_to_path.find(ref_file_id);
                 if (path_it != fileid_to_path.end()) {
                     auto fn_it = file_node_map.find(path_it->second);
                     if (fn_it != file_node_map.end()) {
-                        const char* edge_kind;
-                        if (kind == "call") edge_kind = "calls";
-                        else if (kind == "include") edge_kind = "includes";
-                        else if (kind == "inherit") edge_kind = "inherits";
-                        else edge_kind = "references";
                         edge_tuples.push_back({fn_it->second, resolved_id, edge_kind});
                     }
                 }

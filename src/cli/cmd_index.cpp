@@ -726,6 +726,7 @@ int run_index(const Config& config) {
         std::cerr << "Rebuilding read-path indexes...\n";
         ScopedPhase _ir(profiler.idx_read);
         auto idx_start = std::chrono::steady_clock::now();
+        conn.exec("BEGIN TRANSACTION");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
@@ -733,6 +734,7 @@ int run_index(const Config& config) {
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
+        conn.exec("COMMIT");
         auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - idx_start).count();
         std::cerr << "Read-path indexes rebuilt in " << idx_elapsed << "s\n";
@@ -758,9 +760,11 @@ int run_index(const Config& config) {
         std::cerr << "Rebuilding write-path indexes...\n";
         ScopedPhase _iw(profiler.idx_write);
         auto idx_start = std::chrono::steady_clock::now();
+        conn.exec("BEGIN TRANSACTION");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
+        conn.exec("COMMIT");
         auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - idx_start).count();
         std::cerr << "Write-path indexes rebuilt in " << idx_elapsed << "s\n";
