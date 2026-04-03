@@ -853,38 +853,11 @@ int run_index(const Config& config) {
 
     // Checkpoint WAL to main DB before read-heavy post-processing
     conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    // R2: Re-enable periodic WAL checkpointing for post-processing writes
-    conn.exec("PRAGMA wal_autocheckpoint=1000");
-
-    // --- Rebuild read-path indexes only (nodes, files) for resolve_references lookups ---
-    // Edge and refs write-path indexes are deferred until AFTER resolve_references
-    // to avoid maintaining them during 2.8M+ random inserts/updates.
-    if (bulk_mode) {
-        std::cerr << "Rebuilding read-path indexes...\n";
-        ScopedPhase _ir(profiler.idx_read);
-        auto idx_start = std::chrono::steady_clock::now();
-        conn.exec("BEGIN TRANSACTION");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
-        conn.exec("COMMIT");
-        auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - idx_start).count();
-        std::cerr << "Read-path indexes rebuilt in " << idx_elapsed << "s\n";
-    }
-
-    // R1: Checkpoint after idx_read to consolidate new index WAL writes
-    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    // R5: Warm page cache with tables resolve_refs needs
-    conn.exec("SELECT count(*) FROM refs");
-    conn.exec("SELECT count(*) FROM nodes");
 
     // T039: Cross-file reference resolution (in-memory hash-based pass)
-    // Disable FK checks — all IDs come from the DB itself, FK validation is pure overhead.
+    // Run BEFORE any secondary indexes — resolve_refs only needs INTEGER PRIMARY KEY
+    // lookups (always present) and in-memory hash maps; building indexes first would
+    // force UPDATEs to maintain them for no benefit and bloat the WAL.
     std::cerr << "Resolving cross-file references...\n";
     {
         ScopedPhase _rr(profiler.resolve_refs);
@@ -898,19 +871,34 @@ int run_index(const Config& config) {
                   << edges_created << " edges in " << resolve_elapsed << "s\n";
     }
 
-    // --- Rebuild remaining write-path indexes (deferred from above) ---
+    // Checkpoint WAL after resolve_refs before building indexes
+    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
     if (bulk_mode) {
-        std::cerr << "Rebuilding write-path indexes...\n";
-        ScopedPhase _iw(profiler.idx_write);
+        std::cerr << "Rebuilding all indexes...\n";
+        ScopedPhase _ir(profiler.idx_read);
         auto idx_start = std::chrono::steady_clock::now();
         conn.exec("BEGIN TRANSACTION");
+        // files
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
+        // nodes
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
+        // refs
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
+        // edges
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
         conn.exec("COMMIT");
         auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - idx_start).count();
-        std::cerr << "Write-path indexes rebuilt in " << idx_elapsed << "s\n";
+        std::cerr << "All indexes rebuilt in " << idx_elapsed << "s\n";
     }
 
     // Rebuild FTS5 index in one pass (much faster than per-row triggers)
@@ -938,6 +926,8 @@ int run_index(const Config& config) {
         ScopedPhase _wc(profiler.wal_ckpt);
         conn.wal_checkpoint();
     }
+    // Restore normal autocheckpoint for any subsequent queries
+    conn.exec("PRAGMA wal_autocheckpoint=1000");
 
     // Remove worklist and progress files on success
     fs::remove(worklist_path);
