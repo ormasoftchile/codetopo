@@ -53,3 +53,14 @@
 - **Key pattern**: Formula is a lambda inside `cmd_index.cpp`, not directly testable. Replicated formula in test file as reference implementation. Config struct is `Config` (not `IndexConfig`).
 - **Build**: Clean compile, all 16 tests green. Full unit suite: 136 tests, 904 assertions, all pass.
 - **Files**: `tests/unit/test_watchdog_timeout.cpp`, `CMakeLists.txt` (test registration)
+
+### 2026-07-21: Arena lifetime defense tests for P0 heap corruption fixes (DEC-038/039)
+- Created `tests/unit/test_arena_lifetime.cpp` with **11 test cases (143 assertions)** covering three P0 fixes
+- **ArenaLease thread-local clearing (3 cases)** `[arena][lifetime][lease]`: Verifies `get_thread_arena()` returns `nullptr` after `ArenaLease` destructor runs, arena is returned to pool, and sequential leases all clear correctly.
+- **Tree destruction before arena release (3 cases)** `[arena][lifetime][tree]`: Explicit `TreeGuard` reset leaves arena valid (not reset). Multiple trees destroyed in order. Scoped TreeGuard destruction before arena scope ends.
+- **Fresh parser per file across arenas (3 cases)** `[arena][lifetime][parser]`: Two arenas with fresh parsers (no reuse), 20 arena cycles with fresh parsers, different languages across arena boundaries. All verify no crash and clean pool state.
+- **Combined defense-in-depth (2 cases)** `[arena][lifetime][integration]`: Full parse→destroy→clear→release lifecycle. Arena reset verification: `used() == 0` after re-lease from pool.
+- **Existing parser reuse tests (5 cases)** `[parser][reuse]`: Confirmed all still pass — these test single-arena reuse which was never the problem. The cross-arena reuse was the heap corruption root cause.
+- **Key learning**: `ts_tree_delete()` calls arena's free (which is a no-op), so `arena->used()` may increase slightly during delete due to tree-sitter internal allocations. Don't assert exact equality of `used()` before/after tree destruction — assert `> 0` instead.
+- **Build**: Clean compile, all 146 tests green (1039 assertions). No regressions.
+- **Files**: `tests/unit/test_arena_lifetime.cpp`, `CMakeLists.txt` (test registration)

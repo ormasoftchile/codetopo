@@ -642,3 +642,75 @@ profile_subset.bat C:\One\DsMainDev\Sql full      # Expect: ~3.5-4.5ms/file pers
 ```
 
 The scaling ratio should improve from 6.0x to ~3-3.5x (remaining degradation from UNIQUE constraints and inherent B-tree depth growth — irreducible without R6).
+
+---
+
+# DEC-038/039: P0 Heap Corruption Fixes
+
+**Author:** Grag (Systems Engineer)  
+**Date:** 2026-04-02  
+**Status:** Implemented  
+
+## Context
+
+DEC-040 audit identified that DEC-039 OPT-5 (thread-local parser reuse) is the root cause of heap corruption at high throughput (10,000+ f/s). Tree-sitter parsers cache internal buffers allocated from arena N; when the same parser is reused with arena M, it calls `realloc()` on stale pointers → heap corruption.
+
+## Decisions
+
+### 1. Revert Parser Reuse (OPT-5)
+- **What:** `thread_local std::unordered_map<std::string, Parser>` → per-file `Parser parser;`
+- **Why:** Parser internal state holds arena-allocated pointers. Reusing across arena boundaries is fundamentally unsafe.
+- **Trade-off:** ~15 f/s throughput reduction (negligible vs. crash elimination)
+- **File:** `src/cli/cmd_index.cpp` line 471-474
+
+### 2. Explicit Tree Destruction Before Arena Release
+- **What:** `tree = TreeGuard(nullptr)` inserted after extraction, before ArenaLease destruction
+- **Why:** `ts_tree_delete()` walks arena-allocated tree nodes. Must happen before `arena->reset()` invalidates that memory.
+- **File:** `src/cli/cmd_index.cpp` line 525-529
+
+### 3. Thread-Local Arena Pointer Cleanup
+- **What:** `set_thread_arena(nullptr)` added to all 7 return paths in worker lambda + ArenaLease destructor
+- **Why:** Defense-in-depth. Prevents stale `t_current_arena` from being used after arena is returned to pool.
+- **Files:** `src/cli/cmd_index.cpp` (7 return paths), `src/core/arena_pool.h` (destructor)
+
+## What Was NOT Changed
+- Batch symbol INSERT (OPT-1) — retained
+- Turbo batch 5000 (OPT-2) — retained
+- Pre-sized file read (OPT-3) — retained
+- Removed clear_bindings (OPT-4) — retained
+
+## Verification
+- Build: Clean (MSVC Release)
+- Tests: 136 cases, 904 assertions, all pass
+
+---
+
+# DEC-038/039: Arena Lifetime Defense Tests
+
+**Author:** Joan (QA)  
+**Date:** 2026-07-21  
+**Status:** Complete  
+
+## Context
+
+Grag implemented three P0 heap corruption fixes (DEC-038/039):
+1. Reverted thread-local parser cache → fresh parser per file
+2. Explicit tree destruction before arena lease release
+3. ArenaLease destructor clears thread-local arena pointer
+
+## Decision
+
+Created `tests/unit/test_arena_lifetime.cpp` (11 tests, 143 assertions) as a dedicated test file rather than appending to `test_dec039_optimizations.cpp`. Rationale: the arena lifetime tests are conceptually distinct from the DEC-039 optimization tests (batch insert, pre-sized read, parser reuse). They test defense-in-depth memory safety, not performance optimizations.
+
+## Key Finding
+
+`ts_tree_delete()` routes through the arena's free function (which is a no-op). During deletion, tree-sitter may trigger internal allocations via the arena allocator, so `arena->used()` can *increase* after tree destruction. Tests must assert `used() > 0` (arena not reset) rather than exact byte equality.
+
+## Existing Tests
+
+The 5 parser reuse tests in `test_dec039_optimizations.cpp` all still pass. They test single-arena parser reuse which was never broken — the heap corruption was from cross-arena parser reuse with stale internal pointers.
+
+## Impact
+
+- 146 total tests, 1039 assertions, all green
+- No regressions in existing test suite

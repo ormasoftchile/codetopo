@@ -190,3 +190,13 @@
 - **Long-term:** If parser reuse is needed, implement "parser-per-arena" architecture where parsers are owned by ArenaPool and reset alongside arenas.
 - **Report delivered:** `.squad/decisions/inbox/grag-arena-thread-safety.md` — full audit with exact locations, trigger sequences, and code fixes.
 
+
+### DEC-038/039 P0 Heap Corruption Fixes  Implementation (2026-04-02)
+- **Context:** Implemented the three fixes identified in DEC-040 arena audit to eliminate heap corruption at high throughput (10,000+ f/s).
+- **Fix 1 (cmd_index.cpp:469-481):** Reverted DEC-039 OPT-5 parser reuse. Replaced `thread_local std::unordered_map<std::string, Parser> t_parsers` with per-file `Parser parser;`. Root cause: tree-sitter parsers cache arena-allocated buffers; reusing across arena boundaries causes dangling pointers.
+- **Fix 2 (cmd_index.cpp:525-529):** Added explicit `tree = TreeGuard(nullptr)` after extraction, before ArenaLease goes out of scope. Forces `ts_tree_delete()` while arena memory is still valid. Also added `set_thread_arena(nullptr)` before ALL 7 return paths after `set_thread_arena(lease->get())`.
+- **Fix 3 (arena_pool.h:64-69):** Modified ArenaLease destructor to call `set_thread_arena(nullptr)` before `pool_.release(arena_)`. Defense-in-depth against stale thread-local arena pointers.
+- **Key pattern:** Triple defense: (1) no parser state survives across arenas, (2) tree explicitly destroyed before arena reset, (3) thread-local arena pointer cleared on every exit path + lease destructor.
+- **Build:** Clean (MSVC Release). **Tests:** 136 test cases, 904 assertions, all pass.
+- **Files modified:** `src/cli/cmd_index.cpp`, `src/core/arena_pool.h`.
+- **Decision doc:** `.squad/decisions/inbox/grag-p0-heap-fixes.md`
