@@ -102,3 +102,72 @@
 - Arena pools already handle large-file fallback
 - Result queue contention negligible even at 50 threads
 - Resolve phase becomes offline bottleneck; parallel resolve (#5) high-ROI at scale
+
+### 2026-04-02: Persist Pipeline Overhaul Design (DEC-038)
+
+**Designed 3-phase optimization targeting 351s persist + 95s contention at 100K files:**
+
+1. **OPT-1 (Cold index skip):** `enable_cold_index_if_empty()` exists but was never wired up in cmd_index.cpp. One-line fix. Very low risk.
+
+2. **OPT-2 (Multi-row INSERT):** Batch refs (80 rows/chunk) and edges (150 rows/chunk) into multi-row INSERT. Symbols stay single-row because `last_insert_rowid` is needed per symbol for ref/edge binding. Refs + edges are ~85% of INSERT volume.
+
+3. **OPT-3 (Persist thread):** Bounded `PersistQueue` (capacity 512, mutex+2 CVs, backpressure on full). Persist thread owns full transaction lifecycle (begin_batch → persist_file → flush_if_needed → commit_batch). Main thread reduces to: dequeue → push → refill → display progress via `atomic<int> persisted_count`. Previous DEC-034 attempt crashed from ParserPool (thread_local heap corruption), not from persist thread itself — persist thread is parser-free, safe to retry.
+
+**Key architectural decisions:**
+- Queue bounded at 512 to cap memory (~5-10MB) and prevent runaway growth
+- Connection ownership transfers via join() happens-before guarantee
+- Progress file writes move to persist thread (after each COMMIT)
+- profiler.persist removed from main thread; replaced by persist_wait (backpressure metric)
+- Fatal DB error → atomic flag → main thread aborts gracefully
+
+**Ordering:** OPT-1 → OPT-3 → OPT-2 (validate profiling → decouple pipeline → optimize internals).
+
+### 2026-03-07: WAL Checkpoint Architecture Review (DEC-038 Post-Analysis)
+
+**Regression observed:** Post-processing phases (idx_read, resolve_refs, idx_write, fts_rebuild) regressed 2.7x–6x at 100K despite unchanged code after DEC-038 OPT-3 implementation.
+
+**Root cause identified:** Missing WAL checkpoint between persist completion and post-processing start.
+
+**Key findings:**
+1. **WAL bloat during persist:** 35M row insertions (100K files × ~350 INSERTs/file) → ~100 COMMIT transactions → 500MB–2GB WAL file with no checkpoint
+2. **Persist thread correctly transfers Connection:** `in_batch_` flag properly managed (false after commit_batch), transaction state sound, join() happens-before guarantees ownership transfer
+3. **PRAGMA persistence confirmed:** All per-connection settings (journal_mode=WAL, synchronous=NORMAL/OFF, wal_autocheckpoint=0 in turbo) remain in effect across thread boundary
+4. **Lock contention mechanism:** Post-processing queries (idx_read CREATE INDEX, resolve_refs scanning + updates) now contend with massive WAL frame eviction and lock incompatibilities on table metadata writes
+
+**Solution:** Add explicit `conn.wal_checkpoint()` between `persist_thread.join()` (line 808) and idx_read start (line 831) in cmd_index.cpp. This consolidates WAL frames into database file, frees memory, removes lock contention.
+
+**Expected outcome:** 3–5x speedup on post-processing phases (back to pre-OPT-3 baseline), with persist phase flat or +2–3% overhead.
+
+**Architectural validation:**
+- DEC-038 persist thread design is sound — no thread safety or transaction state issues
+- Problem is not in persist pipeline but in missing pipeline transition ritual (checkpoint)
+- Post-DEC-038, WAL discipline must be explicit (was previously implicit in main-thread persist loop)
+
+**Decision:** Fix is one-line code addition; no architectural rework needed. Defer deeper optimization (incremental checkpoint during persist) to DEC-039 if further tuning desired
+
+### 2026-04-03: Full Index Pipeline Architecture Review (DEC-039)
+
+**Reviewed entire run_index() pipeline end-to-end at 100K file scale (652s wall, 16 threads).**
+
+**Key architectural findings:**
+
+1. **Persist throughput is the pipeline ceiling.** 242s (37%) of main-thread backpressure proves persist can't keep up with 16 workers. Theoretical worker throughput is ~333 files/s but actual is 153 files/s — pipeline efficiency is only 54%. The single-row symbol INSERT (forced by `last_insert_rowid` dependency) is the dominant persist-phase cost.
+
+2. **Main-thread relay adds unnecessary latency.** Data path is worker → result_queue → main → persist_queue → persist. Main thread only relays data + manages slots. Batch draining from result_queue (pop ALL ready results in one lock) is a quick win. Eliminating the relay entirely is a longer-term architectural option.
+
+3. **Arena pool contention (87s/13.4%) traced to large-file pool.** Normal pool has 32 arenas for 18 workers (adequate). Large-file pool has only max(2, thread_count/4) = 4 arenas. When multiple large files queue, workers block.
+
+4. **Post-processing is 210s (32%) all sequential.** idx_read (82s, 7 indexes), resolve_refs (72s), idx_write (27s), fts_rebuild (29s). Index audit may reveal redundant indexes. Resolve is well-optimized from DEC-015 but could benefit from incremental resolution on warm re-index.
+
+5. **File read (35.3ms/file) still uses ostringstream** — DEC-037 #1 pre-allocated buffer not yet implemented. Largest single-phase cost.
+
+6. **ThreadPool lost custom stack sizes** when slot system was replaced (DEC-024). Current std::thread uses default 1MB stacks. Not crash-critical (iterative DFS) but inconsistent with DEC-021 intent.
+
+7. **Parser created per file** — 100K ts_parser_new/delete cycles. Thread-local pooling by language would eliminate this.
+
+**Actionable optimization tiers identified:**
+- Tier 1 (80–120s, low risk): Pre-allocated read buffer, batch drain, remove clear_bindings, parser pooling, language enum dispatch
+- Tier 2 (50–80s, moderate risk): Batch symbol INSERT with ID arithmetic, index audit, larger persist batches
+- Tier 3 (40–60s, architectural): Eliminate main-thread relay, lock-free arena distribution, incremental resolve
+
+**Review written to:** `.squad/decisions/inbox/simon-index-design-review.md`. Integrated with Otho analysis into DEC-039 (decisions.md). Design accepted. Phase 1 implementation (batch symbol INSERT, turbo batch 5000) proceeding to Grag.

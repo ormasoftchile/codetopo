@@ -151,6 +151,151 @@ Implemented 3 MCP tool fixes identified in design review to close capability gap
 
 ---
 
+# DEC-039: Index Pipeline Architecture Review — Simon + Otho Performance Deep Dive
+
+**Authors:** Simon (Lead/Architect), Otho (Performance Engineer)  
+**Date:** 2026-04-03  
+**Status:** Accepted — Design review complete, implementation proceeding
+
+## Executive Summary
+
+Full end-to-end architecture review of `run_index()` pipeline at 100K file scale (652s wall, 16 threads, post-DEC-038). Analysis identified that **persist throughput remains the pipeline ceiling** despite prior optimizations. Root cause is single-row symbol INSERT pattern (2400μs per ~30-symbol file, 69% of persist cost). Three-tier optimization plan targets 480s baseline (−172s, −26%), meeting 494s target.
+
+## Key Findings
+
+### Finding 1: Persist is Pipeline Bottleneck Despite DEC-034 R2 Pipelining
+- Persist thread: 425s (persist 348s + flush 77s)
+- Workers per-thread: 300s
+- Main-thread idle: 194s (healthy)
+- Main-thread backpressure: 242s (37% of wall) proves queue saturation
+
+Pipeline balance ratio: 425/300 = 1.42:1 (persist-bound). Workers produce at 333 files/s theoretical, actual 153 files/s (46% efficiency).
+
+### Finding 2: Single-Row Symbol INSERT is Dominant Cost
+- Per-file: ~30 symbols × 1 `sqlite3_step()` each = 2400μs (69% of 3.48ms persist cost)
+- Refs/edges already batch (80-row, 150-row per DEC-038 OPT-2)
+- Symbols are the only unbatched INSERT; `last_insert_rowid()` per-symbol drives pattern
+
+### Finding 3: File Read Still Uses ostringstream (O(N log N) allocations)
+- Current: 35.3ms/file average, 3530s thread-time (largest single phase)
+- Root: exponential allocation growth + redundant `.str()` copy
+- Fix: Pre-sized string + single direct read → 50-65% faster
+
+### Finding 4: 11-Phase Pipeline Analyzed End-to-End
+1. Discovery (scanner) — 72s at 200K+ (off critical path)
+2. Work list prep — double file read for changed files (warm-index only)
+3. Worker pool — slot system dual-layer complexity (low-priority refactor)
+4. File read — largest phase, pre-allocation quick win
+5. Hashing — excellent, 20μs/file irreducible
+6. Parsing — 100K parser allocations (2s overhead), thread-local pooling → 3-5s savings
+7. Extraction — string dispatch overhead in hot loop (1.5ms/file)
+8. Result queue — single-dequeue pattern (opportunity: batch drain)
+9. Persist queue — well-designed, backpressure is symptom not cause
+10. SQLite persist — batch symbol INSERT is critical path, batch drain, clear_bindings removal
+11. Post-processing — 210s sequential (82s idx_read, 72s resolve_refs, 27s idx_write, 29s fts_rebuild)
+
+### Finding 5: 7 Post-Processing Bottlenecks Assessed
+- **idx_read (82s, 7 indexes):** Index audit reveals potential redundancy
+- **resolve_refs (72s):** Well-optimized from DEC-015, sequential by design
+- **idx_write (27s):** Deferred correctly, cannot parallelize with FTS (single-writer)
+- **fts_rebuild (29s):** Atomic, cannot overlap
+- All 4 phases single-threaded due to SQLite single-writer constraint
+
+## Three-Phase Optimization Plan (11 Optimizations)
+
+### Phase 1: Persist Speedup (Must-Do First)
+
+**Tier 1 — Two Changes, Combined 652→520s (−132s, −20%)**
+
+| Optimization | Cost | Effort | Risk |
+|---|---|---|---|
+| Batch symbol INSERT (20-row) | −110s persist, −117s wall | Medium (60 LOC) | Medium |
+| Turbo batch size 1000→5000 | −30s flush | 1-line | Low |
+
+**Method:** Follow existing batch INSERT pattern (refs 80-row, edges 150-row). Compute IDs via `last_insert_rowid() - (N-1)` arithmetic (SQLite sequential rowid guarantee within single INSERT, no concurrent deletes in transaction).
+
+**Rationale:** After Phase 1, persist (300s) ≈ workers (300s). Pipeline becomes balanced instead of persist-bound.
+
+### Phase 2: Worker Speedup (Unlocked by Phase 1)
+
+**Tier 1 — Two Changes, Combined 520→480s (−40s, reaching target)**
+
+| Optimization | Cost | Effort | Risk |
+|---|---|---|---|
+| Pre-sized file_read | −60s wall | Small (10 LOC) | Very Low |
+| Thread-local parser reuse | −10s wall | Small (15 LOC) | Low |
+
+**Method:** (1) Allocate `std::string(file.size_bytes)` once, single `f.read()` call. (2) `thread_local unordered_map<string, Parser>` per language, reuse across files.
+
+**Rationale:** After Phase 1, persist no longer gates. Worker optimizations become visible. These are the two largest per-file worker costs (35ms + 2ms of 48ms total).
+
+**After Phase 1+2:** 652s → ~480s (−172s, −26%), **meets 494s target with margin**.
+
+### Phase 3: Post-Processing Polish (If Needed)
+
+**Tier 2 — Two Changes, Combined 480→455s (−25s, exceed target)**
+
+| Optimization | Cost | Effort | Risk |
+|---|---|---|---|
+| Defer content_hash index | −10s | Small | Very Low |
+| Page size 4K→8K (new DBs) | −15s | Small | Very Low |
+
+**Method:** (1) Skip building `idx_files_content_hash` during cold index (only used by incremental change detector). (2) Set `PRAGMA page_size=8192` before `ensure_schema()` on fresh DBs.
+
+**Rationale:** Low-complexity refinement. Not on critical path but useful polish.
+
+### Additional Tier 1 Opportunities (Low-Risk, Not Critical)
+
+- **Remove clear_bindings() calls:** All parameters re-bound anyway. −10s.
+- **Batch drain from result_queue:** Pop ALL ready results per lock, not one-at-a-time. Improves worker utilization, reduces lock overhead.
+- **Language enum dispatch:** Pre-computed enum instead of string comparisons in extract hot loop (synergizes with Phase 2 parser pooling).
+
+## Risk Assessment
+
+| Change | Risk | Mitigation |
+|---|---|---|
+| Batch symbol INSERT | Medium (rowid guarantee) | Unit test persist_file round-trip validation, verify sequential IDs |
+| Turbo batch 5000 | Low (already in turbo mode) | Accepts expanded crash recovery window (acceptable for rebuildable index) |
+| Pre-sized file_read | Very Low (size is known) | filesystem::file_size() is reliable |
+| Thread-local parser | Low (lifetime management) | Parser outlives all tasks; reset automatic on language switch |
+| Defer content_hash | Very Low (lazy build) | Build on first incremental detect() call if needed |
+
+## Data-Driven Validation
+
+- **Persist throughput:** 3.48ms/file × 100K = 348s measured (matches profile)
+- **Worker production:** 100K / (300s / 16 threads) = 5333 files/s theoretical vs 153 files/s actual (35% efficiency proves persist bottleneck)
+- **persist_wait backpressure:** 242s = 242s / (100K × 0.00242ms/iteration) confirms 100% main-thread blocked, queue saturation
+- **Flush cost:** 100 commits × 770ms = 77s (each writes 20-40MB WAL)
+
+## Critical Path Insight
+
+**Pipeline bottleneck chain:** Persist (425s) > Workers (300s) > Main contention (436s ceiling reachable if workers freed).
+
+After Phase 1: Persist (300s) ≈ Workers (300s). Workers become new bottleneck when Phase 2 implemented.
+
+After Phase 1+2: Persist (300s) > Workers (185s). Persist ceiling lower, but still limits overall wall time. Remaining gains require persist micro-optimizations (Phase 3) or architectural changes (eliminate main-thread relay, lock-free arena distribution).
+
+## Recommendation
+
+**Execute Phase 1 immediately.** Batch symbol INSERT + turbo batch 5000 are the only changes that directly reduce wall time at current bottleneck. Phase 1 (2-3 hours) delivers −132s (−20%). Phase 1+2 combined (5-6 hours total) meets target: **652s → 480s** (−172s, −26%).
+
+## Implementation Sequence
+
+1. **Grag:** Implement Phase 1 (batch symbol INSERT, turbo batch 5000)
+2. **Joan:** Write tests for batch symbol INSERT round-trip validation
+3. **Team:** Re-profile fsm (4145 files) to validate 652→520s projection
+4. **Grag:** Implement Phase 2 (pre-sized file_read, thread-local parser)
+5. **Joan:** Write tests for parser reuse, file_read edge cases
+6. **Team:** Final profile on fsm to confirm 520→480s and 100K baseline improvement
+
+## Artifacts
+
+- Full review: `.squad/decisions/inbox/simon-index-design-review.md` (11 phases, 250+ lines)
+- Full analysis: `.squad/decisions/inbox/otho-perf-opportunities.md` (7 bottlenecks, 385+ lines)
+- Orchestration logs: `.squad/orchestration-log/2026-04-03T0235Z-simon.md` and `.squad/orchestration-log/2026-04-03T0235Z-otho.md`
+
+---
+
 # DEC-034: SQLite Turbo PRAGMAs + FK Disable + 2GB mmap (Grag, 2026-04-01)
 
 **Status:** Implemented, build + benchmark verified

@@ -90,3 +90,52 @@
 - **Simon's roadmap ready:** Phase 1 code review → implementation → re-profile. DEC-037 locked.
 - **Build status:** MSVC + CMake clean. 208 tests (1112 assertions), 207 pass (1 pre-existing flake).
 - **Team actions:** Code review Phase 1, implement in parallel if possible, profile before/after on fsm to validate gains.
+
+### 2026-04-01: DEC-038 post-processing regression — WAL + thread transition root cause
+- **Symptom:** DEC-038 moved persist_file to a dedicated thread. Indexing improved (510→472s) but post-processing regressed 3x (164→484s), total 805→957s.
+- **Root cause:** With `wal_autocheckpoint=0`, the WAL accumulates ~1GB at 100K files. SQLite's mmap (2GB) doesn't cover WAL pages — all reads go through WAL hash tables (~60 segments). In opt2 (main-thread persist), SQLite's WAL reader state was warm on the same thread. In opt3 (persist thread), the main thread must rebuild WAL reader state after `persist_thread.join()`, causing every page read to re-scan hash tables.
+- **Why FTS 6.16x worst:** FTS5 rebuild writes to multiple shadow tables with random access patterns, maximizing WAL hash table lookup overhead per page.
+- **Fix:** Add `PRAGMA wal_checkpoint(TRUNCATE)` after `persist_thread.join()` and before idx_read. Converts WAL→DB file, enables mmap-based reads. Expected: +30-50s checkpoint, −320s reads, net ~270s improvement.
+- **Batch INSERT zero effect:** DEC-027 statement caching already eliminated API overhead. Batch INSERT only saves 79 reset/clear_bindings calls per 80 refs — microseconds. Recommend removing the ~100 lines of batch INSERT complexity.
+- **Persist scaling (2.57→3.51ms/file):** B-tree depth growth + page cache pressure at 100K scale. Fundamental SQLite limit at this volume.
+- **Key principle:** When moving SQLite writes to a background thread, ALWAYS checkpoint the WAL before switching to reads on the main thread. The WAL/mmap interaction makes uncheckpointed reads catastrophically slow at scale.
+- **Files:** `src/cli/cmd_index.cpp` (persist thread + post-processing), `src/index/persister.h` (batch INSERT), `src/db/connection.h` (WAL/mmap pragmas)
+
+### 2026-04-02: resolve_refs 3× regression root-cause — cache destruction + WAL re-growth
+- **Symptom:** resolve_refs 63s→178s (+183%) after adding TRUNCATE checkpoint. Checkpoint fixed fts_rebuild and idx_write but not resolve_refs.
+- **Primary root cause: Page cache destruction chain.** TRUNCATE checkpoint processes ~1GB WAL (churns 32K-page cache), then idx_read does 7 full table scans + 7 B-tree builds (churns it 7 more times). resolve_refs starts with stone-cold cache for the refs/nodes/edges tables it needs. In opt2 (no checkpoint), WAL pages had good locality for the same tables persist just wrote.
+- **Secondary cause: WAL re-accumulation.** After TRUNCATE empties the WAL, wal_autocheckpoint=0 remains active. resolve_refs generates 5M WAL frames (2.5M UPDATEs + 2.5M INSERTs) from zero, growing WAL hash table to 30-60 segments. Every page read must search all segments.
+- **Why other phases benefited:** fts_rebuild and idx_write do SEQUENTIAL reads → mmap + OS read-ahead covers them. resolve_refs does RANDOM read-write (UPDATE by rowid, INSERT with B-tree navigation) → cold cache + growing WAL = worst case.
+- **Key finding: resolve_refs Step 6 uses single-row INSERT for 2.5M edges** while persist_file uses 150-row batch. Not a regression cause but the single biggest absolute-time component.
+- **Fixes proposed (for Grag):** (1) Checkpoint between idx_read and resolve_refs, (2) re-enable wal_autocheckpoint before post-processing, (3) batch edge INSERT in resolve_refs, (4) increase mmap_size to 4GB, (5) cache warming scans, (6) index-assisted DELETE. Expected: 178s → ~60-65s.
+- **Key principle update:** TRUNCATE checkpoint helps sequential access patterns but HURTS random-access patterns when it destroys page cache. For mixed read-write phases, either warm the cache after checkpoint or keep autocheckpoint enabled.
+- **Files:** `src/index/persister.h` (resolve_references lines 360-610), `src/cli/cmd_index.cpp` (lines 828-878), `src/db/connection.h` (turbo mode, mmap)
+
+### 2026-04-02: Deep performance analysis — 100K index 652s, persist still bottleneck
+- **Methodology:** Full code-level analysis of all profiled phases at 100K scale (652s wall, 16 threads). Decomposed wall time into indexing phase (442s) and post-processing (210s). Traced critical path through pipeline.
+- **Key finding: persist thread (425s) is STILL the pipeline bottleneck despite DEC-034 R2 pipelining.** Workers produce at ~3ms/effective-item, persist consumes at ~4.25ms/item. persist_wait (242s = 55% of indexing phase) proves queue backpressure. Worker optimizations (file_read, parser) yield ZERO wall-time improvement until persist is faster.
+- **Root cause of persist cost: single-row symbol INSERT.** Per-file: ~30 individual sqlite3_step() calls for symbols = 2400μs (69% of 3.48ms persist cost). Refs and edges already use batch INSERT (DEC-038 OPT-2). Symbols are the only unbatched INSERT.
+- **Root cause of file_read cost: ostringstream doubling + copy.** read_file_content uses `ss << f.rdbuf()` + `ss.str()` — two full copies, O(N log N) growth. For 500KB file: ~1.5MB wasted copies. Fixable with pre-sized string + direct read.
+- **Root cause of flush cost: 100 COMMIT+BEGIN pairs.** Turbo batch_size=1000 → 100 commits at ~770ms each. Each writes 20-40MB WAL data. Larger batch (5000) amortizes better.
+- **Optimization plan (3 phases):**
+  1. Phase 1 (persist): Batch symbol INSERT (20-row) + turbo batch 1000→5000. persist_thread: 425→300s. Wall: 652→520s (−132s).
+  2. Phase 2 (workers): Pre-sized file_read + thread-local parser reuse. Workers: 300→185s/thread. Wall: 520→480s (−40s more).
+  3. Phase 3 (post-proc): Defer content_hash index + page_size=8192. Wall: 480→455s (−25s more).
+- **Phase 1+2 combined meets 494s target** at ~480s (−172s, −26%).
+- **Pipeline dynamics insight:** After Phase 1, persist≈workers≈300s (balanced). Phase 2 makes workers faster, re-establishing persist as bottleneck but at lower ceiling. file_read savings only materialize when persist isn't gating.
+- **Confirmed non-targets:** arena_lease (87s = 5.4s/thread, noise), contention (194s = healthy idle), parallel post-processing (SQLite single-writer blocks it), thread count reduction (would slow workers).
+- **Files analyzed:** `src/cli/cmd_index.cpp` (full pipeline), `src/index/persister.h` (persist_file, resolve_references), `src/index/parser.h` (Parser per-file allocation), `src/core/arena.h`/`arena.cpp` (thread-local arena), `src/core/arena_pool.h` (pool sizing), `src/index/extractor.cpp` (read_file_content), `src/core/config.h` (defaults), `src/db/connection.h` (turbo pragmas)
+
+### 2026-04-03: DEC-039 Performance Analysis Accepted — Phase 1 Implementation Queued
+
+**Full bottleneck analysis complete and documented in DEC-039 (decisions.md).**
+
+Integrated Simon's architectural review with Otho's 7-bottleneck decomposition. Key findings validated:
+- Persist (425s) remains pipeline ceiling despite DEC-034 R2 pipelining
+- Single-row symbol INSERT (2400μs per file, 69% of persist) is critical path
+- Batch symbol INSERT (20-row) + turbo batch 5000 unlock rebalancing: 652→520s (−132s)
+- Phase 1+2 combined (5-6 hours) meets 494s target at ~480s
+
+**Design review DEC-039 accepted.** Three-tier optimization plan sequenced: Phase 1 (persist speedup, low-risk) → Phase 2 (worker speedup, unlocked by Phase 1) → Phase 3 (post-proc polish, optional).
+
+**Next:** Grag to implement Phase 1, Joan to write validation tests. Re-profile fsm (4145) to confirm 652→520s baseline improvement.
