@@ -191,9 +191,51 @@ public:
                 }
             }
 
-            // Insert refs
+            // Insert refs (DEC-038 OPT-2: batched 80-row INSERT)
             {
-                for (const auto& ref : extraction.refs) {
+                const int REF_BATCH_SIZE = 80;
+                int num_refs = static_cast<int>(extraction.refs.size());
+                int full_chunks = num_refs / REF_BATCH_SIZE;
+                int remainder = num_refs % REF_BATCH_SIZE;
+                
+                // Full chunks: use batch INSERT
+                if (full_chunks > 0) {
+                    ensure_batch_ref_stmt();
+                    for (int c = 0; c < full_chunks; ++c) {
+                        sqlite3_reset(stmt_batch_insert_ref_);
+                        sqlite3_clear_bindings(stmt_batch_insert_ref_);
+                        
+                        for (int r = 0; r < REF_BATCH_SIZE; ++r) {
+                            int idx = c * REF_BATCH_SIZE + r;
+                            const auto& ref = extraction.refs[idx];
+                            int base_param = r * 9 + 1;  // 9 params per ref
+                            
+                            sqlite3_bind_int64(stmt_batch_insert_ref_, base_param + 0, file_id);
+                            sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 1, ref.kind.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 2, ref.name.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_int(stmt_batch_insert_ref_, base_param + 3, ref.start_line);
+                            sqlite3_bind_int(stmt_batch_insert_ref_, base_param + 4, ref.start_col);
+                            sqlite3_bind_int(stmt_batch_insert_ref_, base_param + 5, ref.end_line);
+                            sqlite3_bind_int(stmt_batch_insert_ref_, base_param + 6, ref.end_col);
+                            if (ref.evidence.empty()) 
+                                sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 7);
+                            else 
+                                sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 7, ref.evidence.c_str(), -1, SQLITE_STATIC);
+                            if (ref.containing_symbol_index >= 0 && 
+                                ref.containing_symbol_index < static_cast<int>(symbol_ids.size()))
+                                sqlite3_bind_int64(stmt_batch_insert_ref_, base_param + 8, symbol_ids[ref.containing_symbol_index]);
+                            else
+                                sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 8);
+                        }
+                        sqlite3_step(stmt_batch_insert_ref_);
+                    }
+                }
+                
+                // Remainder: use single-row INSERT
+                for (int r = 0; r < remainder; ++r) {
+                    int idx = full_chunks * REF_BATCH_SIZE + r;
+                    const auto& ref = extraction.refs[idx];
+                    
                     sqlite3_reset(stmt_insert_ref_);
                     sqlite3_clear_bindings(stmt_insert_ref_);
                     sqlite3_bind_int64(stmt_insert_ref_, 1, file_id);
@@ -214,28 +256,65 @@ public:
                 }
             }
 
-            // Insert edges (containment: file_node → symbol)
+            // Insert edges (DEC-038 OPT-2: batched 150-row INSERT)
             {
+                const int EDGE_BATCH_SIZE = 150;
+                
+                // Pre-filter edges (need to know final count)
+                std::vector<std::tuple<int64_t, int64_t, const ExtractedEdge*>> valid_edges;
                 for (const auto& edge : extraction.edges) {
                     int64_t src_id = (edge.src_index < 0) ? file_node_id : symbol_ids[edge.src_index];
-                    int64_t dst_id;
-
-                    if (edge.dst_index >= 0 && edge.dst_index < static_cast<int>(symbol_ids.size())) {
-                        dst_id = symbol_ids[edge.dst_index];
-                    } else {
-                        continue;  // Unresolved cross-file edge — skip for now
-                    }
-
+                    
+                    if (edge.dst_index < 0 || edge.dst_index >= static_cast<int>(symbol_ids.size()))
+                        continue;  // Unresolved cross-file edge
                     if (edge.confidence < 0.3) continue;  // FR-044
-
+                    
+                    int64_t dst_id = symbol_ids[edge.dst_index];
+                    valid_edges.push_back({src_id, dst_id, &edge});
+                }
+                
+                int num_edges = static_cast<int>(valid_edges.size());
+                int full_chunks = num_edges / EDGE_BATCH_SIZE;
+                int remainder = num_edges % EDGE_BATCH_SIZE;
+                
+                // Full chunks: use batch INSERT
+                if (full_chunks > 0) {
+                    ensure_batch_edge_stmt();
+                    for (int c = 0; c < full_chunks; ++c) {
+                        sqlite3_reset(stmt_batch_insert_edge_);
+                        sqlite3_clear_bindings(stmt_batch_insert_edge_);
+                        
+                        for (int e = 0; e < EDGE_BATCH_SIZE; ++e) {
+                            int idx = c * EDGE_BATCH_SIZE + e;
+                            auto [src_id, dst_id, edge_ptr] = valid_edges[idx];
+                            int base_param = e * 5 + 1;  // 5 params per edge
+                            
+                            sqlite3_bind_int64(stmt_batch_insert_edge_, base_param + 0, src_id);
+                            sqlite3_bind_int64(stmt_batch_insert_edge_, base_param + 1, dst_id);
+                            sqlite3_bind_text(stmt_batch_insert_edge_, base_param + 2, edge_ptr->kind.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_double(stmt_batch_insert_edge_, base_param + 3, edge_ptr->confidence);
+                            if (edge_ptr->evidence.empty()) 
+                                sqlite3_bind_null(stmt_batch_insert_edge_, base_param + 4);
+                            else 
+                                sqlite3_bind_text(stmt_batch_insert_edge_, base_param + 4, edge_ptr->evidence.c_str(), -1, SQLITE_STATIC);
+                        }
+                        sqlite3_step(stmt_batch_insert_edge_);
+                    }
+                }
+                
+                // Remainder: use single-row INSERT
+                for (int e = 0; e < remainder; ++e) {
+                    int idx = full_chunks * EDGE_BATCH_SIZE + e;
+                    auto [src_id, dst_id, edge_ptr] = valid_edges[idx];
+                    
                     sqlite3_reset(stmt_insert_edge_);
                     sqlite3_clear_bindings(stmt_insert_edge_);
                     sqlite3_bind_int64(stmt_insert_edge_, 1, src_id);
                     sqlite3_bind_int64(stmt_insert_edge_, 2, dst_id);
-                    sqlite3_bind_text(stmt_insert_edge_, 3, edge.kind.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_double(stmt_insert_edge_, 4, edge.confidence);
-                    if (edge.evidence.empty()) sqlite3_bind_null(stmt_insert_edge_, 5);
-                    else sqlite3_bind_text(stmt_insert_edge_, 5, edge.evidence.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(stmt_insert_edge_, 3, edge_ptr->kind.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_double(stmt_insert_edge_, 4, edge_ptr->confidence);
+                    if (edge_ptr->evidence.empty()) sqlite3_bind_null(stmt_insert_edge_, 5);
+                    else sqlite3_bind_text(stmt_insert_edge_, 5, edge_ptr->evidence.c_str(), -1, SQLITE_STATIC);
                     sqlite3_step(stmt_insert_edge_);
                 }
             }
@@ -497,33 +576,69 @@ public:
         // Without a unique constraint, re-runs would accumulate duplicate edges.
         // Delete only resolver-created edges (confidence=0.7, name-match evidence).
         std::cerr << "  Clearing old cross-ref edges...\n";
-        conn_.exec("DELETE FROM edges WHERE kind IN ('calls','includes','inherits') AND evidence = 'name-match'");
+        conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
         std::cerr << "  Inserting " << edge_tuples.size() << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
-        sqlite3_stmt* edge_stmt = nullptr;
+        // R3: Batch edge INSERT using 150-row chunks (no UNIQUE constraint on edges,
+        // so plain INSERT is equivalent to INSERT OR IGNORE here)
+        const int RESOLVE_EDGE_BATCH = 150;
+        const int PARAMS_PER_EDGE = 3;  // src_id, dst_id, kind (confidence+evidence are literals)
+
+        // Prepare batch statement: 150 rows × "(?,?,?,0.7,'name-match')"
+        std::string batch_sql = "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) VALUES ";
+        for (int i = 0; i < RESOLVE_EDGE_BATCH; ++i) {
+            if (i > 0) batch_sql += ",";
+            batch_sql += "(?,?,?,0.7,'name-match')";
+        }
+        sqlite3_stmt* batch_edge_stmt = nullptr;
+        sqlite3_prepare_v2(conn_.raw(), batch_sql.c_str(), -1, &batch_edge_stmt, nullptr);
+
+        // Single-row fallback for remainder
+        sqlite3_stmt* single_edge_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "INSERT OR IGNORE INTO edges(src_id, dst_id, kind, confidence, evidence) "
+            "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
             "VALUES(?, ?, ?, 0.7, 'name-match')",
-            -1, &edge_stmt, nullptr);
+            -1, &single_edge_stmt, nullptr);
 
-        int edge_batch = 0;
-        for (const auto& e : edge_tuples) {
-            sqlite3_reset(edge_stmt);
-            sqlite3_bind_int64(edge_stmt, 1, e.src_id);
-            sqlite3_bind_int64(edge_stmt, 2, e.dst_id);
-            sqlite3_bind_text(edge_stmt, 3, e.kind, -1, SQLITE_STATIC);
-            sqlite3_step(edge_stmt);
-            ++edges_created;
+        int total_edges = static_cast<int>(edge_tuples.size());
+        int full_chunks = total_edges / RESOLVE_EDGE_BATCH;
+        int remainder = total_edges % RESOLVE_EDGE_BATCH;
+        int commit_counter = 0;
 
-            if (++edge_batch >= 100000) {
+        for (int c = 0; c < full_chunks; ++c) {
+            sqlite3_reset(batch_edge_stmt);
+            sqlite3_clear_bindings(batch_edge_stmt);
+            for (int e = 0; e < RESOLVE_EDGE_BATCH; ++e) {
+                const auto& t = edge_tuples[c * RESOLVE_EDGE_BATCH + e];
+                int base = e * PARAMS_PER_EDGE + 1;
+                sqlite3_bind_int64(batch_edge_stmt, base + 0, t.src_id);
+                sqlite3_bind_int64(batch_edge_stmt, base + 1, t.dst_id);
+                sqlite3_bind_text(batch_edge_stmt, base + 2, t.kind, -1, SQLITE_STATIC);
+            }
+            sqlite3_step(batch_edge_stmt);
+            edges_created += RESOLVE_EDGE_BATCH;
+            commit_counter += RESOLVE_EDGE_BATCH;
+            if (commit_counter >= 100000) {
                 conn_.exec("COMMIT");
                 conn_.exec("BEGIN TRANSACTION");
-                edge_batch = 0;
+                commit_counter = 0;
             }
         }
+
+        for (int e = 0; e < remainder; ++e) {
+            const auto& t = edge_tuples[full_chunks * RESOLVE_EDGE_BATCH + e];
+            sqlite3_reset(single_edge_stmt);
+            sqlite3_bind_int64(single_edge_stmt, 1, t.src_id);
+            sqlite3_bind_int64(single_edge_stmt, 2, t.dst_id);
+            sqlite3_bind_text(single_edge_stmt, 3, t.kind, -1, SQLITE_STATIC);
+            sqlite3_step(single_edge_stmt);
+            ++edges_created;
+        }
+
         conn_.exec("COMMIT");
-        sqlite3_finalize(edge_stmt);
+        sqlite3_finalize(batch_edge_stmt);
+        sqlite3_finalize(single_edge_stmt);
         std::cerr << "  Created " << edges_created << " edges\n";
 
         conn_.exec("PRAGMA foreign_keys = ON");
@@ -542,6 +657,11 @@ private:
     sqlite3_stmt* stmt_insert_symbol_ = nullptr;
     sqlite3_stmt* stmt_insert_ref_ = nullptr;
     sqlite3_stmt* stmt_insert_edge_ = nullptr;
+    
+    // DEC-038 OPT-2: Batch INSERT statements (lazy-prepared)
+    sqlite3_stmt* stmt_batch_insert_ref_ = nullptr;   // 80-row batch
+    sqlite3_stmt* stmt_batch_insert_edge_ = nullptr;  // 150-row batch
+    
     bool stmts_cached_ = false;
     bool cold_index_ = false;   // R4: skip DELETE on cold index (empty files table)
 
@@ -575,6 +695,31 @@ private:
         stmts_cached_ = true;
     }
 
+    // DEC-038 OPT-2: Lazy-prepare batch INSERT statements
+    void ensure_batch_ref_stmt() {
+        if (stmt_batch_insert_ref_) return;
+        
+        // 80-row batch: 9 params/row * 80 = 720 params (< 999 limit)
+        std::string sql = "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id) VALUES ";
+        for (int i = 0; i < 80; ++i) {
+            if (i > 0) sql += ",";
+            sql += "(?,?,?,?,?,?,?,?,?)";
+        }
+        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_ref_, nullptr);
+    }
+
+    void ensure_batch_edge_stmt() {
+        if (stmt_batch_insert_edge_) return;
+        
+        // 150-row batch: 5 params/row * 150 = 750 params (< 999 limit)
+        std::string sql = "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) VALUES ";
+        for (int i = 0; i < 150; ++i) {
+            if (i > 0) sql += ",";
+            sql += "(?,?,?,?,?)";
+        }
+        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_edge_, nullptr);
+    }
+
     void finalize_cached_stmts() {
         if (stmt_delete_file_)     { sqlite3_finalize(stmt_delete_file_);     stmt_delete_file_ = nullptr; }
         if (stmt_insert_file_)     { sqlite3_finalize(stmt_insert_file_);     stmt_insert_file_ = nullptr; }
@@ -582,6 +727,8 @@ private:
         if (stmt_insert_symbol_)   { sqlite3_finalize(stmt_insert_symbol_);   stmt_insert_symbol_ = nullptr; }
         if (stmt_insert_ref_)      { sqlite3_finalize(stmt_insert_ref_);      stmt_insert_ref_ = nullptr; }
         if (stmt_insert_edge_)     { sqlite3_finalize(stmt_insert_edge_);     stmt_insert_edge_ = nullptr; }
+        if (stmt_batch_insert_ref_) { sqlite3_finalize(stmt_batch_insert_ref_); stmt_batch_insert_ref_ = nullptr; }
+        if (stmt_batch_insert_edge_){ sqlite3_finalize(stmt_batch_insert_edge_);stmt_batch_insert_edge_ = nullptr; }
         stmts_cached_ = false;
     }
 };

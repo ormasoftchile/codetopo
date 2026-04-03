@@ -50,6 +50,7 @@ struct Profiler {
     PhaseTimer extract;
     PhaseTimer contention;
     PhaseTimer persist;
+    PhaseTimer persist_wait;
     PhaseTimer flush;
     PhaseTimer idx_read;
     PhaseTimer resolve_refs;
@@ -90,6 +91,7 @@ struct Profiler {
         print_phase("extract", extract);
         print_phase("contention", contention);
         print_phase("persist", persist);
+        print_phase("persist_wait", persist_wait);
         print_phase("flush", flush);
         print_phase("idx_read", idx_read);
         print_phase("resolve_refs", resolve_refs);

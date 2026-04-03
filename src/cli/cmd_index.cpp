@@ -25,6 +25,9 @@
 #include <vector>
 #include <future>
 #include <queue>
+#include <deque>
+#include <optional>
+#include <condition_variable>
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
@@ -68,6 +71,59 @@ struct ParsedFile {
     std::string parse_status;   // ok, partial, failed, skipped
     std::string parse_error;
     bool has_error = false;
+};
+
+// DEC-038 OPT-3: Persist queue item (main thread → persist thread)
+struct PersistItem {
+    ParsedFile parsed;
+    int work_list_index;
+    bool sentinel = false;  // signals end-of-work
+};
+
+// DEC-038 OPT-3: Bounded queue for persist pipeline
+class PersistQueue {
+    std::deque<PersistItem> queue_;
+    std::mutex mutex_;
+    std::condition_variable cv_not_full_;
+    std::condition_variable cv_not_empty_;
+    int capacity_;
+    bool closed_ = false;
+
+public:
+    explicit PersistQueue(int capacity) : capacity_(capacity) {}
+
+    void push(PersistItem&& item) {
+        std::unique_lock<std::mutex> lk(mutex_);
+        cv_not_full_.wait(lk, [this] { return queue_.size() < static_cast<size_t>(capacity_) || closed_; });
+        if (closed_) return;
+        queue_.push_back(std::move(item));
+        cv_not_empty_.notify_one();
+    }
+
+    std::optional<PersistItem> pop() {
+        std::unique_lock<std::mutex> lk(mutex_);
+        cv_not_empty_.wait(lk, [this] { return !queue_.empty() || closed_; });
+        if (queue_.empty()) return std::nullopt;
+        auto item = std::move(queue_.front());
+        queue_.pop_front();
+        cv_not_full_.notify_one();
+        return item;
+    }
+
+    void close() {
+        std::unique_lock<std::mutex> lk(mutex_);
+        closed_ = true;
+        cv_not_empty_.notify_all();
+        cv_not_full_.notify_all();
+    }
+};
+
+// DEC-038 OPT-3: Persist thread state (shared atomics)
+struct PersistThreadState {
+    std::atomic<int> persisted_count{0};
+    std::atomic<int> persist_errors{0};
+    std::atomic<bool> fatal_error{false};
+    std::string error_message;  // guarded by fatal_error flag
 };
 
 // T045-T050: Full index command implementation with parallel parse.
@@ -621,14 +677,66 @@ int run_index(const Config& config) {
         return true;
     };
 
-    persister.begin_batch();
+    // DEC-038 OPT-1: Detect cold index BEFORE persist thread starts
+    // (both touch Connection — must not overlap)
+    persister.enable_cold_index_if_empty();
+
+    // DEC-038 OPT-3: Create persist queue and persist thread
+    PersistQueue persist_queue(512);  // bounded capacity
+    PersistThreadState persist_state;
+    
+    std::thread persist_thread([&persist_queue, &persist_state, &persister, &profiler, 
+                                 &config, &work_list, effective_batch_size, &progress_path]() {
+        persister.begin_batch();
+        int local_count = 0;
+        
+        while (true) {
+            auto item_opt = persist_queue.pop();
+            if (!item_opt.has_value()) break;  // closed and empty
+            
+            auto& item = item_opt.value();
+            if (item.sentinel) break;  // end-of-work signal
+            
+            auto& result = item.parsed;
+            
+            if (result.has_error) {
+                persist_state.persist_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            
+            {
+                ScopedPhase _ps(profiler.persist);
+                if (!persister.persist_file(result.file, result.extraction,
+                                            result.content_hash, result.parse_status,
+                                            result.parse_error)) {
+                    persist_state.persist_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            
+            local_count++;
+            bool committed = false;
+            {
+                ScopedPhase _fl(profiler.flush);
+                committed = persister.flush_if_needed(effective_batch_size);
+            }
+            
+            persist_state.persisted_count.store(local_count, std::memory_order_relaxed);
+            
+            if (config.supervised && committed) {
+                std::ofstream pf(progress_path, std::ios::trunc);
+                pf << work_list[item.work_list_index].relative_path << '\n';
+                pf.flush();
+            }
+        }
+        
+        persister.commit_batch();
+    });
 
     // Fill initial window (up to budget)
     while (next_submit < total && in_flight < window_size) {
         if (!try_submit_one()) break;
     }
 
-    // Collect results as they arrive (any order), persist, refill
+    // Collect results as they arrive (any order), push to persist queue, refill
     while (in_flight > 0) {
         IndexedResult item;
         {
@@ -659,52 +767,49 @@ int run_index(const Config& config) {
         int i = item.index;
         auto& result = item.parsed;
 
-
-
         if (result.has_error) {
             errors.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // DEC-038 OPT-3: Push to persist queue (may block if queue is full)
         {
-            ScopedPhase _ps(profiler.persist);
-            if (!persister.persist_file(result.file, result.extraction,
-                                        result.content_hash, result.parse_status,
-                                        result.parse_error)) {
-                errors.fetch_add(1, std::memory_order_relaxed);
-            }
+            ScopedPhase _pw(profiler.persist_wait);
+            PersistItem persist_item;
+            persist_item.parsed = std::move(result);
+            persist_item.work_list_index = i;
+            persist_item.sentinel = false;
+            persist_queue.push(std::move(persist_item));
         }
 
         next_persist++;
-        bool committed = false;
-        {
-            ScopedPhase _fl(profiler.flush);
-            committed = persister.flush_if_needed(effective_batch_size);
-        }
 
-        if (config.supervised && committed) {
-            std::ofstream pf(progress_path, std::ios::trunc);
-            pf << work_list[i].relative_path << '\n';
-            pf.flush();
-        }
-
+        // Progress display using persisted_count (actual SQLite commits)
         {
-            int pct = static_cast<int>(100.0 * (display_offset + next_persist) / display_total);
+            int persisted = persist_state.persisted_count.load(std::memory_order_relaxed);
+            int pct = static_cast<int>(100.0 * (display_offset + persisted) / display_total);
             auto now = std::chrono::steady_clock::now();
             auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
             // Update on percentage change OR every 10 seconds
             bool time_update = (elapsed_s / 10) > (last_display_time / 10);
-            if (pct > last_pct || time_update || next_persist == total) {
+            if (pct > last_pct || time_update || persisted == total) {
                 last_pct = pct;
                 last_display_time = elapsed_s;
-                double rate = elapsed_s > 0 ? static_cast<double>(next_persist) / elapsed_s : 0;
-                std::cerr << "\r\033[K[" << (display_offset + next_persist) << "/" << display_total << "] "
+                double rate = elapsed_s > 0 ? static_cast<double>(persisted) / elapsed_s : 0;
+                std::cerr << "\r\033[K[" << (display_offset + persisted) << "/" << display_total << "] "
                           << pct << "% "
                           << elapsed_s << "s "
                           << static_cast<int>(rate) << " files/s" << std::flush;
             }
         }
     }
-    persister.commit_batch();
+
+    // DEC-038 OPT-3: Signal persist thread to finish and wait for drain
+    persist_queue.close();
+    if (persist_thread.joinable()) persist_thread.join();
+
+    // Accumulate persist thread errors
+    errors.fetch_add(persist_state.persist_errors.load(std::memory_order_relaxed), 
+                     std::memory_order_relaxed);
 
     // Stop watchdog thread
     watchdog_stop.store(true, std::memory_order_relaxed);
@@ -718,6 +823,11 @@ int run_index(const Config& config) {
               << " (" << static_cast<int>(rate) << " files/s)";
     if (errors > 0) std::cerr << " [" << errors << " errors]";
     std::cerr << "\n";
+
+    // Checkpoint WAL to main DB before read-heavy post-processing
+    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    // R2: Re-enable periodic WAL checkpointing for post-processing writes
+    conn.exec("PRAGMA wal_autocheckpoint=1000");
 
     // --- Rebuild read-path indexes only (nodes, files) for resolve_references lookups ---
     // Edge and refs write-path indexes are deferred until AFTER resolve_references
@@ -739,6 +849,12 @@ int run_index(const Config& config) {
             std::chrono::steady_clock::now() - idx_start).count();
         std::cerr << "Read-path indexes rebuilt in " << idx_elapsed << "s\n";
     }
+
+    // R1: Checkpoint after idx_read to consolidate new index WAL writes
+    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    // R5: Warm page cache with tables resolve_refs needs
+    conn.exec("SELECT count(*) FROM refs");
+    conn.exec("SELECT count(*) FROM nodes");
 
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     // Disable FK checks — all IDs come from the DB itself, FK validation is pure overhead.

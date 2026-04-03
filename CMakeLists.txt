@@ -142,6 +142,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_file_summary_nodeid.cpp
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
+    tests/unit/test_persist_optimizations.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
