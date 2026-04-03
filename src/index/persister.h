@@ -160,10 +160,10 @@ public:
                 file_node_id = sqlite3_last_insert_rowid(conn_.raw());
             }
 
-            // Insert symbol nodes (DEC-039 OPT-1: batched 20-row INSERT)
+            // Insert symbol nodes (DEC-039 OPT-1: batched 100-row INSERT)
             std::vector<int64_t> symbol_ids;
             {
-                const int SYMBOL_BATCH_SIZE = 20;
+                const int SYMBOL_BATCH_SIZE = 100;
                 int num_syms = static_cast<int>(extraction.symbols.size());
                 int full_chunks = num_syms / SYMBOL_BATCH_SIZE;
                 int remainder = num_syms % SYMBOL_BATCH_SIZE;
@@ -615,8 +615,10 @@ public:
         // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
         // Without a unique constraint, re-runs would accumulate duplicate edges.
         // Delete only resolver-created edges (confidence=0.7, name-match evidence).
-        std::cerr << "  Clearing old cross-ref edges...\n";
-        conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
+        if (!cold_index_) {
+            std::cerr << "  Clearing old cross-ref edges...\n";
+            conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
+        }
         std::cerr << "  Inserting " << edge_tuples.size() << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
@@ -765,10 +767,11 @@ private:
     void ensure_batch_symbol_stmt() {
         if (stmt_batch_insert_symbol_) return;
 
-        // 20-row batch: 13 params/row * 20 = 260 params (< 999 limit)
+        // 100-row batch: 13 params/row * 100 = 1300 params (< 32766 limit)
+        const int SYMBOL_BATCH_SIZE = 100;
         std::string sql = "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
             "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) VALUES ";
-        for (int i = 0; i < 20; ++i) {
+        for (int i = 0; i < SYMBOL_BATCH_SIZE; ++i) {
             if (i > 0) sql += ",";
             sql += "('symbol',?,?,?,?,?,?,?,?,?,?,?,?,?)";
         }
