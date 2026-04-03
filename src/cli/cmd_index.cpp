@@ -274,8 +274,18 @@ int run_index(const Config& config) {
     }
 
     // DEC-018 largest-first sort removed: with arena overflow fallback,
-    // fail-fast is unnecessary. Scan order (effectively random) spreads
-    // large files across the run, preventing large-pool contention bursts.
+    // fail-fast is unnecessary. Sort alphabetically for deterministic
+    // --max-files selection across runs.
+    std::sort(work_list.begin(), work_list.end(),
+              [](const ScannedFile& a, const ScannedFile& b) {
+                  return a.relative_path < b.relative_path;
+              });
+
+    // Apply --max-files to the work list (files that will actually be indexed),
+    // not the scan (which includes files that may be skipped or unchanged).
+    if (config.max_files > 0 && work_list.size() > static_cast<size_t>(config.max_files)) {
+        work_list.resize(config.max_files);
+    }
 
     // Save worklist so restarted children can skip scanning
     if (config.supervised && !resumed) {
@@ -438,6 +448,7 @@ int run_index(const Config& config) {
             result.parse_error = "file too large for arena (" +
                 std::to_string(file.size_bytes / (1024*1024)) + "MB file, " +
                 std::to_string(arena_cap / (1024*1024)) + "MB arena)";
+            set_thread_arena(nullptr);
             return result;
         }
 
@@ -450,6 +461,7 @@ int run_index(const Config& config) {
             result.parse_status = "failed";
             result.parse_error = "could not read file";
             result.has_error = true;
+            set_thread_arena(nullptr);
             return result;
         }
 
@@ -466,14 +478,15 @@ int run_index(const Config& config) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         slots[slot].start_epoch_ms.store(now_ms, std::memory_order_release);
 
-        // DEC-039 OPT-5: Reuse parsers per thread via thread_local map.
-        // Safe because ThreadPool threads are persistent (joined in destructor).
-        thread_local std::unordered_map<std::string, Parser> t_parsers;
-        auto& parser = t_parsers[file.language];
+        // Fresh parser per file — parser reuse (DEC-039 OPT-5) reverted per DEC-038/039.
+        // Tree-sitter parsers cache internal buffers from the arena; reusing across
+        // arena boundaries causes dangling pointers and heap corruption at high throughput.
+        Parser parser;
         if (!parser.set_language(file.language)) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
             result.parse_status = "skipped";
             result.parse_error = "language grammar not available";
+            set_thread_arena(nullptr);
             return result;
         }
         if (config.parse_timeout_s > 0) {
@@ -499,6 +512,7 @@ int run_index(const Config& config) {
                 std::to_string(lease->get()->capacity() / (1024*1024)) + "MB arena, " +
                 std::to_string(file.size_bytes / 1024) + "KB file)";
             result.has_error = true;
+            set_thread_arena(nullptr);
             return result;
         }
 
@@ -507,6 +521,7 @@ int run_index(const Config& config) {
             result.parse_status = "failed";
             result.parse_error = "parse cancelled by watchdog (exceeded timeout)";
             result.has_error = true;
+            set_thread_arena(nullptr);
             return result;
         }
 
@@ -517,6 +532,12 @@ int run_index(const Config& config) {
             result.extraction = extractor.extract(tree.tree, content, file.language, file.relative_path);
         }
 
+        // Explicitly destroy the tree while the arena is still leased.
+        // TreeGuard's destructor calls ts_tree_delete(), which accesses
+        // arena-allocated tree internals. Must happen before ArenaLease
+        // releases the arena back to the pool (where it gets reset).
+        tree = TreeGuard(nullptr);
+
         // Mark slot idle now that both parse + extract are done.
         slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
 
@@ -524,6 +545,7 @@ int run_index(const Config& config) {
             result.parse_status = "failed";
             result.parse_error = "extraction cancelled by watchdog (exceeded timeout)";
             result.has_error = true;
+            set_thread_arena(nullptr);
             return result;
         }
 
@@ -543,6 +565,7 @@ int run_index(const Config& config) {
             result.has_error = true;
         }
 
+        set_thread_arena(nullptr);
         return result;
     };
 

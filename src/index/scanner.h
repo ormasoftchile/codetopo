@@ -150,8 +150,6 @@ public:
         if (!config_.no_gitignore && fs::exists(root / ".git")) {
             auto files = scan_via_git(root);
             if (!files.empty()) {
-                if (config_.max_files > 0 && files.size() > static_cast<size_t>(config_.max_files))
-                    files.resize(config_.max_files);
                 return files;
             }
             // Fall back to manual scan if git ls-files failed
@@ -164,8 +162,6 @@ public:
         }
 
         scan_directory(root, root, gitignore, files);
-        if (config_.max_files > 0 && files.size() > static_cast<size_t>(config_.max_files))
-            files.resize(config_.max_files);
         return files;
     }
 

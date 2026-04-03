@@ -62,7 +62,10 @@ public:
         : pool_(pool), arena_(pool.lease()) {}
 
     ~ArenaLease() {
-        if (arena_) pool_.release(arena_);
+        if (arena_) {
+            set_thread_arena(nullptr);
+            pool_.release(arena_);
+        }
     }
 
     ArenaLease(const ArenaLease&) = delete;
