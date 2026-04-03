@@ -4,6 +4,14 @@
 #include <sstream>
 #include <filesystem>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace codetopo {
 
 // --- Extractor public ---
@@ -785,22 +793,59 @@ void Extractor::extract_sql(TSNode node, const std::string& type, const std::str
 
 // Free function — pre-sized read avoids O(N log N) buffer doubling
 std::string read_file_content(const std::filesystem::path& path) {
-    std::error_code ec;
-    auto size = std::filesystem::file_size(path, ec);
-    if (ec || size == 0) {
-        // Fallback for special files or zero-size
-        std::ifstream f(path, std::ios::binary);
-        if (!f) return "";
-        std::ostringstream ss;
-        ss << f.rdbuf();
-        return ss.str();
+#ifdef _WIN32
+    // Use FILE_FLAG_SEQUENTIAL_SCAN to enable aggressive OS read-ahead.
+    // On cold cache, this can save 5-10ms/file by hinting the NTFS cache manager.
+    HANDLE hFile = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+
+    LARGE_INTEGER li_size;
+    if (!GetFileSizeEx(hFile, &li_size)) {
+        CloseHandle(hFile);
+        return "";
     }
-    std::string content(static_cast<size_t>(size), '\0');
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return "";
-    f.read(content.data(), static_cast<std::streamsize>(size));
-    if (!f) return "";
+    auto size = static_cast<size_t>(li_size.QuadPart);
+    if (size == 0) {
+        CloseHandle(hFile);
+        return "";
+    }
+
+    std::string content(size, '\0');
+    DWORD bytes_read = 0;
+    // For files > 4GB, would need a loop, but source files are capped by max_file_size
+    BOOL ok = ReadFile(hFile, content.data(), static_cast<DWORD>(size), &bytes_read, nullptr);
+    CloseHandle(hFile);
+
+    if (!ok || bytes_read != static_cast<DWORD>(size)) {
+        return "";
+    }
     return content;
+#else
+    // POSIX: use open() with posix_fadvise for sequential read-ahead
+    auto size = std::filesystem::file_size(path);
+    if (size == 0) return "";
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "";
+
+    #ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    #endif
+
+    std::string content(size, '\0');
+    auto nread = ::read(fd, content.data(), size);
+    ::close(fd);
+
+    if (nread != static_cast<ssize_t>(size)) return "";
+    return content;
+#endif
 }
 
 } // namespace codetopo
