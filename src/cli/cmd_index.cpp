@@ -336,7 +336,7 @@ int run_index(const Config& config) {
         std::cerr << "SAFE MODE: commit after every file\n";
     }
     if (config.turbo) {
-        effective_batch_size = (std::max)(effective_batch_size, 1000);
+        effective_batch_size = (std::max)(effective_batch_size, 5000);
         conn.enable_turbo();
     }
     // On resume with a small remaining worklist, cap batch size so progress
@@ -466,7 +466,10 @@ int run_index(const Config& config) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         slots[slot].start_epoch_ms.store(now_ms, std::memory_order_release);
 
-        Parser parser;
+        // DEC-039 OPT-5: Reuse parsers per thread via thread_local map.
+        // Safe because ThreadPool threads are persistent (joined in destructor).
+        thread_local std::unordered_map<std::string, Parser> t_parsers;
+        auto& parser = t_parsers[file.language];
         if (!parser.set_language(file.language)) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
             result.parse_status = "skipped";
@@ -559,14 +562,15 @@ int run_index(const Config& config) {
     // After 2x timeout with no response, injects a failed result and marks slot dead.
     std::atomic<bool> watchdog_stop{false};
     // Per-file timeout: base + scaled by file size.
-    // base_timeout_ms: minimum timeout for any file (default 30s)
-    // Files get extra time proportional to size: +1s per 10 KB.
+    // base_timeout_ms: minimum timeout for any file (default 5s)
+    // Files get extra time proportional to size: +10ms per KB, hard cap 10s.
     int64_t base_timeout_ms = config.parse_timeout_s > 0
         ? static_cast<int64_t>(config.parse_timeout_s) * 1000
-        : 30000;
-    auto slot_timeout_ms = [base_timeout_ms](int64_t file_size_bytes) -> int64_t {
-        int64_t size_bonus_ms = (file_size_bytes / (10 * 1024)) * 1000; // +1s per 10KB
-        return base_timeout_ms + size_bonus_ms;
+        : 5000;
+    constexpr int64_t hard_cap_ms = 10000; // 10s absolute maximum
+    auto slot_timeout_ms = [base_timeout_ms, hard_cap_ms](int64_t file_size_bytes) -> int64_t {
+        int64_t size_bonus_ms = (file_size_bytes * 10) / 1024; // +10ms per KB
+        return std::min(base_timeout_ms + size_bonus_ms, hard_cap_ms);
     };
     // stderr mutex: prevents garbled output between watchdog and main thread
     std::thread watchdog([&slots, num_slots, &watchdog_stop, &slot_timeout_ms,
@@ -582,7 +586,7 @@ int run_index(const Config& config) {
                 if (start <= 0) continue;
                 int64_t elapsed = now_ms - start;
                 int64_t file_timeout = slot_timeout_ms(slots[s].file_size_bytes);
-                int64_t file_kill = file_timeout + file_timeout / 2; // 1.5x
+                int64_t file_kill = file_timeout * 2; // 2x — more time for cooperative cancel
                 if (elapsed > file_kill) {
                     slots[s].dead.store(true, std::memory_order_relaxed);
                     slots[s].generation.fetch_add(1, std::memory_order_relaxed);

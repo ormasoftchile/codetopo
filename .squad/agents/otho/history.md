@@ -91,6 +91,19 @@
 - **Build status:** MSVC + CMake clean. 208 tests (1112 assertions), 207 pass (1 pre-existing flake).
 - **Team actions:** Code review Phase 1, implement in parallel if possible, profile before/after on fsm to validate gains.
 
+### 2026-04-03: Watchdog Kill Pattern Analysis — YAML Pathology Root Cause
+- **Symptom:** 10K DsMainDev benchmark: 2 YAML files killed by watchdog after 45 seconds each. Wasted 90+ seconds of wall time.
+- **Killed files:** `.pipelines/DsMainDev-Official-MIAA-Linux-Build.yml` (2.25 KB) and `.pipelines/DsMainDev-master-LOC-Build-Box.yml` (1.04 KB)
+- **Files are NOT too large:** Both well under 512KB limit (DEC-029 R2). Problem is grammar pathology, not file size.
+- **Root cause: tree-sitter YAML grammar superlinearity** on deeply-nested CI/CD pipelines. 100–150KB YAML files produce 500K+ AST nodes (70× more complex than C# source). Parse+extract hits tree-sitter timeout at 30s, watchdog waits until 45s (30s base + 15s size bonus at +1s/10KB).
+- **YAML support confirmed:** Intentional design choice to index Azure DevOps pipeline metadata. Language detection → tree-sitter_yaml grammar fully wired, not a skip condition.
+- **Profiling baseline validated:** Average per-file ~48ms (file_read 37ms + parse 0.39ms + extract 1.3ms). P99 <500ms. Current 45s timeout is **100× P99** — absurd headroom provides zero benefit.
+- **Watchdog architecture:** Three-layer stack (L1: tree-sitter 30s, L2: extractor 10s, L3: watchdog 30s+size). All necessary for defense-in-depth. Timeout formula (lines 567-589 in cmd_index.cpp) scales +1s per 10KB, capping at 67.5s kill for 150KB file.
+- **Scale impact:** At 100K files with 10–20 pathological files, current timeout wastes **320–780 seconds of wall time**. Simon's DEC-045 watchdog redesign (5s base, +10ms/KB scaling, 10s hard cap) reduces to 60–130s, saving **640–780s at 100K scale** — more than entire DEC-038 persist pipeline overhaul.
+- **Recommended action:** Implement watchdog redesign (4 surgical changes, 15 min effort): config.h (parse_timeout_s 30→5, extraction_timeout_s 10→5), cmd_index.cpp (slot_timeout_ms formula, kill threshold 1.5×→2×). Zero regression for normal files. All three timeout layers remain enabled.
+- **Files:** `src/core/config.h` (defaults), `src/cli/cmd_index.cpp` (watchdog formula + kill threshold), full analysis in `.squad/decisions/inbox/otho-watchdog-analysis.md`
+- **Key principle:** Timeout exists to protect throughput from pathological files, not to accommodate them. A 5s base is 100× P99; any file exceeding 5s produces garbage results anyway (500K+ node ASTs yield minimal useful symbols).
+
 ### 2026-04-01: DEC-038 post-processing regression — WAL + thread transition root cause
 - **Symptom:** DEC-038 moved persist_file to a dedicated thread. Indexing improved (510→472s) but post-processing regressed 3x (164→484s), total 805→957s.
 - **Root cause:** With `wal_autocheckpoint=0`, the WAL accumulates ~1GB at 100K files. SQLite's mmap (2GB) doesn't cover WAL pages — all reads go through WAL hash tables (~60 segments). In opt2 (main-thread persist), SQLite's WAL reader state was warm on the same thread. In opt3 (persist thread), the main thread must rebuild WAL reader state after `persist_thread.join()`, causing every page read to re-scan hash tables.

@@ -80,3 +80,61 @@
 - **DEC-037:** Five optimization vectors ranked. Phase 1 ready for implementation.
 - **Build status:** Clean (MSVC + CMake). 208 tests (1112 assertions), 207 pass (1 pre-existing flake).
 - **Next phases:** Implement Phase 1 optimizations, re-profile for validation, Phase 2 candidate preparation.
+
+### Surgical Revert of Phase 1 Harmful Optimizations (2026-04-01)
+- **Context:** Commit e1a6762 ("Phase 1 optimizations") was a sprawling 19-file commit that mixed legitimate infrastructure with harmful "optimizations" causing CPU issues. Cristiano requested surgical revert of only the harmful parts.
+- **Reverted (9 files):**
+  - arena.cpp: Removed extern "C" overflow-handling implementations (contains()-based routing, stdlib fallbacks). Restored original simple static ts_arena_* wrappers inside namespace codetopo.
+  - arena.h: Removed `contains()` method and `extern "C"` declarations. Kept forward declarations for set_thread_arena/get_thread_arena/register_arena_allocator (needed by cmd_parse_file.h, cmd_watch.h).
+  - arena_pool.h: Removed `try_lease()` and pre-leased ArenaLease constructor.
+  - thread_pool.h: Restored original inline worker loop; removed extracted `worker_loop()`, `submit_detached()`, and `stack_size` parameter.
+  - cmd_index.cpp: Removed WAL checkpoint overlap thread, restored sequential WAL checkpoint. Simplified arena leasing from try_lease fallback chains to blocking `lease()`. Changed `submit_detached()` to `submit()`. Removed stack_size argument from ThreadPool constructor.
+  - extractor.cpp: Reverted language dispatch from `switch(LanguageId)` to `if/else` string chain. Restored simple ostringstream `read_file_content()`.
+  - extractor.h: Removed `lang_id_` field. Kept `node_count_`, `timeout_s_`, `cancel_flag_`, `deadline_` fields and extra constructors (required by extractor.cpp timeout logic from df1c1dd).
+  - scanner.h: Removed `lang_id` field and `LanguageId` initialization from ScannedFile.
+  - parser.h: Removed `set_language(LanguageId)` overload and `get_language_by_id()`.
+- **Kept intact:** language_id.h, profiler.h, cmd_parse_file.h, process.h, schema.h, tools.h, CMakeLists.txt, test_resource_limits.cpp.
+- **Key discovery:** e1a6762 also fixed 9 pre-existing header declaration mismatches (forward declarations missing for try_lease, submit_detached, node_count_, etc.). These were added by df1c1dd to .cpp files but not to headers. The revert adapted call sites instead of keeping the now-removed declarations.
+- **Build:** Clean (MSVC Release). **Tests:** 139/140 (1 pre-existing temp file locking flake in test_mcp_enhancements.cpp).
+
+### DEC-038 Persist Pipeline Overhaul — All 3 Optimizations Implemented (2026-04-01)
+- **OPT-1: Cold index skip (1-line)** — Added `persister.enable_cold_index_if_empty()` before begin_batch in cmd_index.cpp:680. The method already existed (DEC-026 R4, lines 101-108 in persister.h). The cold_index_ flag is checked in persist_file() line 127 to skip DELETE on empty files table. Zero-risk wiring.
+- **OPT-3: Dedicated persist thread (architectural change, ~120 LOC)** — Created bounded `PersistQueue` class (capacity=512) with mutex/condvar, `PersistItem` struct, and `PersistThreadState` for shared atomics. Persist thread launched after persister creation, owns all SQLite writes. Main thread now: dequeues worker results → pushes to persist_queue → refills workers → displays progress using `persist_state.persisted_count`. Added `profiler.persist_wait` phase to measure main thread backpressure when queue is full. Persist thread: loops on `pop()` → `persist_file()` → `flush_if_needed()` → increments atomic count → writes progress file on commit. Clean shutdown: `persist_queue.close()` → `persist_thread.join()` → main thread continues with WAL checkpoint. Persist thread NEVER touches parsing/tree-sitter/arena (only SQLite). Architecture: Workers → result_queue → Main → PersistQueue → Persist Thread.
+- **OPT-2: Multi-row INSERT batching (refs & edges, ~140 LOC)** — Added `stmt_batch_insert_ref_` (80-row, 720 params) and `stmt_batch_insert_edge_` (150-row, 750 params) to Persister. Lazy-prepared on first use via `ensure_batch_ref_stmt()` and `ensure_batch_edge_stmt()`. Symbols remain single-row (need per-row rowid for symbol_ids vector). Refs: split into full 80-row chunks (use batch stmt) + remainder (single-row stmt). Edges: pre-filter valid edges (confidence ≥ 0.3, dst resolved), split into 150-row chunks + remainder. All bindings use `SQLITE_STATIC` (DEC-027). Finalized in destructor alongside other stmts.
+- **Files modified:** `cmd_index.cpp` (PersistQueue, persist thread, main loop changes, OPT-1 wiring), `persister.h` (batch stmt fields, prepare helpers, batched INSERT logic in persist_file), `profiler.h` (added persist_wait phase).
+- **Test result:** 100/100 tests pass (409 assertions). All TDD tests from Joan at `test_persist_optimizations.cpp` pass (OPT-1 cold index, OPT-2 batch correctness). OPT-3 placeholder tests marked `[!mayfail]` as expected (they test queue behavior, not end-to-end pipeline).
+- **Key insight:** Persist thread is fully decoupled from worker threads. Connection created by main thread, passed to Persister, used exclusively by persist thread during drain, then reused by main thread post-join for resolve_references/WAL checkpoint. No concurrent Connection access (join() provides happens-before).
+- **Performance implications:** OPT-1 eliminates DELETE overhead on cold index. OPT-2 reduces SQLite call overhead by 80× for refs, 150× for edges (chunked INSERTs). OPT-3 decouples SQLite writes from worker result collection, eliminating persist-induced contention (formerly 35% of wall time per DEC-034).
+
+### WAL checkpoint before post-processing (2026-04-02)
+- **Root cause:** With `wal_autocheckpoint=0` and 60+ WAL segments (~1GB), every SELECT in post-processing (idx_read, resolve_refs, fts_rebuild, idx_write) had to search through all WAL segments via hash-table lookups, causing 2.7x-6x regression.
+- **Fix:** Added `conn.exec("PRAGMA wal_checkpoint(TRUNCATE)")` in cmd_index.cpp between persist_thread.join() completion and the idx_read phase (line ~828). This merges the WAL back into the main DB file and truncates it, so all subsequent SELECTs read from the clean B-tree.
+- **Placement:** After the "Done" summary output, before the "Rebuild read-path indexes" block. The persist thread has already joined (happens-before), so `conn` is safe to use on the main thread.
+- **Build:** Clean (MSVC Release). **Tests:** 100/100 pass (409 assertions).
+
+### Otho's resolve_refs 6-fix optimization batch (2026-04-02)
+- **R1:** Added `PRAGMA wal_checkpoint(TRUNCATE)` between idx_read and resolve_refs in cmd_index.cpp. Consolidates idx_read's WAL writes so resolve_refs starts clean.
+- **R2:** Added `PRAGMA wal_autocheckpoint=1000` after the first TRUNCATE checkpoint (post-persist_thread.join). Re-enables periodic WAL consolidation during post-processing, preventing unbounded WAL growth during resolve_refs' 5M writes.
+- **R3 (biggest win):** Replaced single-row INSERT loop in resolve_references() Step 6 with 150-row batch INSERT. Builds multi-row VALUES clauses with 3 bound params per row (src_id, dst_id, kind) and literal `0.7,'name-match'`. Keeps 100K-row COMMIT batching. Uses single-row fallback for remainder. No UNIQUE constraint on edges table, so switched from `INSERT OR IGNORE` to plain `INSERT` (OR IGNORE was a no-op).
+- **R4:** Increased `PRAGMA mmap_size` from 2GB to 4GB in connection.h constructor, ensuring full DB file coverage after checkpoint growth.
+- **R5:** Added `SELECT count(*) FROM refs` and `SELECT count(*) FROM nodes` cache warming scans after R1 checkpoint, before resolve_refs starts.
+- **R6:** Simplified DELETE predicate in resolve_references() from `WHERE kind IN ('calls','includes','inherits') AND evidence = 'name-match'` to `WHERE evidence = 'name-match'`. All resolver edges use name-match evidence, so the kind IN clause was redundant overhead.
+- **Files modified:** `src/db/connection.h` (R4), `src/cli/cmd_index.cpp` (R1, R2, R5), `src/index/persister.h` (R3, R6).
+- **Build:** Clean (MSVC Release). **Tests:** 100/100 pass (409 assertions).
+
+### DEC-039 Five Optimizations Implemented (2026-04-02)
+- **OPT-1: Batch symbol INSERT (20-row)** — Added `stmt_batch_insert_symbol_` with lazy preparation via `ensure_batch_symbol_stmt()`. Symbol loop in `persist_file()` now batches 20 at a time using 13 params/row (260 total, under 999 limit). IDs computed arithmetically from `sqlite3_last_insert_rowid()`: first_id = last_id - (chunk_size - 1). Remainder handled by single-row stmt. Safe because nodes table uses `INTEGER PRIMARY KEY` (no AUTOINCREMENT), we're in a transaction, and no concurrent deletes.
+- **OPT-2: Turbo batch 1000→5000 (1-line)** — Changed `(std::max)(effective_batch_size, 1000)` to `5000` in cmd_index.cpp:339. Reduces COMMIT frequency in turbo mode by 5×.
+- **OPT-3: Pre-sized file read buffer** — Replaced `ostringstream << f.rdbuf()` in `read_file_content()` (extractor.cpp:787) with `filesystem::file_size()` + pre-allocated `std::string` + `f.read()`. Eliminates O(N log N) buffer doubling. Falls back to ostringstream for zero-size or special files.
+- **OPT-4: Remove sqlite3_clear_bindings()** — Removed all 9 `sqlite3_clear_bindings()` calls in persister.h (8 in persist_file on cached stmts, 1 in resolve_references on local batch stmt). All are redundant because every parameter is re-bound (via bind_text/bind_int64/bind_null) before each step().
+- **OPT-5: Thread-local parser reuse** — Replaced per-file `Parser parser;` in cmd_index.cpp:469 with `thread_local std::unordered_map<std::string, Parser> t_parsers`. Parser objects reuse `ts_parser_new()` allocations across files of the same language on the same thread. Safe because ThreadPool threads are persistent (joined in destructor), so thread_local lifetime covers the entire index operation.
+- **Files modified:** `src/index/persister.h` (OPT-1 batch symbol INSERT + OPT-4 clear_bindings removal), `src/cli/cmd_index.cpp` (OPT-2 turbo batch + OPT-5 thread-local parser), `src/index/extractor.cpp` (OPT-3 file read buffer).
+- **Build:** Clean (MSVC Release). **Tests:** 100/100 pass (409 assertions).
+
+### Watchdog timeout redesign (2026-04-02)
+- **Context:** Simon's design approved to tighten watchdog timeouts. Old defaults (30s parse, 10s extraction) were far too generous — most files parse in <100ms. Generous timeouts let stuck parsers block slots for 30+ seconds.
+- **Change 1 (config.h):** `parse_timeout_s` 30→5, `extraction_timeout_s` 10→5. Both defaults now 5s.
+- **Change 2 (cmd_index.cpp):** Watchdog formula: old was +1s per 10KB (coarse, no cap). New is +10ms per KB with 10s hard cap (`std::min`). A 500KB file now gets 5000+5000=10000ms (capped), not 5000+50000=55000ms.
+- **Change 3 (cmd_index.cpp):** Kill threshold: 1.5× → 2×. Gives more time for cooperative cancel via `ts_parser_set_cancellation_flag` before hard kill.
+- **Change 4 (cmd_index.cpp):** Updated comments near watchdog section: "default 30s" → "default 5s", "+1s per 10 KB" → "+10ms per KB, hard cap 10s", fallback from 30000→5000.
+- **Build:** Clean (MSVC Release, exit code 0).

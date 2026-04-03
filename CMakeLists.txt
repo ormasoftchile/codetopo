@@ -143,6 +143,8 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
     tests/unit/test_persist_optimizations.cpp
+    tests/unit/test_dec039_optimizations.cpp
+    tests/unit/test_watchdog_timeout.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests

@@ -126,7 +126,6 @@ public:
             // R4: Skip on cold index — DELETE is a guaranteed no-op on empty tables
             if (!cold_index_) {
                 sqlite3_reset(stmt_delete_file_);
-                sqlite3_clear_bindings(stmt_delete_file_);
                 sqlite3_bind_text(stmt_delete_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
                 sqlite3_step(stmt_delete_file_);
             }
@@ -135,7 +134,6 @@ public:
             int64_t file_id;
             {
                 sqlite3_reset(stmt_insert_file_);
-                sqlite3_clear_bindings(stmt_insert_file_);
                 sqlite3_bind_text(stmt_insert_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt_insert_file_, 2, file.language.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_int64(stmt_insert_file_, 3, file.size_bytes);
@@ -156,19 +154,65 @@ public:
             {
                 auto file_key = make_file_stable_key(file.relative_path);
                 sqlite3_reset(stmt_insert_file_node_);
-                sqlite3_clear_bindings(stmt_insert_file_node_);
                 sqlite3_bind_text(stmt_insert_file_node_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt_insert_file_node_, 2, file_key.c_str(), -1, SQLITE_STATIC);
                 sqlite3_step(stmt_insert_file_node_);
                 file_node_id = sqlite3_last_insert_rowid(conn_.raw());
             }
 
-            // Insert symbol nodes
+            // Insert symbol nodes (DEC-039 OPT-1: batched 20-row INSERT)
             std::vector<int64_t> symbol_ids;
             {
-                for (const auto& sym : extraction.symbols) {
+                const int SYMBOL_BATCH_SIZE = 20;
+                int num_syms = static_cast<int>(extraction.symbols.size());
+                int full_chunks = num_syms / SYMBOL_BATCH_SIZE;
+                int remainder = num_syms % SYMBOL_BATCH_SIZE;
+                symbol_ids.reserve(num_syms);
+
+                // Full chunks: use batch INSERT
+                if (full_chunks > 0) {
+                    ensure_batch_symbol_stmt();
+                    for (int c = 0; c < full_chunks; ++c) {
+                        sqlite3_reset(stmt_batch_insert_symbol_);
+
+                        for (int r = 0; r < SYMBOL_BATCH_SIZE; ++r) {
+                            int idx = c * SYMBOL_BATCH_SIZE + r;
+                            const auto& sym = extraction.symbols[idx];
+                            int base_param = r * 13 + 1;  // 13 params per symbol
+
+                            sqlite3_bind_int64(stmt_batch_insert_symbol_, base_param + 0, file_id);
+                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 1, sym.kind.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 2, sym.name.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 3, sym.qualname.c_str(), -1, SQLITE_STATIC);
+                            if (sym.signature.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 4);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 4, sym.signature.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 5, sym.start_line);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 6, sym.start_col);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 7, sym.end_line);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 8, sym.end_col);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 9, sym.is_definition ? 1 : 0);
+                            if (sym.visibility.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 10);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 10, sym.visibility.c_str(), -1, SQLITE_STATIC);
+                            if (sym.doc.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 11);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 11, sym.doc.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 12, sym.stable_key.c_str(), -1, SQLITE_STATIC);
+                        }
+                        sqlite3_step(stmt_batch_insert_symbol_);
+                        // Compute IDs arithmetically: last_insert_rowid is the LAST row's ID
+                        int64_t last_id = sqlite3_last_insert_rowid(conn_.raw());
+                        int64_t first_id = last_id - (SYMBOL_BATCH_SIZE - 1);
+                        for (int r = 0; r < SYMBOL_BATCH_SIZE; ++r) {
+                            symbol_ids.push_back(first_id + r);
+                        }
+                    }
+                }
+
+                // Remainder: use single-row INSERT
+                for (int r = 0; r < remainder; ++r) {
+                    int idx = full_chunks * SYMBOL_BATCH_SIZE + r;
+                    const auto& sym = extraction.symbols[idx];
+
                     sqlite3_reset(stmt_insert_symbol_);
-                    sqlite3_clear_bindings(stmt_insert_symbol_);
                     sqlite3_bind_int64(stmt_insert_symbol_, 1, file_id);
                     sqlite3_bind_text(stmt_insert_symbol_, 2, sym.kind.c_str(), -1, SQLITE_STATIC);
                     sqlite3_bind_text(stmt_insert_symbol_, 3, sym.name.c_str(), -1, SQLITE_STATIC);
@@ -203,7 +247,6 @@ public:
                     ensure_batch_ref_stmt();
                     for (int c = 0; c < full_chunks; ++c) {
                         sqlite3_reset(stmt_batch_insert_ref_);
-                        sqlite3_clear_bindings(stmt_batch_insert_ref_);
                         
                         for (int r = 0; r < REF_BATCH_SIZE; ++r) {
                             int idx = c * REF_BATCH_SIZE + r;
@@ -237,7 +280,6 @@ public:
                     const auto& ref = extraction.refs[idx];
                     
                     sqlite3_reset(stmt_insert_ref_);
-                    sqlite3_clear_bindings(stmt_insert_ref_);
                     sqlite3_bind_int64(stmt_insert_ref_, 1, file_id);
                     sqlite3_bind_text(stmt_insert_ref_, 2, ref.kind.c_str(), -1, SQLITE_STATIC);
                     sqlite3_bind_text(stmt_insert_ref_, 3, ref.name.c_str(), -1, SQLITE_STATIC);
@@ -282,7 +324,6 @@ public:
                     ensure_batch_edge_stmt();
                     for (int c = 0; c < full_chunks; ++c) {
                         sqlite3_reset(stmt_batch_insert_edge_);
-                        sqlite3_clear_bindings(stmt_batch_insert_edge_);
                         
                         for (int e = 0; e < EDGE_BATCH_SIZE; ++e) {
                             int idx = c * EDGE_BATCH_SIZE + e;
@@ -308,7 +349,6 @@ public:
                     auto [src_id, dst_id, edge_ptr] = valid_edges[idx];
                     
                     sqlite3_reset(stmt_insert_edge_);
-                    sqlite3_clear_bindings(stmt_insert_edge_);
                     sqlite3_bind_int64(stmt_insert_edge_, 1, src_id);
                     sqlite3_bind_int64(stmt_insert_edge_, 2, dst_id);
                     sqlite3_bind_text(stmt_insert_edge_, 3, edge_ptr->kind.c_str(), -1, SQLITE_STATIC);
@@ -608,7 +648,6 @@ public:
 
         for (int c = 0; c < full_chunks; ++c) {
             sqlite3_reset(batch_edge_stmt);
-            sqlite3_clear_bindings(batch_edge_stmt);
             for (int e = 0; e < RESOLVE_EDGE_BATCH; ++e) {
                 const auto& t = edge_tuples[c * RESOLVE_EDGE_BATCH + e];
                 int base = e * PARAMS_PER_EDGE + 1;
@@ -661,6 +700,8 @@ private:
     // DEC-038 OPT-2: Batch INSERT statements (lazy-prepared)
     sqlite3_stmt* stmt_batch_insert_ref_ = nullptr;   // 80-row batch
     sqlite3_stmt* stmt_batch_insert_edge_ = nullptr;  // 150-row batch
+    // DEC-039 OPT-1: Batch symbol INSERT (lazy-prepared)
+    sqlite3_stmt* stmt_batch_insert_symbol_ = nullptr; // 20-row batch
     
     bool stmts_cached_ = false;
     bool cold_index_ = false;   // R4: skip DELETE on cold index (empty files table)
@@ -720,6 +761,20 @@ private:
         sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_edge_, nullptr);
     }
 
+    // DEC-039 OPT-1: Lazy-prepare 20-row batch symbol INSERT
+    void ensure_batch_symbol_stmt() {
+        if (stmt_batch_insert_symbol_) return;
+
+        // 20-row batch: 13 params/row * 20 = 260 params (< 999 limit)
+        std::string sql = "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
+            "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) VALUES ";
+        for (int i = 0; i < 20; ++i) {
+            if (i > 0) sql += ",";
+            sql += "('symbol',?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        }
+        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_symbol_, nullptr);
+    }
+
     void finalize_cached_stmts() {
         if (stmt_delete_file_)     { sqlite3_finalize(stmt_delete_file_);     stmt_delete_file_ = nullptr; }
         if (stmt_insert_file_)     { sqlite3_finalize(stmt_insert_file_);     stmt_insert_file_ = nullptr; }
@@ -729,6 +784,7 @@ private:
         if (stmt_insert_edge_)     { sqlite3_finalize(stmt_insert_edge_);     stmt_insert_edge_ = nullptr; }
         if (stmt_batch_insert_ref_) { sqlite3_finalize(stmt_batch_insert_ref_); stmt_batch_insert_ref_ = nullptr; }
         if (stmt_batch_insert_edge_){ sqlite3_finalize(stmt_batch_insert_edge_);stmt_batch_insert_edge_ = nullptr; }
+        if (stmt_batch_insert_symbol_){ sqlite3_finalize(stmt_batch_insert_symbol_);stmt_batch_insert_symbol_ = nullptr; }
         stmts_cached_ = false;
     }
 };

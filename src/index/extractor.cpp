@@ -783,13 +783,24 @@ void Extractor::extract_sql(TSNode node, const std::string& type, const std::str
     }
 }
 
-// Free function
+// Free function — pre-sized read avoids O(N log N) buffer doubling
 std::string read_file_content(const std::filesystem::path& path) {
+    std::error_code ec;
+    auto size = std::filesystem::file_size(path, ec);
+    if (ec || size == 0) {
+        // Fallback for special files or zero-size
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return "";
+        std::ostringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    }
+    std::string content(static_cast<size_t>(size), '\0');
     std::ifstream f(path, std::ios::binary);
     if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    f.read(content.data(), static_cast<std::streamsize>(size));
+    if (!f) return "";
+    return content;
 }
 
 } // namespace codetopo

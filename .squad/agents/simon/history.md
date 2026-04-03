@@ -171,3 +171,25 @@
 - Tier 3 (40–60s, architectural): Eliminate main-thread relay, lock-free arena distribution, incremental resolve
 
 **Review written to:** `.squad/decisions/inbox/simon-index-design-review.md`. Integrated with Otho analysis into DEC-039 (decisions.md). Design accepted. Phase 1 implementation (batch symbol INSERT, turbo batch 5000) proceeding to Grag.
+
+### 2026-04-03: Watchdog Timeout Redesign
+
+**Problem:** 30s base watchdog timeout (effective 45s for 150KB files with +1s/10KB scaling) wastes massive wall time when pathological files are killed. At 10K scale, 2 YAML pipeline files hit the watchdog — each wasting ~45s of slot time. At 100K with 10-20 kills, this wastes 450-900s.
+
+**Key findings:**
+1. Three-layer timeout stack (tree-sitter parse, extractor deadline, watchdog) is architecturally correct but values are 600× the average processing time (48ms avg vs 30s timeout)
+2. Killed YAML pipeline files are pathological for tree-sitter's YAML grammar (deeply nested CI/CD templates producing 500K+ AST nodes), not a file-size issue
+3. Watchdog kill at 1.5× timeout leaves zombie threads in ThreadPool, reducing effective parallelism
+4. The `--max-file-size 512` flag doesn't protect against grammar pathology on sub-512KB files
+
+**Recommended strategy:**
+- `parse_timeout_s`: 30 → 5s (still 100× P99)
+- `extraction_timeout_s`: 10 → 5s
+- Watchdog per-KB scaling: +1s/10KB → +10ms/KB
+- Hard cap: 10s absolute maximum regardless of file size
+- Kill threshold: 1.5× → 2× (more cooperative cancel time, max 20s)
+- Keep all three timeout layers (complementary, not redundant)
+
+**Impact:** 4 surgical code changes (~15 min effort). Saves 350-800s of wasted wall time at 100K scale — potentially more than the entire persist pipeline overhaul (DEC-038).
+
+**Design written to:** `.squad/decisions/inbox/simon-watchdog-redesign.md`

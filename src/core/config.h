@@ -20,8 +20,8 @@ struct Config {
     int large_file_threshold_kb = 0;  // 0 = auto (arena_size / 30); file size above which the large arena is used
     int batch_size = 500;
     int max_file_size_kb = 10240;  // 10 MB in KB
-    int parse_timeout_s = 30;  // Per-file tree-sitter parse timeout in seconds (0=no limit)
-    int extraction_timeout_s = 10;  // Per-file extraction timeout in seconds (0=no limit)
+    int parse_timeout_s = 5;  // Per-file tree-sitter parse timeout in seconds (0=no limit)
+    int extraction_timeout_s = 5;  // Per-file extraction timeout in seconds (0=no limit)
     int max_symbols_per_file = 50000;
     int max_ast_depth = 200;
     int max_files = 0;  // 0 = unlimited; truncate scanned file list for profiling
