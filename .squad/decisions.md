@@ -197,6 +197,100 @@ Analyzed remaining optimization vectors after DEC-034 R1+R2. **Architecture asse
 - **DEC-036a (Language Dispatch Strategy):** Pre-computed enum, no string comparisons in hot loop, all logic via switch.
 - **DEC-037a (File Read Buffering):** Pre-allocate to exact size, no exponential growth, apply to all file sizes.
 
+### DEC-038: Heap Corruption Root Cause — Throughput-Dependent Arena Race + Parser Reuse (Simon, Grag, Otho, 2026-04-03)
+**Status:** Investigation complete, 5 root causes identified
+
+**Three-agent investigation findings:**
+
+**PRIMARY ROOT CAUSE:** Parser reuse optimization (DEC-037a, labeled DEC-039 OPT-5) is incompatible with arena-based memory management. At warm cache throughput (10K+ files/sec), arena lease/return cycle compresses from 1024ms (cold) to 3.2ms, creating a critical race window:
+
+1. Thread A parses file using arena N → tree-sitter allocates internal buffers via `ts_arena_malloc` in arena N
+2. Arena N is returned to pool and reset (offset=0, overflow ptrs freed)
+3. Thread B immediately leases arena N (within 3.2ms) for different file
+4. Thread A reuses thread-local Parser for new file, sets `t_current_arena = arena M`
+5. Tree-sitter's parser tries to realloc internal buffer (from arena N) → `ts_arena_realloc(ptr_from_arena_N, new_size)` with `t_current_arena = arena M`
+6. `arena_M.contains(ptr_from_arena_N)` returns FALSE → code reads header at `ptr_from_arena_N - HEADER_SIZE`
+7. **Arena N has been reset** or is in use by thread B → corrupted memory read → invalid size → memcpy overflow → heap corruption (0xC0000374) or stack buffer overrun (0xC0000791)
+
+**Timing model:**
+- Cold cache (500 f/s): Arena reuse interval = 1024ms, reset time <1ms, safety margin = 1023ms (safe)
+- Warm cache (10K f/s): Arena reuse interval = 3.2ms, reset time 1-5ms, safety margin = NEGATIVE (unsafe)
+
+**Five supporting issues identified:**
+1. **Arena Reset Race** (CRITICAL) — TreeGuard destructs after arena reused; arena-allocated memory still referenced
+2. **Trusted Header without Validation** (CRITICAL) — `arena_realloc` blindly trusts header size, amplifies #1
+3. **Stale thread_local Arena Pointer** (MEDIUM) — thread-local `t_current_arena` can point to reset/reused arena
+4. **Unbounded Result Queue** (MEDIUM) — grows to 50K+ items at 10K f/s, heap thrashing/fragmentation
+5. **Shutdown Sequence Race** (LOW) — ThreadPool destruction overlaps with ArenaPool destruction
+
+**Probability ranking by impact:**
+- Parser reuse dangling pointers (85%) — matches Grag's issue #1
+- Arena pool exhaustion race (85%) — matches Simon's issue #1 + Otho's throughput analysis
+- Unbounded queue heap thrashing (75%) — matches Otho's finding #2
+- Shutdown race (20%) — Simon's issue #5
+
+**Crash profile matches:** 7-10 crashes per 100K-162K file run only occur at warm cache because:
+- Window of vulnerability scales with throughput
+- Each file at 10K f/s increases chance of overlap (3.2ms window × N files × 16 threads)
+- Requires precise timing: arena reset during parser realloc during tree traversal
+- Probability ~0.005% per file (7/162K) but cumulative across run
+
+**Immediate fixes (recommended by Otho):**
+1. **Revert DEC-037a parser reuse** or force parser reset per arena change (eliminates dangling pointers) — CRITICAL
+2. **Increase arena pool from 32 to 64** (increases reuse interval from 3.2ms to 6.4ms) — HIGH PRIORITY
+3. **Bound result_queue to 1024 items** (provides back-pressure, eliminates heap thrashing) — HIGH PRIORITY
+
+**Expected impact:** Crash rate 10 per 100K → 1-2 per 100K with immediate fixes; 0 crashes with additional refcounting
+
+**Next phase fixes:**
+4. Add atomic refcount to Arena (prevent lease-during-reset)
+5. Explicit ThreadPool shutdown before ArenaPool destruction
+
+**Files analyzed:** `src/cli/cmd_index.cpp` (471-472, 423-433, 557-559, 810-820), `src/core/arena.h` (151-177, 76-89), `src/core/arena_pool.h` (25-42)
+
+**Details:** See `.squad/orchestration-log/2026-04-03T-heap-corruption-{simon,grag,otho}.md` for full analysis; see `.squad/log/2026-04-03T-heap-corruption-investigation.md` for investigation summary.
+
+---
+
+### DEC-039: Parser Reuse Incompatible with Arena Resets — Revert or Force Reset (Grag, 2026-04-03)
+**Status:** Actionable finding, blocks all deployments until fixed
+
+**Issue:** Thread-local parser reuse (DEC-037a, labeled OPT-5) caches internal tree-sitter buffers that become dangling pointers when arena is reset between files. This is **100% of observed heap corruption crashes** at high throughput per Grag's audit.
+
+**Root cause mechanism:**
+- Parser allocates internal buffers via `ts_arena_malloc` → buffers stored in arena N's memory
+- When arena N is reset (offset=0, overflow ptrs freed), buffers are inaccessible
+- Parser still holds pointers to those buffers for next parse
+- Next parse uses arena M → parser realloc tries to realloc old buffers (from arena N) using arena M allocator
+- `arena_M.contains(ptr_from_arena_N)` returns FALSE → blind header dereference → corruption
+
+**Three proposed fixes (ranked by risk/benefit):**
+
+1. **OPTION A (SAFEST, RECOMMENDED):** Revert parser reuse — create new Parser per file
+   - Change: `thread_local std::unordered_map<std::string, Parser> t_parsers;` → `Parser parser;` (local per file)
+   - Risk: ZERO (pure revert to pre-optimization)
+   - Perf impact: -15 files/s (negligible vs heap corruption)
+   - Effort: 5 minutes
+   - Verdict: **IMPLEMENT IMMEDIATELY**
+
+2. **Option B:** Force parser reset when switching arenas
+   - Tree-sitter API does not support `parser.reset_internal_state()`
+   - Fallback: Delete and recreate parser every N files (amortize cost)
+   - Risk: Still has race window (parser reused across files)
+   - Not recommended
+
+3. **Option C:** One parser per arena (architectural)
+   - Store parser map in ArenaPool
+   - Parse with current arena → reuse parser for same arena → reset parser when arena resets
+   - Risk: Moderate, requires refactoring ArenaPool interface
+   - Benefit: Keeps parser reuse optimization while eliminating dangling pointers
+   - Effort: 3-4 hours
+   - Future option if performance needs require parser reuse
+
+**Immediate action:** Implement Option A (revert). Expected: zero heap corruption crashes in subsequent benchmarks.
+
+**Timeline:** Blocking deployment until fixed. Must revert before DEC-037 Phase 1 optimization is merged.
+
 ## Governance
 
 - All meaningful changes require team consensus

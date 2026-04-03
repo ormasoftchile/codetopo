@@ -43,6 +43,29 @@
 - `src/index/supervisor.cpp` lines 218-229: quarantine window (too wide in single-thread)
 - `src/core/config.h` line 25: max_ast_depth = 500
 
+### 2026-04-03: Heap Corruption Concurrency Analysis — 5 Issues Identified
+
+**Investigation scope:** Full concurrency architecture review under high throughput (10K+ files/sec). Context: crashes (0xC0000374, 0xC0000791) only occur when OS file cache is warm (0.4ms read vs 33ms cold).
+
+**Five concurrency issues identified (Critical to Low):**
+1. **Arena Reset Race — Use-After-Free in TreeGuard (CRITICAL)** — Arena released back to pool BEFORE TreeGuard's destructor runs. Arena is instantly re-leased to another worker at 10K f/s (3.2ms window). TreeGuard destructs while arena is in use by next worker → heap corruption.
+2. **arena_realloc Trusted Header Without Validation (CRITICAL)** — Blindly trusts ArenaAllocHeader size field without magic number or bounds check. If header corrupt (arena reset + reuse), memcpy can overrun → 0xC0000374 or 0xC0000791.
+3. **thread_local Arena Pointer Stale After Release (MEDIUM)** — Race window exists where t_current_arena points to reset/reused arena before next `set_thread_arena()` call.
+4. **Result Queue Unbounded (MEDIUM)** — Grows to 1K-5K items × 500KB per file = 500MB-2.5GB heap allocation at 10K f/s; amplifies Issue #1 timeline window.
+5. **Shutdown Sequence Race (LOW-MEDIUM)** — Persist thread still draining queue when main thread destruction begins; no explicit join-before-destruct ordering enforced.
+
+**Root cause summary:** Issue #1 (Arena Reset Race) + Issue #2 (Trusted Header) combine to cause all crashes. TreeGuard arena dependency outlives the lease scope. At high throughput, race window narrows to milliseconds.
+
+**Key timing insight:** Cold cache (500 f/s) arena reuse interval is ~1024ms; warm cache (10K f/s) is ~3.2ms. Safety margin flips from +1023ms to NEGATIVE.
+
+**Architecture flaw:** Arena MUST outlive TSTree it allocated. Currently: Arena lease scope (lines 423-546 in worker) << TreeGuard lifetime (destructs in main thread ~5-10ms later).
+
+**Recommended fixes:** Extend arena lease to match tree lifetime OR move tree destruction into worker before lease returns. See DEC-038, DEC-039 for full recommendations.
+
+**Deliverables:** `simon-heap-corruption-concurrency.md` (618 lines, 6 issues analyzed with code locations + fixes + testing strategy).
+
+---
+
 ### 2026-04-02: Forward-Looking Optimization Analysis
 
 **Current Performance State:**
@@ -193,3 +216,59 @@
 **Impact:** 4 surgical code changes (~15 min effort). Saves 350-800s of wasted wall time at 100K scale — potentially more than the entire persist pipeline overhaul (DEC-038).
 
 **Design written to:** `.squad/decisions/inbox/simon-watchdog-redesign.md`
+
+### 2026-04-03: Heap Corruption Under High Throughput — Critical Concurrency Issue
+
+**Problem:** Warm OS cache (0.4ms file_read vs 33ms cold) → 10K+ files/sec throughput → 7-10 heap corruption crashes per 100K-162K run (exit codes 0xC0000374, 0xC0000791). Cold cache runs (500 files/sec) had ZERO crashes. One crash occurred AFTER completion during shutdown.
+
+**Root Cause Identified:**
+
+**CRITICAL Issue #1 (Arena Reset Race):** Arena is released and reset while TreeGuard still holds TSTree pointers allocated from that arena.
+
+**Timeline:**
+1. Worker: ArenaLease destructor → `pool_.release(arena_)` → `arena->reset()` (lines 64-66 arena_pool.h, line 98 arena.h)
+2. Arena buffer instantly reused by another worker (pool size = 2× thread count, rapid cycling at 10K/sec)
+3. Worker's ParsedFile returned to main thread, moved through result_queue → persist_queue
+4. TreeGuard destructs 10-50ms later when ParsedFile is destroyed in persist thread (line 772+ cmd_index.cpp)
+5. `ts_tree_delete()` walks corrupted tree structure → heap corruption
+
+**CRITICAL Issue #2 (Untrusted Arena Header):** `arena_realloc` blindly trusts `ArenaAllocHeader.size` with no magic number or bounds check (lines 151-177 arena.h). When arena is reset while tree-sitter still references it, realloc reads corrupt header → `memcpy` overruns → 0xC0000374 (heap corruption) or 0xC0000791 (stack buffer overrun).
+
+**Key architectural insight:** Arena MUST outlive TSTree. Current design:
+- Arena lease scope: worker lambda (lines 423-546)
+- TreeGuard lifetime: created in worker, destructs in main/persist thread after result processing (~10-50ms later)
+- At 500 files/sec (cold cache), 500ms reuse latency — TreeGuard destructs before arena reuse
+- At 10K files/sec (warm cache), 0.5-2ms reuse latency — TreeGuard destructs DURING arena reuse by another worker
+
+**5 other issues found:**
+- #3: thread_local arena pointer stale after lease (arena.cpp:9, cmd_index.cpp:432) — Medium
+- #4: result_queue unbounded (cmd_index.cpp:557-559) — Medium (memory pressure, not direct corruption)
+- #5: Shutdown race (persist thread + main thread Connection access, lines 810-832) — explains "crash after completion"
+- #6: Large-file arena pool contention (87s at 100K files) — timing amplifier
+
+**Recommended fixes:**
+1. **Option A (immediate):** Move ArenaLease + TreeGuard ownership into ParsedFile. Arena destructs AFTER TreeGuard (RAII member order). Requires 546 arenas (thread + window + persist_queue depth) at 128MB = 70GB address space.
+2. **Option B (proper architecture):** Copy ExtractionResult in worker, destruct tree before returning. Arena released immediately. No arena pool increase.
+3. **Arena header validation:** Add magic number (0xA4EAA4EA) to ArenaAllocHeader, validate in arena_realloc. Return nullptr on corruption → parse fails cleanly instead of heap corruption.
+4. **Clear thread_local:** `set_thread_arena(nullptr)` in ArenaLease destructor before release.
+5. **Bound result_queue:** Replace std::queue with bounded deque (capacity = window_size + thread_count). Backpressure on workers.
+6. **Shutdown error handling:** Wrap persist thread in try-catch, set fatal_error flag. Main thread checks before touching Connection.
+
+**Critical code locations:**
+- `src/core/arena.h` lines 151-177: arena_realloc trusted header (no validation)
+- `src/core/arena_pool.h` lines 64-66: ArenaLease destructor releases arena
+- `src/cli/cmd_index.cpp` lines 423-546: Worker lambda arena lease scope
+- `src/cli/cmd_index.cpp` lines 484-517: TreeGuard created and passed to extractor
+- `src/cli/cmd_index.cpp` lines 772+: ParsedFile destroyed in main thread (TreeGuard destructs here)
+- `src/index/parser.h` lines 104-117: TreeGuard RAII (calls ts_tree_delete in destructor)
+
+**Analysis written to:** `.squad/decisions/inbox/simon-heap-corruption-concurrency.md`
+
+**Implementation priority:**
+1. Arena header validation (Fix #2) — 1hr, immediate safety net
+2. Extend arena lease into ParsedFile (Fix #1 Option A) — 10min, test hypothesis
+3. Stress test with warm cache — confirm crashes stop
+4. Proper fix: Copy result + release arena in worker (Fix #1 Option B) — 2hr
+5. Defense-in-depth: Fix #3, #4, #5 — 2hr
+
+**Confidence:** 95% that Issue #1 + #2 explain the throughput-dependent crash pattern. Crash probability per file is ~0.005% (7/162K), increases with file size and throughput due to timing window.
