@@ -31,6 +31,7 @@ struct Config {
     std::vector<std::string> exclude_patterns;  // Glob patterns to exclude (e.g. **/GlobalSuppressions.cs)
     bool supervised = false;   // True when running as a supervised child process
     bool safe_mode = false;    // True = commit after every file (for crash isolation)
+    bool in_memory = false;    // Use in-memory SQLite for cold index, backup to disk at end
     bool resume = false;       // True = load cached worklist instead of rescanning
     int progress_offset = 0;   // Files already completed in prior runs (for display)
     int progress_total = 0;    // Original total file count (0 = use work_list.size())
