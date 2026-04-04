@@ -152,11 +152,7 @@ int run_index(const Config& config) {
     register_arena_allocator();
 
     // Open DB and ensure schema (T010, T011)
-    bool using_memory = config.in_memory;
-    Connection conn(using_memory ? std::filesystem::path(":memory:") : db_path);
-    if (using_memory) {
-        std::cerr << "IN-MEMORY mode: building database in RAM, will backup to disk at end\n";
-    }
+    Connection conn(db_path);
     int schema_rc = schema::ensure_schema(conn);
     if (schema_rc != 0) {
         std::cerr << "ERROR: Schema version mismatch (exit code 3)\n";
@@ -272,7 +268,7 @@ int run_index(const Config& config) {
         // Ensure FTS triggers are active for future incremental updates
         fts::create_sync_triggers(conn);
         persister.write_metadata(repo_root.string());
-        if (!using_memory) conn.wal_checkpoint();
+        conn.wal_checkpoint();
         fs::remove(worklist_path);  // Clean up stale worklist
         return 0;
     }
@@ -856,7 +852,7 @@ int run_index(const Config& config) {
     std::cerr << "\n";
 
     // Checkpoint WAL to main DB before read-heavy post-processing
-    if (!using_memory) conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     // Run BEFORE any secondary indexes — resolve_refs only needs INTEGER PRIMARY KEY
@@ -876,7 +872,7 @@ int run_index(const Config& config) {
     }
 
     // Checkpoint WAL after resolve_refs before building indexes
-    if (!using_memory) conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 
     // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
     if (bulk_mode) {
@@ -925,40 +921,13 @@ int run_index(const Config& config) {
         persister.write_metadata(repo_root.string());
     }
 
-    // WAL checkpoint (T050) — skip for in-memory mode (no WAL)
-    if (!using_memory) {
-        {
-            ScopedPhase _wc(profiler.wal_ckpt);
-            conn.wal_checkpoint();
-        }
-        // Restore normal autocheckpoint for any subsequent queries
-        conn.exec("PRAGMA wal_autocheckpoint=1000");
+    // WAL checkpoint (T050)
+    {
+        ScopedPhase _wc(profiler.wal_ckpt);
+        conn.wal_checkpoint();
     }
-
-    // For in-memory mode: backup the completed database to disk
-    if (using_memory) {
-        std::cerr << "Backing up in-memory database to disk...\n";
-        auto backup_start = std::chrono::steady_clock::now();
-
-        // Ensure parent directory exists
-        fs::create_directories(db_path.parent_path());
-
-        // Remove any existing DB file (cold index = fresh start)
-        fs::remove(db_path);
-        auto wal_path = db_path; wal_path += "-wal";
-        auto shm_path = db_path; shm_path += "-shm";
-        fs::remove(wal_path);
-        fs::remove(shm_path);
-
-        if (!conn.backup_to(db_path)) {
-            std::cerr << "ERROR: Failed to backup in-memory database to " << db_path << "\n";
-            return 1;
-        }
-
-        auto backup_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - backup_start).count();
-        std::cerr << "Database backed up in " << backup_elapsed << "s\n";
-    }
+    // Restore normal autocheckpoint for any subsequent queries
+    conn.exec("PRAGMA wal_autocheckpoint=1000");
 
     // Remove worklist and progress files on success
     fs::remove(worklist_path);

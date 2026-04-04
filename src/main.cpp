@@ -31,7 +31,6 @@ int main(int argc, char** argv) {
     int index_max_symbols = 50000;
     bool index_no_gitignore = false;
     bool index_turbo = false;
-    bool index_in_memory = false;
     std::vector<std::string> index_exclude;
     bool index_supervised = false;
     bool index_safe_mode = false;
@@ -45,7 +44,6 @@ int main(int argc, char** argv) {
     sub_index->add_option("--large-file-threshold", index_large_file_threshold, "File size in KB above which the large arena is used (0=auto: arena/30)")->default_val(0);
     sub_index->add_option("--batch-size", index_batch_size, "Files per transaction batch")->default_val(500);
     sub_index->add_flag("--turbo", index_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
-    sub_index->add_flag("--in-memory", index_in_memory, "Use in-memory SQLite (faster cold index, more RAM)");
     int index_parse_timeout = 5;
     sub_index->add_option("--max-file-size", index_max_file_size, "Max file size in KB")->default_val(10240);
     sub_index->add_option("--parse-timeout", index_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(5);
@@ -77,7 +75,6 @@ int main(int argc, char** argv) {
     int init_max_file_size = 10240;
     bool init_watch = true;
     bool init_turbo = false;
-    bool init_in_memory = false;
     std::vector<std::string> init_exclude;
     std::string init_freshness = "normal";
 
@@ -92,7 +89,6 @@ int main(int argc, char** argv) {
     sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in KB")->default_val(10240);
     sub_init->add_option("--parse-timeout", init_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(5);
     sub_init->add_flag("--turbo", init_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
-    sub_init->add_flag("--in-memory", init_in_memory, "Use in-memory SQLite (faster cold index, more RAM)");
     sub_init->add_option("--exclude", init_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
     sub_init->add_flag("--watch,!--no-watch", init_watch,
         "Include --watch in MCP config (default: true)")->default_val(true);
@@ -197,7 +193,6 @@ int main(int argc, char** argv) {
         cfg.max_symbols_per_file = index_max_symbols;
         cfg.no_gitignore = index_no_gitignore;
         cfg.turbo = index_turbo;
-        cfg.in_memory = index_in_memory;
         cfg.exclude_patterns = index_exclude;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
@@ -229,7 +224,6 @@ int main(int argc, char** argv) {
                                       init_max_file_size,
                                       init_parse_timeout,
                                       init_turbo,
-                                      init_in_memory,
                                       init_exclude,
                                       init_watch, init_freshness);
         } catch (const std::exception& e) {

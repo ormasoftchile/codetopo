@@ -11,7 +11,8 @@ param(
     [int]$LargeFileThreshold = 150,
     [int]$MaxFileSize = 512,
     [switch]$SkipFlush,
-    [string]$Label = ""
+    [string]$Label = "",
+    [switch]$InMemory
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,6 +78,9 @@ $args = @("index", "--root", $Root, "--threads", $Threads,
           "--max-file-size", $MaxFileSize, "--profile")
 if ($Scale -gt 0) {
     $args += @("--max-files", $Scale)
+}
+if ($InMemory) {
+    $args += @("--in-memory")
 }
 
 $scaleLabel = if ($Scale -gt 0) { "${Scale}" } else { "FULL" }

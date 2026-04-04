@@ -32,26 +32,20 @@ public:
             ? (SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX)
             : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX);
 
-        bool is_memory = (db_path.string() == ":memory:");
-
-        int rc = sqlite3_open_v2(
-            is_memory ? ":memory:" : db_path.string().c_str(),
-            &db_, flags, nullptr);
+        int rc = sqlite3_open_v2(db_path.string().c_str(), &db_, flags, nullptr);
         if (rc != SQLITE_OK) {
             std::string msg = db_ ? sqlite3_errmsg(db_) : "failed to open database";
             if (db_) sqlite3_close(db_);
             throw std::runtime_error("SQLite open failed: " + msg);
         }
 
-        // PRAGMA setup — skip WAL and mmap for in-memory databases
-        if (!is_memory) {
-            exec("PRAGMA journal_mode=WAL");
-            exec("PRAGMA mmap_size=4294967296");  // 4 GB memory-mapped I/O
-        }
+        // PRAGMA setup
+        exec("PRAGMA journal_mode=WAL");
         exec("PRAGMA foreign_keys=ON");
         exec("PRAGMA busy_timeout=5000");
         exec("PRAGMA synchronous=NORMAL");
         exec("PRAGMA cache_size=-65536");    // 64 MB page cache
+        exec("PRAGMA mmap_size=4294967296");  // 4 GB memory-mapped I/O (R4: covers DB growth past 2GB at 100K+ files)
     }
 
     ~Connection() {
@@ -94,29 +88,6 @@ public:
     // Run PRAGMA wal_checkpoint(PASSIVE)
     void wal_checkpoint() {
         exec("PRAGMA wal_checkpoint(PASSIVE)");
-    }
-
-    // Backup this in-memory (or any) database to a file on disk using sqlite3_backup API.
-    bool backup_to(const std::filesystem::path& dest_path) {
-        sqlite3* dest_db = nullptr;
-        int rc = sqlite3_open_v2(dest_path.string().c_str(), &dest_db,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr);
-        if (rc != SQLITE_OK) {
-            if (dest_db) sqlite3_close(dest_db);
-            return false;
-        }
-
-        sqlite3_backup* backup = sqlite3_backup_init(dest_db, "main", db_, "main");
-        if (!backup) {
-            sqlite3_close(dest_db);
-            return false;
-        }
-
-        rc = sqlite3_backup_step(backup, -1);  // copy all pages in one step
-        sqlite3_backup_finish(backup);
-        sqlite3_close(dest_db);
-
-        return (rc == SQLITE_DONE);
     }
 
     // Run PRAGMA integrity_check (SLOW — scans every B-tree page, avoid in hot paths)

@@ -307,7 +307,6 @@ inline int run_init(const std::string& root_str,
                     int max_file_size,
                     int parse_timeout,
                     bool turbo,
-                    bool in_memory,
                     const std::vector<std::string>& exclude_patterns,
                     bool watch, const std::string& freshness) {
     namespace fs = std::filesystem;
@@ -330,7 +329,6 @@ inline int run_init(const std::string& root_str,
     cfg.max_file_size_kb = max_file_size;
     cfg.parse_timeout_s = parse_timeout;
     cfg.turbo = turbo;
-    cfg.in_memory = in_memory;
     cfg.profile = false;
     cfg.max_files = 0;
     cfg.exclude_patterns = exclude_patterns;
