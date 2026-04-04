@@ -82,3 +82,7 @@ image.png
 
 # codetopo index (auto-generated)
 .codetopo/
+
+# Squad documentation (team coordination)
+!.squad/
+

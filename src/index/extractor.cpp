@@ -4,6 +4,14 @@
 #include <sstream>
 #include <filesystem>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace codetopo {
 
 // --- Extractor public ---
@@ -17,7 +25,11 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
     rel_path_ = &rel_path;
     language_ = &language;
     symbol_count_ = 0;
+    node_count_ = 0;
     symbol_stack_.clear();
+    deadline_ = (timeout_s_ > 0)
+        ? std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s_)
+        : std::chrono::steady_clock::time_point::max();
 
     TSNode root = ts_tree_root_node(tree);
     visit_node(root, "", 0);
@@ -192,61 +204,96 @@ void Extractor::add_call_edge(int caller_idx, const std::string& callee_name, do
     });
 }
 
-void Extractor::visit_node(TSNode node, const std::string& parent_qualname, int depth) {
-    if (ts_node_is_null(node) || depth > max_depth_) return;
-    if (result_->truncated) return;
+void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, int /*depth*/) {
+    // Iterative DFS using an explicit stack to avoid stack overflow on deeply
+    // nested ASTs (the #1 cause of 0xC0000409 crashes on large files).
+    // Each frame mirrors what the old recursive visit_node did per call.
+    struct Frame {
+        TSNode node;
+        uint32_t child_count;
+        uint32_t next_child;   // next child index to push
+        bool pushed_scope;     // whether this frame pushed onto symbol_stack_
+    };
 
-    const char* type = ts_node_type(node);
-    if (!type) return;
+    thread_local static std::vector<Frame> stack;
+    stack.clear();
 
-    std::string type_str(type);
+    auto process_node = [&](TSNode node) -> bool {
+        if (ts_node_is_null(node)) return false;
+        if (result_->truncated) return false;
+        if (static_cast<int>(stack.size()) > max_depth_) return false;
 
-    // Snapshot symbol count before the language extractor so we can detect
-    // whether this node introduced a new scoping symbol.
-    int sym_before = static_cast<int>(result_->symbols.size());
+        // Check deadline every 4096 nodes (~60ns overhead per check)
+        if ((++node_count_ & 0xFFF) == 0 &&
+            ((cancel_flag_ && *cancel_flag_ != 0) ||
+             std::chrono::steady_clock::now() > deadline_)) {
+            result_->truncated = true;
+            result_->truncation_reason = "extraction timeout";
+            return false;
+        }
 
-    if (*language_ == "c" || *language_ == "cpp") {
-        extract_c_cpp(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "csharp") {
-        extract_csharp(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "typescript" || *language_ == "javascript") {
-        extract_typescript(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "go") {
-        extract_go(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "yaml") {
-        extract_yaml(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "python") {
-        extract_python(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "rust") {
-        extract_rust(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "java") {
-        extract_java(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "bash") {
-        extract_bash(node, type_str, parent_qualname);
-    }
-    else if (*language_ == "sql") {
-        extract_sql(node, type_str, parent_qualname);
-    }
+        const char* type = ts_node_type(node);
+        if (!type) return false;
 
-    // If a new symbol was emitted for this node, push it as the containing
-    // scope so that refs found inside its children are attributed to it.
-    bool pushed = static_cast<int>(result_->symbols.size()) > sym_before;
-    if (pushed) symbol_stack_.push_back(sym_before);
+        std::string type_str(type);
+        const std::string& parent_qualname = root_qualname;
 
-    uint32_t child_count = ts_node_child_count(node);
-    for (uint32_t i = 0; i < child_count; ++i) {
-        visit_node(ts_node_child(node, i), parent_qualname, depth + 1);
+        int sym_before = static_cast<int>(result_->symbols.size());
+
+        if (*language_ == "c" || *language_ == "cpp") {
+            extract_c_cpp(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "csharp") {
+            extract_csharp(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "typescript" || *language_ == "javascript") {
+            extract_typescript(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "go") {
+            extract_go(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "yaml") {
+            extract_yaml(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "python") {
+            extract_python(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "rust") {
+            extract_rust(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "java") {
+            extract_java(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "bash") {
+            extract_bash(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "sql") {
+            extract_sql(node, type_str, parent_qualname);
+        }
+
+        bool pushed = static_cast<int>(result_->symbols.size()) > sym_before;
+        if (pushed) symbol_stack_.push_back(sym_before);
+
+        stack.push_back({node, ts_node_child_count(node), 0, pushed});
+        return true;
+    };
+
+    if (!process_node(root_node)) return;
+
+    while (!stack.empty()) {
+        if (result_->truncated) break;
+
+        auto& top = stack.back();
+        if (top.next_child < top.child_count) {
+            TSNode child = ts_node_child(top.node, top.next_child);
+            top.next_child++;
+            process_node(child);  // pushes a new frame if valid
+        } else {
+            // All children visited — pop this frame
+            if (top.pushed_scope) symbol_stack_.pop_back();
+            stack.pop_back();
+        }
     }
-
-    if (pushed) symbol_stack_.pop_back();
 }
 
 void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::string& parent_qn) {
@@ -397,6 +444,41 @@ void Extractor::extract_csharp(TSNode node, const std::string& type, const std::
     else if (type == "invocation_expression") {
         auto func = ts_node_child(node, 0);
         if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "invocation");
+    }
+    else if (type == "using_directive") {
+        auto name_node = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(name_node)) {
+            // Fallback: try extracting from named children
+            name_node = get_name_from_child(node, "name").empty() ? name_node : name_node;
+            uint32_t count = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < count; ++i) {
+                TSNode child = ts_node_named_child(node, i);
+                std::string ct(ts_node_type(child));
+                if (ct == "identifier" || ct == "qualified_name") {
+                    add_ref("include", node_text(child), node, "using_directive");
+                    break;
+                }
+            }
+        } else {
+            add_ref("include", node_text(name_node), node, "using_directive");
+        }
+    }
+    else if (type == "base_list") {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; ++i) {
+            TSNode child = ts_node_named_child(node, i);
+            std::string child_type(ts_node_type(child));
+            if (child_type == "identifier" || child_type == "qualified_name" ||
+                child_type == "generic_name" || child_type == "simple_base_type") {
+                add_ref("inherit", node_text(child), node, "base_list");
+            }
+        }
+    }
+    else if (type == "object_creation_expression") {
+        auto type_node = ts_node_child(node, 1);
+        if (!ts_node_is_null(type_node)) {
+            add_ref("call", node_text(type_node), node, "object_creation");
+        }
     }
 }
 
@@ -709,13 +791,61 @@ void Extractor::extract_sql(TSNode node, const std::string& type, const std::str
     }
 }
 
-// Free function
+// Free function — pre-sized read avoids O(N log N) buffer doubling
 std::string read_file_content(const std::filesystem::path& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return "";
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+#ifdef _WIN32
+    // Use FILE_FLAG_SEQUENTIAL_SCAN to enable aggressive OS read-ahead.
+    // On cold cache, this can save 5-10ms/file by hinting the NTFS cache manager.
+    HANDLE hFile = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN | FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return "";
+
+    LARGE_INTEGER li_size;
+    if (!GetFileSizeEx(hFile, &li_size)) {
+        CloseHandle(hFile);
+        return "";
+    }
+    auto size = static_cast<size_t>(li_size.QuadPart);
+    if (size == 0) {
+        CloseHandle(hFile);
+        return "";
+    }
+
+    std::string content(size, '\0');
+    DWORD bytes_read = 0;
+    // For files > 4GB, would need a loop, but source files are capped by max_file_size
+    BOOL ok = ReadFile(hFile, content.data(), static_cast<DWORD>(size), &bytes_read, nullptr);
+    CloseHandle(hFile);
+
+    if (!ok || bytes_read != static_cast<DWORD>(size)) {
+        return "";
+    }
+    return content;
+#else
+    // POSIX: use open() with posix_fadvise for sequential read-ahead
+    auto size = std::filesystem::file_size(path);
+    if (size == 0) return "";
+
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "";
+
+    #ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+    #endif
+
+    std::string content(size, '\0');
+    auto nread = ::read(fd, content.data(), size);
+    ::close(fd);
+
+    if (nread != static_cast<ssize_t>(size)) return "";
+    return content;
+#endif
 }
 
 } // namespace codetopo

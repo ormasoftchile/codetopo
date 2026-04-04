@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <filesystem>
+#include <chrono>
 
 namespace codetopo {
 
@@ -60,6 +61,14 @@ public:
     Extractor(int max_symbols, int max_depth)
         : max_symbols_(max_symbols), max_depth_(max_depth) {}
 
+    Extractor(int max_symbols, int max_depth, int timeout_s)
+        : max_symbols_(max_symbols), max_depth_(max_depth),
+          timeout_s_(timeout_s) {}
+
+    Extractor(int max_symbols, int max_depth, int timeout_s, size_t* cancel_flag)
+        : max_symbols_(max_symbols), max_depth_(max_depth),
+          timeout_s_(timeout_s), cancel_flag_(cancel_flag) {}
+
     ExtractionResult extract(TSTree* tree, const std::string& source,
                               const std::string& language,
                               const std::string& rel_path);
@@ -68,6 +77,10 @@ private:
     int max_symbols_;
     int max_depth_;
     int symbol_count_ = 0;
+    int node_count_ = 0;
+    int timeout_s_ = 0;
+    size_t* cancel_flag_ = nullptr;
+    std::chrono::steady_clock::time_point deadline_;
     std::vector<int> symbol_stack_;  // Stack of enclosing symbol indices
     const std::string* source_ = nullptr;
     ExtractionResult* result_ = nullptr;

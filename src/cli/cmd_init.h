@@ -6,6 +6,7 @@
 #include "util/json.h"
 #include "util/process.h"
 #include "db/connection.h"
+#include "db/schema.h"
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -301,7 +302,12 @@ inline std::string editor_config_display(Editor e, const std::filesystem::path& 
 // The init command entry point.
 inline int run_init(const std::string& root_str,
                     const std::string& editors_str,
-                    int threads, int arena_size, int max_file_size,
+                    int threads, int arena_size, int large_arena_size,
+                    int large_file_threshold,
+                    int max_file_size,
+                    int parse_timeout,
+                    bool turbo,
+                    const std::vector<std::string>& exclude_patterns,
                     bool watch, const std::string& freshness) {
     namespace fs = std::filesystem;
 
@@ -318,12 +324,33 @@ inline int run_init(const std::string& root_str,
     cfg.db_path = db_path;
     cfg.thread_count = threads;
     cfg.arena_size_mb = arena_size;
-    cfg.max_file_size_mb = max_file_size;
+    cfg.large_arena_size_mb = large_arena_size;
+    cfg.large_file_threshold_kb = large_file_threshold;
+    cfg.max_file_size_kb = max_file_size;
+    cfg.parse_timeout_s = parse_timeout;
+    cfg.turbo = turbo;
+    cfg.profile = false;
+    cfg.max_files = 0;
+    cfg.exclude_patterns = exclude_patterns;
+
+    // Fresh init: clear stale quarantine from previous runs
+    {
+        Connection conn(db_path);
+        schema::ensure_quarantine_table(conn);
+        int old_q = schema::quarantine_count(conn);
+        if (old_q > 0) {
+            schema::clear_quarantine(conn);
+            std::cerr << "Cleared " << old_q << " stale quarantine entries from previous run\n";
+        }
+    }
 
     int index_rc = run_index_supervisor(cfg);
-    if (index_rc != 0) {
+    if (index_rc != 0 && index_rc != 1) {
         std::cerr << "ERROR: Indexing failed (exit code " << index_rc << ")\n";
         return index_rc;
+    }
+    if (index_rc == 1) {
+        std::cerr << "WARNING: Indexing completed with some parse errors (non-fatal)\n";
     }
 
     // Query stats from the finished index

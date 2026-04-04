@@ -11,7 +11,7 @@ namespace codetopo {
 
 // T011: Schema DDL creation and version check logic per data-model.md.
 // Schema version 1 = initial schema.
-static constexpr int CURRENT_SCHEMA_VERSION = 1;
+static constexpr int CURRENT_SCHEMA_VERSION = 2;
 static constexpr const char* INDEXER_VERSION = "1.0.0";
 
 namespace schema {
@@ -47,8 +47,9 @@ inline void create_tables(Connection& conn) {
             is_definition INTEGER NOT NULL DEFAULT 1,
             visibility TEXT CHECK(visibility IN ('public','protected','private') OR visibility IS NULL),
             doc TEXT,
-            stable_key TEXT NOT NULL UNIQUE
+            stable_key TEXT NOT NULL
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key);
         CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name);
         CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname);
@@ -167,8 +168,10 @@ inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_refs_file_id");
     conn.exec("DROP INDEX IF EXISTS idx_refs_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_refs_resolved");
+    conn.exec("DROP INDEX IF EXISTS idx_refs_containing");
     conn.exec("DROP INDEX IF EXISTS idx_edges_src");
     conn.exec("DROP INDEX IF EXISTS idx_edges_dst");
+    conn.exec("DROP INDEX IF EXISTS idx_nodes_stable_key");
 }
 
 // Rebuild secondary indexes after bulk loading.
@@ -181,8 +184,10 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
+    conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key)");
 }
 
 // Initialize or verify schema. Returns exit code (0=ok, 3=mismatch).
@@ -323,6 +328,11 @@ inline int rehab_quarantine(Connection& conn, const std::vector<ScannedFile>& sc
     }
 
     return static_cast<int>(rehab_paths.size());
+}
+
+// Clear all quarantine entries (used on fresh init to reset stale state)
+inline void clear_quarantine(Connection& conn) {
+    conn.exec("DELETE FROM quarantine");
 }
 
 } // namespace schema

@@ -22,12 +22,16 @@ TEST_CASE("Arena reset reclaims all memory", "[arena]") {
     REQUIRE(arena.used() == 0);
 }
 
-TEST_CASE("Arena overflow returns nullptr", "[arena]") {
+TEST_CASE("Arena overflow falls back to malloc", "[arena]") {
     Arena arena(256);
     void* p1 = arena.allocate(200);
     REQUIRE(p1 != nullptr);
-    void* p2 = arena.allocate(200);  // Exceeds 256
-    REQUIRE(p2 == nullptr);
+    REQUIRE_FALSE(arena.overflowed());
+    void* p2 = arena.allocate(200);  // Exceeds 256 — falls back to malloc
+    REQUIRE(p2 != nullptr);          // malloc fallback succeeds
+    REQUIRE(arena.overflowed());     // overflow flag is set
+    arena.reset();
+    REQUIRE_FALSE(arena.overflowed()); // reset clears overflow flag
 }
 
 TEST_CASE("Arena calloc zeroes memory", "[arena]") {

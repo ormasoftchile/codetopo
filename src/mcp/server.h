@@ -69,7 +69,9 @@ public:
 
             std::string line = json_read_line();
             if (line.empty()) {
-                if (std::cin.eof()) return 0;  // Client closed connection
+                if (std::cin.eof()) {
+                    return 0;
+                }
                 continue;
             }
 
@@ -210,6 +212,22 @@ private:
         yyjson_mut_obj_add_str(doc.doc, server_info, "name", "codetopo");
         yyjson_mut_obj_add_str(doc.doc, server_info, "version", INDEXER_VERSION);
         yyjson_mut_obj_add_val(doc.doc, result, "serverInfo", server_info);
+
+        // MCP instructions — guides the LLM on when to prefer these tools
+        yyjson_mut_obj_add_str(doc.doc, result, "instructions",
+            "codetopo provides structural code intelligence for large codebases. "
+            "It pre-indexes all source files into a symbol graph with call relationships.\n\n"
+            "WHEN TO USE THESE TOOLS (prefer over reading files or grep/regex):\n"
+            "- When the user asks about code structure, classes, functions, or symbols\n"
+            "- When the user asks to refactor, split, decompose, or reorganize code\n"
+            "- When you need to understand callers, callees, or impact of a change\n"
+            "- When files are large (>500 lines) — use symbol_search + context_for instead of reading\n"
+            "- When you need to find all references or implementations of a type\n\n"
+            "KEY WORKFLOW: symbol_search (find symbols) -> context_for (get source + callers + callees) -> "
+            "impact_of (blast radius). For refactoring: dependency_cluster (find coupled methods) -> "
+            "method_fields (classify field access) -> context_for (get method bodies to extract).\n\n"
+            "NEVER read large source files directly. Use file_summary to list symbols, then context_for "
+            "to get individual symbol source code with full structural context.");
 
         yyjson_mut_obj_add_val(doc.doc, root, "result", result);
 

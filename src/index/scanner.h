@@ -149,7 +149,9 @@ public:
         // Fast path: use git ls-files if this is a git repo (avoids walking dirs)
         if (!config_.no_gitignore && fs::exists(root / ".git")) {
             auto files = scan_via_git(root);
-            if (!files.empty()) return files;
+            if (!files.empty()) {
+                return files;
+            }
             // Fall back to manual scan if git ls-files failed
         }
 
@@ -163,8 +165,93 @@ public:
         return files;
     }
 
+    // Check if a relative path matches any --exclude pattern.
+    // Patterns support: ** (any path segments), * (any chars except /), ? (single char).
+    // A pattern without / is matched against the filename only.
+    static bool matches_exclude(const std::string& rel_path,
+                                const std::vector<std::string>& patterns) {
+        if (patterns.empty()) return false;
+        // Extract filename for patterns without path separators
+        size_t last_slash = rel_path.rfind('/');
+        std::string filename = (last_slash != std::string::npos)
+            ? rel_path.substr(last_slash + 1) : rel_path;
+        for (const auto& pat : patterns) {
+            if (pat.find('/') == std::string::npos && pat.find("**") == std::string::npos) {
+                // Filename-only pattern
+                if (glob_match(filename, pat)) return true;
+            } else {
+                // Path pattern — handle **
+                if (glob_match_path(rel_path, pat)) return true;
+            }
+        }
+        return false;
+    }
+
 private:
     const Config& config_;
+
+    // Simple glob: * matches any chars except /, ? matches single char
+    static bool glob_match(const std::string& str, const std::string& pattern) {
+        return glob_impl(str.c_str(), pattern.c_str());
+    }
+
+    static bool glob_impl(const char* s, const char* p) {
+        while (*p) {
+            if (*p == '*') {
+                p++;
+                while (*s) {
+                    if (*s == '/') return false;
+                    if (glob_impl(s, p)) return true;
+                    s++;
+                }
+                return glob_impl(s, p);
+            }
+            if (*p == '?') {
+                if (!*s || *s == '/') return false;
+                s++; p++;
+            } else {
+                if (*s != *p) return false;
+                s++; p++;
+            }
+        }
+        return *s == '\0';
+    }
+
+    // Path-aware glob with ** support
+    static bool glob_match_path(const std::string& path, const std::string& pattern) {
+        // Handle ** — split pattern on first ** and check both parts
+        auto dstar = pattern.find("**");
+        if (dstar != std::string::npos) {
+            std::string before = (dstar > 0 && pattern[dstar - 1] == '/')
+                ? pattern.substr(0, dstar - 1) : pattern.substr(0, dstar);
+            std::string after = pattern.substr(dstar + 2);
+            if (!after.empty() && after[0] == '/') after = after.substr(1);
+
+            if (before.empty() && after.empty()) return true;
+            if (before.empty()) {
+                // **/something — match against every suffix
+                for (size_t i = 0; i <= path.size(); ++i) {
+                    if (i == 0 || path[i - 1] == '/') {
+                        if (glob_match(path.substr(i), after)) return true;
+                    }
+                }
+                return false;
+            }
+            if (after.empty()) return path.find(before) != std::string::npos;
+            // before/**/after
+            for (size_t i = 0; i <= path.size(); ++i) {
+                if (i == 0 || path[i - 1] == '/') {
+                    if (glob_match(path.substr(0, i > 0 ? i - 1 : 0), before) &&
+                        glob_match_path(path.substr(i), after)) return true;
+                }
+            }
+            return false;
+        }
+        // No ** — direct match
+        std::string p = pattern;
+        if (!p.empty() && p[0] == '/') p = p.substr(1);
+        return glob_match(path, p);
+    }
 
     // Fast scan using git ls-files (respects .gitignore automatically)
     std::vector<ScannedFile> scan_via_git(const fs::path& root) {
@@ -217,6 +304,9 @@ private:
             // Normalize path separators
             std::string norm_rel = rel;
             for (auto& c : norm_rel) { if (c == '\\') c = '/'; }
+
+            // Check --exclude patterns
+            if (matches_exclude(norm_rel, config_.exclude_patterns)) continue;
 
             files.push_back({
                 abs_path,
@@ -284,6 +374,9 @@ private:
 
                 // Check gitignore
                 if (!config_.no_gitignore && gitignore.is_ignored(rel_path, false)) continue;
+
+                // Check --exclude patterns
+                if (matches_exclude(rel_path, config_.exclude_patterns)) continue;
 
                 // Check file size limit
                 auto size = entry.file_size(ec);

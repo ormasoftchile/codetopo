@@ -1,0 +1,40 @@
+{
+  "assignments": [
+    {
+      "persistent_name": "Simon",
+      "universe": "Captain Future",
+      "character": "Simon Wright (The Living Brain)",
+      "role": "Lead / Architect",
+      "created_at": "2026-03-30T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    {
+      "persistent_name": "Grag",
+      "universe": "Captain Future",
+      "character": "Grag (The Robot)",
+      "role": "Systems Engineer",
+      "created_at": "2026-03-30T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    {
+      "persistent_name": "Otho",
+      "universe": "Captain Future",
+      "character": "Otho (The Android)",
+      "role": "Performance Engineer",
+      "created_at": "2026-03-30T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    },
+    {
+      "persistent_name": "Joan",
+      "universe": "Captain Future",
+      "character": "Joan Randall",
+      "role": "Tester / QA",
+      "created_at": "2026-03-30T00:00:00Z",
+      "legacy_named": false,
+      "status": "active"
+    }
+  ]
+}

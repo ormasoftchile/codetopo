@@ -42,6 +42,255 @@ Tests use inner-scoped Connection objects + cleanup() helper to avoid WAL file l
 **Status:** Implemented, build verified
 `--watch` CLI flag on the `mcp` subcommand embeds the filesystem watcher into the MCP server. Watcher triggers `ReindexState` child processes; on completion sets `std::atomic<bool>` that the main stdio loop checks before each tool dispatch to clear QueryCache. No mutexes — cross-thread communication entirely via atomics. Watcher lifecycle tied to `server.run()`.
 
+### DEC-011: Coordinator must never implement — delegate all work (Cristiano, 2026-03-30)
+**Status:** Standing directive  
+The coordinator must NEVER write code, edit files, or do implementation work directly. ALL work — code, fixes, analysis, debugging, testing — must be routed to the appropriate team member (Simon, Grag, Otho, Joan). No exceptions. User directive after coordinator violated this rule by implementing arena routing, thread pool, and crash fixes directly instead of spawning agents.
+
+### DEC-012: Init command tolerates exit code 1 — parse errors non-fatal (Grag, 2026-03-30)
+**Status:** Implemented  
+`cmd_init.h::run_init()` now treats exit code 1 (parse errors) as a warning, not a fatal abort. Only exit codes > 1 (e.g. schema mismatch=3) abort. This allows `codetopo init` on large repos with unavoidable parse errors to still write MCP editor configs. Root cause chain: `cmd_index.cpp` returns 1 on parse errors → supervisor correctly classifies as non-crash → `cmd_init.h` previously treated any non-zero as fatal.
+
+### DEC-013: Supervisor exit code classification (Grag, 2026-03-30)
+**Status:** Implemented, build verified, all tests pass  
+Exit codes classified into categories: success (0), schema mismatch (3, no retry), normal error (1-2, log warning, propagate, NO crash recovery), actual crash (negative or >127, full crash recovery). Added `is_crash_exit_code()` helper returning `true` for `code < 0 || code > 127`. Prevents supervisor from doing a full cold restart (re-scan 162K files, re-resolve 2.87M edges) when the child simply had parse errors.
+
+### DEC-014: Deferred index rebuild for resolve_references (Otho, 2026-03-30)
+**Status:** Proposed (implemented, pending team review)  
+Split index rebuild into read-path (before resolver) and write-path (after resolver) phases. Disable FK checks during resolve. Delete stale cross-ref edges before re-insert. Merge Step 1+4 into single table scan. Increase batch commit 10K→100K. Expected 761s→~100-150s (5-7x). Trade-off: write-path indexes temporarily absent during resolve; acceptable given existing crash recovery.
+
+### DEC-015: Eliminate SQL join in resolve_references Step 6 (Otho, 2026-03-30)
+**Status:** Implemented, build + tests verified  
+Replaced 3-way SQL join (`refs × files × nodes`) in Step 6 with in-memory edge collection during Step 5's resolution loop. Edge tuples collected in a vector and batch-inserted via prepared statement. Eliminates the dominant cost center (~80% of total time). 761s→single-digit seconds for edge creation. All 173 tests pass (914 assertions).
+
+### DEC-016: Root cause analysis — 0xC0000409 crash on large codebases (Simon, 2026-03-30)
+**Status:** Diagnosis complete, fixes pending  
+Ranked root causes for STATUS_STACK_BUFFER_OVERRUN during 162K-file indexing: (1) HIGH 70% — Arena realloc with corrupt header → memcpy overrun in `arena.h`; fix: validate header, add magic number corruption detection. (2) MEDIUM 20% — SEH translator throwing C++ exception on stack overflow in `cmd_index.cpp`; fix: quick-exit instead of throw for EXCEPTION_STACK_OVERFLOW. (3) LOW 8% — Tree-sitter grammar external scanner buffer overflow; fix: audit scanners, update grammar deps. (4) LOW 2% — Supervisor quarantine window misalignment (amplifier, not root cause).
+
+### DEC-017: Slot system vs. simple futures — revert to futures + lightweight watchdog (Simon, 2026-03-30)
+**Status:** Decision made, implemented by Grag (DEC-024)  
+Discarded the SlotState/windowed submission system (690 lines) in favor of the committed simple futures model (339 lines) with a lightweight watchdog (~30 lines). The crash that motivated the slot design was root-caused in DEC-016 to arena header corruption and SEH mishandling — not thread management. Watchdog uses per-thread `atomic<int64_t>` timestamps + `cancel_flag` vectors; no slots, generations, or result queues. Keeps `_resetstkoflw()`, `parse_timeout_s`, quarantine rehab, and dual arena pool routing.
+
+### DEC-018: No interleaved file scheduling — largest-first sort must stay (Cristiano, 2026-03-30)
+**Status:** Standing directive  
+Interleaved file scheduling (mixing large and small files) was already tried and caused major slowness. The largest-first sort must stay. Do not propose interleaved scheduling as a fix.
+
+### DEC-019: Performance regression analysis — 5 root causes ranked (Otho, 2026-03-30)
+**Status:** Analysis complete, fixes implemented (DEC-021, DEC-022)  
+Regression from 700→300 files/s. Ranked causes: RC-1 (HIGH) 64MB committed thread stacks — 1.15GB for stacks alone; RC-2 (HIGH) largest-first sort + small window causes initial stall; RC-3 (MEDIUM) windowed submission starves workers during batch commits; RC-4 (MEDIUM-LOW) system malloc fallback memory leak in arena; RC-5 (LOW) non-inlined ts_arena_realloc. Combined fix expected to recover to 530-710 files/s.
+
+### DEC-020: Deep regression analysis — arena de-inline + extractor DFS are dominant costs (Otho, 2026-03-30)
+**Status:** Analysis complete, fixes implemented (DEC-022)  
+Previous analysis targeted wrong bottlenecks (stack/window). Actual 2x regression from two per-file hot path changes: RC-A (40-60%) arena allocator de-inlined — hundreds of millions of calls with function-call overhead; RC-B (30-50%) iterative DFS creates std::vector per file + chrono syscalls every 4096 nodes. Combined fix expected 286→450-600 files/s.
+
+### DEC-021: P0 fixes — thread stack 64→8MB, window thread_count+2 → thread_count*4 (Grag, 2026-03-30)
+**Status:** Implemented, build + tests verified  
+Stack: `_beginthreadex` with `flags=0` commits full size as physical RAM. 18×64MB=1.15GB → 18×8MB=144MB. Window: old +2 meant workers starved during batch SQLite commits; 4x multiplier provides buffer. Largest-first sort unchanged per DEC-018.
+
+### DEC-022: Deep fixes — arena re-inline + extractor DFS stack reuse (Grag, 2026-03-30)
+**Status:** Implemented, build + tests verified  
+Re-inlined `ts_arena_malloc/calloc/realloc/free` from arena.cpp back to arena.h. Extractor DFS stack changed to `thread_local static` (zero allocation after first file). Deadline check mask increased from 0xFFF to 0xFFFF (16x fewer steady_clock::now() syscalls). Expected +140-280 files/s.
+
+### DEC-023: Parse timeout wired up — fixes indexer hang on pathological files (Grag, 2026-03-31)
+**Status:** Implemented, build verified, all tests pass  
+Parser timeout and extractor timeout infrastructure existed but were never called in cmd_index.cpp worker lambda. Without timeout, tree-sitter on pathological files blocks forever; with futures[i].get() sequential consumption, this causes head-of-line blocking — apparent hang. Two-line fix: call `parser.set_timeout()` and pass `config.parse_timeout_s` to Extractor constructor.
+
+### DEC-024: Slot system reverted to simple futures + lightweight watchdog (Grag, 2026-03-30)
+**Status:** Implemented, build verified, all tests pass  
+Reverted cmd_index.cpp from SlotState/windowed submission (690 lines) to simple futures (545 lines, 21% reduction). Removed: SlotState struct, IndexedResult queue, try_submit_one(), window budgeting, complex watchdog. Restored: ThreadPool pool(thread_count) + futures.reserve(total) + sequential futures[i].get(). Added: WatchdogEntry struct (~30 lines) with thread_local slot, atomic timestamps, cancel flags. All prior arena/sort/batch/deferred-index work preserved.
+
+### DEC-025: Extractor deadline check frequency 0xFFFF→0xFFF (Grag, 2026-03-31)
+**Status:** Implemented, build + tests + benchmark verified  
+Extractor's deadline check was firing every 65536 nodes (0xFFFF mask), meaning large-AST files with 500K+ nodes only checked ~8 times — the deadline could be exceeded by 10-15 seconds before detection, tanking throughput to 213 files/s. Changed to every 4096 nodes (0xFFF mask). `steady_clock::now()` costs ~15ns so overhead is negligible (~60ns per 4096-node batch). `cancel_flag_` confirmed not wired up from cmd_index.cpp — deadline is sole enforcement and sufficient. DFS truncation correctly halts the walk via `result_->truncated` check. Benchmark: 55792 files at 395 files/s (up from 213), 12 timeouts caught, extract time 2609us/f. All 179 tests pass (939 assertions).
+
+### DEC-026: Remaining throughput gap analysis — 278 vs 829 files/s (Otho, 2026-03-31)
+**Status:** Analysis complete, recommendations pending implementation  
+Workers (16 threads) produce at 2,100+ files/s but single-threaded SQLite persist caps pipeline at 278 files/s. Per-file persist costs 3.6ms (5 re-prepared SQL statements, SQLITE_TRANSIENT string copies, DELETE-cascade on cold index). Recommendations ranked: R1 cache prepared statements + R2 SQLITE_STATIC (quick wins, +25-40%), R3 pipelined drain (moderate, +10-20%), R4 skip DELETE on cold index, R7 parallel WAL persist (nuclear option for >500 files/s). Worker optimization is exhausted — next gains must come from persist side.
+
+### DEC-027: SQLite prepared statement caching + SQLITE_STATIC (Grag, 2026-03-31)
+**Status:** Implemented and verified  
+Cached 6 prepared statements in Persister (lazily prepared, reused via `sqlite3_reset()` + `sqlite3_clear_bindings()`, finalized in destructor). Switched all `persist_file()` string binds from SQLITE_TRANSIENT to SQLITE_STATIC (source data lives through `sqlite3_step()`). Class now non-copyable/non-movable for RAII. Benchmark: 200s→136s wall time (-32%), 278→410 files/s (+47%). Contention spike from 0.9s→87.7s is expected — workers now outpace persist more, proving persist was the bottleneck. All 179 tests pass (939 assertions).
+
+### DEC-025: Thread pool sizing error — 72 threads created instead of 18 (Otho, 2026-03-30)
+**Status:** Analysis complete, actionable  
+ThreadPool constructed with `window_size` (72) instead of `thread_count` (18). Creates 4x oversubscription: 72 OS threads on 18 cores, 576MB committed stacks, 32 threads permanently blocked on arena pool. Context switching destroys cache locality for tree-sitter's memory-intensive parsing. One-line fix: `ThreadPool worker_pool(thread_count, 8*1024*1024)`. Also recommends `STACK_SIZE_PARAM_IS_A_RESERVATION` flag in `_beginthreadex` to reserve rather than commit stack memory.
+
+### DEC-026: Edges table — add UNIQUE constraint, defer with write-path indexes (Otho, 2026-03-30)
+**Status:** Proposed  
+`INSERT OR IGNORE INTO edges` has no UNIQUE constraint to ignore — it's a no-op. Recommended: add `UNIQUE INDEX idx_edges_unique ON edges(src_id, dst_id, kind)` but include it in `drop_bulk_indexes()`/deferred write-path rebuild per DEC-014 pattern. Best correctness with minimal bulk-insert cost.
+
+### DEC-027: Parse regression root cause — surgical per-file analysis (Otho, 2026-03-31)
+**Status:** Analysis complete  
+Examined 6 changed files line-by-line. Arena fast-path adds ~20µs/file (extra branch). Extractor iterative DFS adds ~300-800µs/file (TLS vector overhead + potential lambda non-inlining). Tree-sitter timeout polling adds ~15µs/file. Total from 6 files: ~0.3-0.8ms/file — explains only ~25% of the 3.3ms/file regression. Remaining 75% suspected in cmd_index.cpp changes (batch sizing, config plumbing) or I-cache pollution. Key finding: `inline` keyword provides ZERO benefit for arena functions called through function pointers (`ts_set_allocator`).
+
+### DEC-028: Profile results — extract phase is the regression killer (Otho, 2026-03-31)
+**Status:** Actionable findings  
+Per-phase profiling on 4145 C# files. With max-file-size 256KB: 829 files/s, zero contention — engine is fine for normal files. With max-file-size 1024KB: 45 files/s — extract blew up 13x (7.4s→98.7s thread-time) from unbounded extraction on large-AST files. Regression is tail-latency from ~0.1% pathological files. R1: add extraction timeout (highest priority). R2: lower default max-file-size to 512KB. R3: remove redundant tree-sitter set_timeout(30s). R4: log slow files.
+
+### DEC-029: Extraction timeout implementation — all R1-R4 recommendations (Grag, 2026-03-31)
+**Status:** Implemented, build + tests verified  
+Implemented all four DEC-028 recommendations. R1: Added `Config::extraction_timeout_s = 10` and `--extract-timeout` CLI flag on index and init subcommands; supervisor plumbs to child; Extractor constructor receives extraction-specific timeout. R2: Lowered `max_file_size_kb` default from 10240 to 512. R3: Removed redundant `parser.set_timeout(30s)` from cmd_index.cpp worker lambda (parse averages 1.8ms/file, never bottleneck). R4: Added `extract_us` field to ParsedFile; files exceeding 2 seconds log `[SLOW]` tag with timing and symbol count; summary line includes slow file count. Enabled Joan's blocked test (Scenario 4). Release build: 0 errors, 0 warnings. All 185 tests pass (964 assertions), up from 179 (939).
+
+### DEC-030: Extraction timeout test coverage — proactive suite (Joan, 2026-03-31)
+**Status:** Implemented, 6 tests passing  
+Added test_extraction_timeout.cpp with 6 test cases (5 live + 1 gated). Coverage: deadline truncation via cancel_flag (deterministic, 1000 functions → 20K+ nodes), generous timeout no-truncation, Config default max_file_size_kb==512 (R2), Config extraction_timeout_s field (R1), timeout_s=0 unlimited, truncated results contain partial data. Deterministic testing pattern: pre-set cancel_flag=1 to guarantee parse returns nullptr on first check, avoiding hardware variance. Tests validated R2-R5 immediately; test 4 gated until Grag added R1, then unblocked and passing. All 185 tests pass (964 assertions).
+
+### DEC-031: Profiling infrastructure — --max-files flag and profile_subset.bat (Otho, 2026-03-31)
+**Status:** Implemented, build + tests verified  
+Added `--max-files N` CLI flag on index and init subcommands to truncate scanned file list (0=unlimited); plumbed through Config → Scanner → Supervisor. Added profile_subset.bat with presets (tiny/small/fsm/medium/large/full) for fast iteration on large repos. Design: truncation after scanning (simpler, no scan loop changes). For large git repos, `--root` to subdirectory preferred over `--max-files` alone (avoids 72s git ls-files overhead). Profiling script deletes DB before each run for clean cold-index benchmarks. Validated: tiny (500 files, 10.4s), fsm (4145 files, 39.4s). All 179 tests pass (939 assertions).
+
+### DEC-032: Persist pipeline optimization — R3 batch drain + R4 cold index skip (Grag, 2026-03-31)
+**Status:** Implemented, build + benchmark verified  
+R3: Batch drain — main thread dequeues ALL available results from completion queue under a single lock instead of one-at-a-time. R4: Cold index flag — `enable_cold_index_if_empty()` queries files table; when empty, skips DELETE step in persist_file() (no-op on empty tables but has B-tree + FK cascade overhead). Benchmark (fsm, 4145 files): wall 36.2s→20.5s (-43%), persist 13.7s→6.2s (-55%, 3.3→1.5ms/file), overall 114→200 files/s (+76%). Contention rose from 0.1s→6.4s as expected — persist no longer dominant bottleneck; workers (parse+extract) now constrain pipeline.
+
+### DEC-033: Persist pipeline test conventions — WAL-safe temp directory pattern (Joan, 2026-03-31)
+**Status:** Implemented, 18 tests passing
+Key finding: Stale temp directories from previous test runs prevent deletion on Windows; Connection opens stale DB; ensure_schema silently preserves old data → false test failures. Established pattern: use `make_test_dir(name)` helper that cleanup BEFORE create_directories (in addition to existing DEC-008 cleanup-at-end pattern). This is backward-compatible with DEC-008. All DB-based tests now use this pattern. Added 18 comprehensive test cases (132 assertions) in `test_persist_pipeline.cpp` covering cold index, warm index, correctness, batch atomicity, and out-of-order drain scenarios. Full suite: 203 tests, 1096 assertions, all green.
+
+### DEC-034: ThreadPool stack fix + pipelined persist thread (Grag & Joan, 2026-04-01)
+**Status:** Implemented, build + tests verified
+**R1 (ThreadPool stack 64→8MB):** One-liner in `cmd_index.cpp:584` changing stack size parameter. `_beginthreadex` with `flags=0` commits full stack as physical RAM; 18×64MB=1.15GB → 18×8MB=144MB (saves 1GB+). Zero risk — tree-sitter recursion well within 8MB per profiling analysis. Thread stack sizing is backend-dependent; using `flags=0` (reserved, not committed) or proper flag setting on all platforms critical.
+
+**R2 (Pipelined persist thread):** Architectural refactor decoupling SQLite writes from worker result collection. Added `PersistQueue` (mutex+condvar with batch drain) and `PersistItem` structs in cmd_index.cpp. Dedicated `persist_thread` owns Persister, calls `begin_batch()`/`commit_batch()`, drains queue loop. Main thread: collects results, revives slots, refills pool, pushes queue, displays progress. `std::atomic<int> persisted_count` tracks actual commits. Progress file writes on persist thread after batch commits. Profiler note: `contention` phase now measures pure main-thread idle (waiting for workers), not persist-blocked time. High contention % is expected and healthy.
+
+**Build & Tests:** Release 0 errors/warnings. 208 tests (1112 assertions) all green. Joan also registered missing `test_persist_pipeline.cpp` (18 tests) in CMakeLists.
+
+**Benchmark (fsm, 4145 C# files):** 207 files/s, 20s wall. Persist 15.5s (4ms/file on dedicated thread, not blocking). Contention 19.4s (expected). Baseline DEC-032: 20.5s / 200 files/s. Pipeline maintains throughput while decoupling.
+
+**Finding: File node leak on re-persist (Joan).** Low severity. `persist_file()` cascades delete symbol nodes but file_nodes (file_id=NULL) survive. On re-insert, `stable_key UNIQUE` constraint silent (unchecked). Single-file warm persist harmless (existing tests pass). Batch re-persist: wrong file_node_id can cause edge references. Recommendation: explicit `DELETE FROM nodes WHERE node_type='file'` before file_node INSERT, or use `INSERT OR REPLACE`.
+
+**Next steps:** Prepared statement caching (DEC-027 pattern, ~1.5ms/file target). Cold index skip-DELETE flag. Parallel WAL persist may be unnecessary after caching. Monitor profiler idle vs contention distinction.
+
+### DEC-035: File Node Leak Fix — Explicit DELETE before INSERT (Grag, 2026-04-01)
+**Status:** Implemented, 207/208 tests pass (1 pre-existing timing flake)
+File nodes (`node_type='file'`, `file_id=NULL`) were not cascade-deleted when `persist_file()` re-persisted the same path. The `DELETE FROM files WHERE path = ?` cascades to symbol nodes (file_id=N) but not file nodes (file_id=NULL) because NULL doesn't participate in FK cascade. On re-insert, `stable_key UNIQUE` constraint silently failed. Batch re-persist scenarios: wrong `file_node_id` could collide with IDs from different tables. **Fix:** Added explicit `DELETE FROM nodes WHERE node_type='file' AND name = ?` immediately before file_node INSERT. Also added `sqlite3_step` return value check to catch and report `SQLITE_CONSTRAINT` errors. Files: `src/db/persister.h`. No prepared statement cache exists yet (DEC-027 pattern pending). Joan identified this issue during pipelined persist testing. **Decision:** Adopt this fix. Prepared statement caching (DEC-027) will reuse the DELETE+INSERT pattern at scale.
+
+### DEC-036: R2 Pipelined Persist Validation — 218 files/s Confirmed (Otho, 2026-04-01)
+**Status:** Profiling complete, recommendations ready
+Validated DEC-034 R2 pipelined persist thread at production scale (fsm, 4145 C# files). **Key metrics:** Indexing rate 218 files/s, persist/worker ratio 1.07:1 (nearly balanced), workers now the true ceiling. **Before vs After:** Persist/worker 2:1→1.07:1, persist % wall 42%→53% (off critical path). **New bottleneck:** WAL checkpoint 4.8s (16% wall), fully synchronous on main thread post-index. **Worker breakdown:** file_read 50% (29ms/file, I/O contention), parse 20% (20ms/file, irreducible tree-sitter), extract 9% (9ms/file, well-controlled). **R3a quick win:** WAL checkpoint during resolve_refs phase (hide 4.8s, low effort). **R3b:** SQLite stmt caching on persist thread (reduce 4→2-3ms/file). **R3c:** file_read prefetch/mmap (ceiling-limited, medium effort). **Scaling:** At 50K files, resolve phase becomes 100–200s offline bottleneck; parallel resolve (#5 in Simon's roadmap) becomes high-ROI. Decision: Implement R3a immediately as quick win.
+
+### DEC-037: Five Optimization Opportunities Ranked — 280–320 files/s Potential (Simon, 2026-04-01)
+**Status:** Analysis complete, Phase 1 ready for implementation
+Analyzed remaining optimization vectors after DEC-034 R1+R2. **Architecture assessment:** Indexer is well-designed. Persist pipeline correctly decoupled. Remaining gains are micro-optimizations: parser allocation, string comparison, I/O buffering — NOT structural changes.
+
+**Five opportunities (ranked by ROI):**
+
+1. **Pre-Allocated File Read Buffer (QUICK WIN)** — Impact: 5ms→3ms/file (40% faster I/O), Effort: 30min, Risk: Very low. Fix: Pre-allocate string to file size, single read instead of ostringstream. Expected +40 files/s.
+
+2. **Parser Object Pooling (SOLID WIN)** — Impact: Eliminate 4145 parser allocations + FFI calls, Effort: 2hr, Risk: Low. Thread-local unordered_map by language. Expected +15 files/s.
+
+3. **Language Dispatch Optimization (SOLID WIN)** — Impact: Eliminate millions of string comparisons in hot loop (extract), Effort: 1hr, Risk: Very low. Pre-compute enum, switch instead of if-chain. Expected +18 files/s (extract 6→5ms).
+
+4. **Thread-Local String Cache for Node Types (DIMINISHING RETURNS)** — Impact: Reduce allocations ~60%, Effort: 1.5hr, Risk: Low. Cache "function_definition" etc. Expected +8 files/s.
+
+5. **Parallel Resolve Phase (ADVANCED)** — Impact: Post-index 10–20s→2–5s offline, Effort: 4hr, Risk: Moderate. Partition refs by file_id. Does not affect indexing speed but improves total CLI latency.
+
+**Deprioritized:** Lazy resolve (architectural shift), Parallel WAL persist (unnecessary after DEC-034 R2, no measured lock contention), Vectored I/O (marginal gains).
+
+**Phase 1 (Quick Wins):** Implement #1, #3, #2 in parallel if possible. Expected 207→260–280 files/s, 3.5hr combined effort, low risk.
+
+**Phase 2 (Refinements):** Implement #4. Prepare #5 for code review. Expected 207→285–300 files/s, 5.5hr combined, low-moderate risk.
+
+**Combined projection:** All five opportunities → 280–320 files/s (+35–55%). Estimated gains conservative (±10%). Next step: Code review of Phase 1 candidates, then profile before/after on fsm (4145 files).
+
+**Design decisions locked in:**
+- **DEC-035a (Parser Reuse Pattern):** Parser objects created once per language, reused across files. Thread-local storage, no locks.
+- **DEC-036a (Language Dispatch Strategy):** Pre-computed enum, no string comparisons in hot loop, all logic via switch.
+- **DEC-037a (File Read Buffering):** Pre-allocate to exact size, no exponential growth, apply to all file sizes.
+
+### DEC-038: Heap Corruption Root Cause — Throughput-Dependent Arena Race + Parser Reuse (Simon, Grag, Otho, 2026-04-03)
+**Status:** Investigation complete, 5 root causes identified
+
+**Three-agent investigation findings:**
+
+**PRIMARY ROOT CAUSE:** Parser reuse optimization (DEC-037a, labeled DEC-039 OPT-5) is incompatible with arena-based memory management. At warm cache throughput (10K+ files/sec), arena lease/return cycle compresses from 1024ms (cold) to 3.2ms, creating a critical race window:
+
+1. Thread A parses file using arena N → tree-sitter allocates internal buffers via `ts_arena_malloc` in arena N
+2. Arena N is returned to pool and reset (offset=0, overflow ptrs freed)
+3. Thread B immediately leases arena N (within 3.2ms) for different file
+4. Thread A reuses thread-local Parser for new file, sets `t_current_arena = arena M`
+5. Tree-sitter's parser tries to realloc internal buffer (from arena N) → `ts_arena_realloc(ptr_from_arena_N, new_size)` with `t_current_arena = arena M`
+6. `arena_M.contains(ptr_from_arena_N)` returns FALSE → code reads header at `ptr_from_arena_N - HEADER_SIZE`
+7. **Arena N has been reset** or is in use by thread B → corrupted memory read → invalid size → memcpy overflow → heap corruption (0xC0000374) or stack buffer overrun (0xC0000791)
+
+**Timing model:**
+- Cold cache (500 f/s): Arena reuse interval = 1024ms, reset time <1ms, safety margin = 1023ms (safe)
+- Warm cache (10K f/s): Arena reuse interval = 3.2ms, reset time 1-5ms, safety margin = NEGATIVE (unsafe)
+
+**Five supporting issues identified:**
+1. **Arena Reset Race** (CRITICAL) — TreeGuard destructs after arena reused; arena-allocated memory still referenced
+2. **Trusted Header without Validation** (CRITICAL) — `arena_realloc` blindly trusts header size, amplifies #1
+3. **Stale thread_local Arena Pointer** (MEDIUM) — thread-local `t_current_arena` can point to reset/reused arena
+4. **Unbounded Result Queue** (MEDIUM) — grows to 50K+ items at 10K f/s, heap thrashing/fragmentation
+5. **Shutdown Sequence Race** (LOW) — ThreadPool destruction overlaps with ArenaPool destruction
+
+**Probability ranking by impact:**
+- Parser reuse dangling pointers (85%) — matches Grag's issue #1
+- Arena pool exhaustion race (85%) — matches Simon's issue #1 + Otho's throughput analysis
+- Unbounded queue heap thrashing (75%) — matches Otho's finding #2
+- Shutdown race (20%) — Simon's issue #5
+
+**Crash profile matches:** 7-10 crashes per 100K-162K file run only occur at warm cache because:
+- Window of vulnerability scales with throughput
+- Each file at 10K f/s increases chance of overlap (3.2ms window × N files × 16 threads)
+- Requires precise timing: arena reset during parser realloc during tree traversal
+- Probability ~0.005% per file (7/162K) but cumulative across run
+
+**Immediate fixes (recommended by Otho):**
+1. **Revert DEC-037a parser reuse** or force parser reset per arena change (eliminates dangling pointers) — CRITICAL
+2. **Increase arena pool from 32 to 64** (increases reuse interval from 3.2ms to 6.4ms) — HIGH PRIORITY
+3. **Bound result_queue to 1024 items** (provides back-pressure, eliminates heap thrashing) — HIGH PRIORITY
+
+**Expected impact:** Crash rate 10 per 100K → 1-2 per 100K with immediate fixes; 0 crashes with additional refcounting
+
+**Next phase fixes:**
+4. Add atomic refcount to Arena (prevent lease-during-reset)
+5. Explicit ThreadPool shutdown before ArenaPool destruction
+
+**Files analyzed:** `src/cli/cmd_index.cpp` (471-472, 423-433, 557-559, 810-820), `src/core/arena.h` (151-177, 76-89), `src/core/arena_pool.h` (25-42)
+
+**Details:** See `.squad/orchestration-log/2026-04-03T-heap-corruption-{simon,grag,otho}.md` for full analysis; see `.squad/log/2026-04-03T-heap-corruption-investigation.md` for investigation summary.
+
+---
+
+### DEC-039: Parser Reuse Incompatible with Arena Resets — Revert or Force Reset (Grag, 2026-04-03)
+**Status:** Actionable finding, blocks all deployments until fixed
+
+**Issue:** Thread-local parser reuse (DEC-037a, labeled OPT-5) caches internal tree-sitter buffers that become dangling pointers when arena is reset between files. This is **100% of observed heap corruption crashes** at high throughput per Grag's audit.
+
+**Root cause mechanism:**
+- Parser allocates internal buffers via `ts_arena_malloc` → buffers stored in arena N's memory
+- When arena N is reset (offset=0, overflow ptrs freed), buffers are inaccessible
+- Parser still holds pointers to those buffers for next parse
+- Next parse uses arena M → parser realloc tries to realloc old buffers (from arena N) using arena M allocator
+- `arena_M.contains(ptr_from_arena_N)` returns FALSE → blind header dereference → corruption
+
+**Three proposed fixes (ranked by risk/benefit):**
+
+1. **OPTION A (SAFEST, RECOMMENDED):** Revert parser reuse — create new Parser per file
+   - Change: `thread_local std::unordered_map<std::string, Parser> t_parsers;` → `Parser parser;` (local per file)
+   - Risk: ZERO (pure revert to pre-optimization)
+   - Perf impact: -15 files/s (negligible vs heap corruption)
+   - Effort: 5 minutes
+   - Verdict: **IMPLEMENT IMMEDIATELY**
+
+2. **Option B:** Force parser reset when switching arenas
+   - Tree-sitter API does not support `parser.reset_internal_state()`
+   - Fallback: Delete and recreate parser every N files (amortize cost)
+   - Risk: Still has race window (parser reused across files)
+   - Not recommended
+
+3. **Option C:** One parser per arena (architectural)
+   - Store parser map in ArenaPool
+   - Parse with current arena → reuse parser for same arena → reset parser when arena resets
+   - Risk: Moderate, requires refactoring ArenaPool interface
+   - Benefit: Keeps parser reuse optimization while eliminating dangling pointers
+   - Effort: 3-4 hours
+   - Future option if performance needs require parser reuse
+
+**Immediate action:** Implement Option A (revert). Expected: zero heap corruption crashes in subsequent benchmarks.
+
+**Timeline:** Blocking deployment until fixed. Must revert before DEC-037 Phase 1 optimization is merged.
+
 ## Governance
 
 - All meaningful changes require team consensus
