@@ -199,7 +199,7 @@ Managed via [vcpkg](https://vcpkg.io/):
 
 ## Performance
 
-Benchmarked on a 450K‑file enterprise C++/C# repository (DsMainDev), Windows, 16 threads, NVMe SSD:
+Benchmarked on a 450K‑file enterprise C++/C# repository, Windows, 16 threads, NVMe SSD:
 
 | Scale | Time | Throughput | Symbols | Edges |
 |-------|------|-----------|---------|-------|
