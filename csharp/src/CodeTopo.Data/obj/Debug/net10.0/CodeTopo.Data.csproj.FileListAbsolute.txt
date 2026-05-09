@@ -1,0 +1,16 @@
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/bin/Debug/net10.0/CodeTopo.Data.deps.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/bin/Debug/net10.0/CodeTopo.Data.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/bin/Debug/net10.0/CodeTopo.Data.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/bin/Debug/net10.0/CodeTopo.Contracts.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/bin/Debug/net10.0/CodeTopo.Contracts.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.csproj.AssemblyReference.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.GeneratedMSBuildEditorConfig.editorconfig
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.AssemblyInfoInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.AssemblyInfo.cs
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.csproj.CoreCompileInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.sourcelink.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.0F601356.Up2Date
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/refint/CodeTopo.Data.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/CodeTopo.Data.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Data/obj/Debug/net10.0/ref/CodeTopo.Data.dll

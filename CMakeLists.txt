@@ -90,6 +90,7 @@ set(CODETOPO_SOURCES
     src/index/extractor.cpp
     src/index/supervisor.cpp
     src/mcp/tools.cpp
+    src/mcp/envelope.cpp
     src/util/process.cpp
 )
 
@@ -149,6 +150,7 @@ set(CODETOPO_LIB_SOURCES
     src/index/extractor.cpp
     src/index/supervisor.cpp
     src/mcp/tools.cpp
+    src/mcp/envelope.cpp
     src/util/process.cpp
 )
 

@@ -1,0 +1,16 @@
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/bin/Debug/net8.0/CodeTopo.Client.deps.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/bin/Debug/net8.0/CodeTopo.Client.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/bin/Debug/net8.0/CodeTopo.Client.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/bin/Debug/net8.0/CodeTopo.Contracts.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/bin/Debug/net8.0/CodeTopo.Contracts.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.csproj.AssemblyReference.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.GeneratedMSBuildEditorConfig.editorconfig
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.AssemblyInfoInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.AssemblyInfo.cs
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.csproj.CoreCompileInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.sourcelink.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.1FF7738D.Up2Date
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/refint/CodeTopo.Client.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/CodeTopo.Client.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Client/obj/Debug/net8.0/ref/CodeTopo.Client.dll

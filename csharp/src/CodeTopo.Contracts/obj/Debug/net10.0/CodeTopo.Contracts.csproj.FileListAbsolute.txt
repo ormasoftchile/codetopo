@@ -1,0 +1,12 @@
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/bin/Debug/net10.0/CodeTopo.Contracts.deps.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/bin/Debug/net10.0/CodeTopo.Contracts.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/bin/Debug/net10.0/CodeTopo.Contracts.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.GeneratedMSBuildEditorConfig.editorconfig
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.AssemblyInfoInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.AssemblyInfo.cs
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.csproj.CoreCompileInputs.cache
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.sourcelink.json
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/refint/CodeTopo.Contracts.dll
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/CodeTopo.Contracts.pdb
+/Users/cristianormazabal/Projects/codetopo/csharp/src/CodeTopo.Contracts/obj/Debug/net10.0/ref/CodeTopo.Contracts.dll

@@ -2,7 +2,8 @@
 // Split from tools.h — definitions moved here to reduce compile times.
 
 #include "mcp/tools.h"
-
+#include "mcp/envelope.h"
+#include "util/tokens.h"
 #include "util/path.h"
 #include "util/git.h"
 #include "mcp/error.h"
@@ -48,6 +49,61 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache&
     if (sqlite3_step(stmt) == SQLITE_ROW) return sqlite3_column_int64(stmt, 0);
     return -1;
 }
+
+// v2-Tokens Phase 1: Heuristic ranking helpers
+namespace {
+
+// Phase 1 ranking score for a result item.
+// Heuristic: visibility (3×) + proximity (2×) + term_frequency (1×)
+struct RankScore {
+    double visibility_score = 0.0;     // public/exported > internal > private
+    double proximity_score = 0.0;      // file-tree distance from query origin (closer = higher)
+    double term_frequency_score = 0.0; // symbol/file appears often in graph
+    
+    double total() const {
+        return 3.0 * visibility_score + 2.0 * proximity_score + 1.0 * term_frequency_score;
+    }
+    
+    // Tie-breaker: file path alphabetical (for deterministic output)
+    std::string file_path;
+};
+
+// Compute visibility score: public > internal > private
+inline double compute_visibility_score(const std::string& kind) {
+    // Simple heuristic: "function", "class", "struct" default to public visibility
+    // "static", "private", "internal" modifiers would need more parsing
+    // For Phase 1, we approximate: all symbols get moderate visibility
+    // Future: parse "static" from signatures, use visibility column
+    return 0.5; // neutral default; Phase 2 will use real visibility data
+}
+
+// Compute file-tree proximity: closer to query origin = higher
+// For Phase 1, we just use a simple directory depth heuristic
+inline double compute_proximity_score(const std::string& query_file, const std::string& result_file) {
+    if (query_file.empty() || result_file.empty()) return 0.5;
+    
+    // Count common path prefix
+    size_t common = 0;
+    size_t max_len = std::min(query_file.size(), result_file.size());
+    for (size_t i = 0; i < max_len; ++i) {
+        if (query_file[i] == result_file[i]) common++;
+        else break;
+    }
+    
+    // Normalize: same directory = 1.0, different = 0.0
+    double proximity = static_cast<double>(common) / std::max(query_file.size(), result_file.size());
+    return proximity;
+}
+
+// Compute term frequency: how often symbol appears (mock for Phase 1)
+// Phase 2 will use actual graph degree (number of incoming + outgoing edges)
+inline double compute_term_frequency_score(int64_t /* node_id */, Connection& /* conn */) {
+    // Phase 1: all symbols get equal term frequency (neutral)
+    // Phase 2: SELECT COUNT(*) FROM edges WHERE src_id = ? OR dst_id = ?
+    return 0.5;
+}
+
+} // anonymous namespace
 
 // T060: server_info
 std::string server_info(yyjson_val* /*params*/, Connection& conn,
@@ -1724,68 +1780,244 @@ std::string shortest_path(yyjson_val* params, Connection& conn,
 // T089: find_implementations — find types that inherit from a base
 std::string find_implementations(yyjson_val* params, Connection& conn,
                                          QueryCache& cache, const std::string& /*repo_root*/) {
-    const char* symbol = params ? json_get_str(params, "symbol") : nullptr;
-    if (!symbol) return McpError::invalid_input("Missing 'symbol' parameter").to_json_rpc(0);
+    if (!params) return McpError::invalid_input("Missing parameters").to_json_rpc(0);
 
-    int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
-    if (limit > 500) limit = 500;
-
-    // First, find the base type node(s) by name
-    auto* name_stmt = cache.get("find_impl_base",
-        "SELECT id FROM nodes WHERE name = ? AND node_type = 'symbol' "
-        "AND kind IN ('class', 'struct', 'interface', 'type', 'trait') LIMIT 10");
-    sqlite3_bind_text(name_stmt, 1, symbol, -1, SQLITE_TRANSIENT);
-
-    std::vector<int64_t> base_ids;
-    while (sqlite3_step(name_stmt) == SQLITE_ROW) {
-        base_ids.push_back(sqlite3_column_int64(name_stmt, 0));
+    // Extract v2-Tokens params
+    int64_t max_tokens = mcp::get_max_tokens(params);
+    std::string cursor_str = mcp::get_cursor_param(params);
+    mcp::Cursor cursor;
+    if (!cursor_str.empty() && !mcp::Cursor::decode(cursor_str, cursor)) {
+        return McpError::invalid_input("Invalid cursor").to_json_rpc(0);
     }
 
-    if (base_ids.empty()) {
-        return McpError::not_found(std::string("No base type found: ") + symbol).to_json_rpc(0);
-    }
+    int64_t limit = json_get_int(params, "limit", 100);
+    if (limit < 0) limit = 0;
+    if (limit > 1000) limit = 1000;
 
-    JsonMutDoc doc;
-    auto* root = doc.new_obj();
-    doc.set_root(root);
-    yyjson_mut_obj_add_strcpy(doc.doc, root, "base_symbol", symbol);
-    auto* results = doc.new_arr();
+    struct BaseNode { int64_t id; std::string name; };
+    std::vector<BaseNode> bases;
 
-    std::unordered_set<int64_t> seen;
-    for (int64_t base_id : base_ids) {
-        auto* stmt = cache.get("find_impl_inherits",
-            "SELECT n.id, n.name, n.qualname, n.kind, n.signature, f.path "
-            "FROM edges e JOIN nodes n ON e.src_id = n.id "
-            "LEFT JOIN files f ON n.file_id = f.id "
-            "WHERE e.dst_id = ? AND e.kind = 'inherits' "
-            "LIMIT ?");
-        sqlite3_bind_int64(stmt, 1, base_id);
-        sqlite3_bind_int64(stmt, 2, limit);
+    int64_t node_id = json_get_int(params, "node_id", -1);
+    if (node_id >= 0) {
+        auto* stmt = cache.get("find_impl_base_by_id",
+            "SELECT id, name FROM nodes WHERE id = ? AND node_type = 'symbol'");
+        sqlite3_bind_int64(stmt, 1, node_id);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            return McpError::not_found("Symbol not found: " + std::to_string(node_id)).to_json_rpc(0);
+        }
+        bases.push_back({sqlite3_column_int64(stmt, 0),
+                         reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))});
+    } else {
+        const char* symbol = json_get_str(params, "symbol");
+        if (!symbol) return McpError::invalid_input("Missing 'node_id' or 'symbol' parameter").to_json_rpc(0);
 
+        const char* file = json_get_str(params, "file");
+        std::string sql =
+            "SELECT n.id, n.name FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE n.node_type = 'symbol' "
+            "AND n.kind IN ('class', 'struct', 'interface', 'type', 'trait') "
+            "AND (n.name = ? OR n.qualname = ?)";
+        std::string cache_key = "find_impl_base_by_symbol";
+        if (file && strlen(file) > 0) {
+            sql += " AND f.path = ?";
+            cache_key += "_file";
+        }
+        sql += " ORDER BY n.is_definition DESC, n.id ASC LIMIT 10";
+
+        auto* stmt = cache.get(cache_key, sql);
+        sqlite3_bind_text(stmt, 1, symbol, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, symbol, -1, SQLITE_TRANSIENT);
+        if (file && strlen(file) > 0) sqlite3_bind_text(stmt, 3, file, -1, SQLITE_TRANSIENT);
         while (sqlite3_step(stmt) == SQLITE_ROW) {
-            int64_t nid = sqlite3_column_int64(stmt, 0);
-            if (!seen.insert(nid).second) continue;
-
-            auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "node_id", nid);
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-            auto* qn = sqlite3_column_text(stmt, 2);
-            if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname",
-                reinterpret_cast<const char*>(qn));
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
-                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
-            auto* sig = sqlite3_column_text(stmt, 4);
-            if (sig) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature",
-                reinterpret_cast<const char*>(sig));
-            auto* fp = sqlite3_column_text(stmt, 5);
-            if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path",
-                reinterpret_cast<const char*>(fp));
-            yyjson_mut_arr_append(results, item);
+            bases.push_back({sqlite3_column_int64(stmt, 0),
+                             reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))});
+        }
+        if (bases.empty()) {
+            return McpError::not_found(std::string("No base type found: ") + symbol).to_json_rpc(0);
         }
     }
 
+    struct ImplRow {
+        int64_t id;
+        std::string name;
+        std::string qualname;
+        std::string kind;
+        std::string signature;
+        std::string file;
+        int line;
+        RankScore rank;
+    };
+
+    std::vector<ImplRow> rows;
+    std::unordered_set<int64_t> seen;
+
+    for (const auto& base : bases) {
+        auto* stmt = cache.get("find_impl_inherits",
+            "SELECT n.id, n.name, n.qualname, n.kind, n.signature, f.path, n.start_line "
+            "FROM edges e JOIN nodes n ON e.src_id = n.id "
+            "LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE e.dst_id = ? AND e.kind = 'inherits' "
+            "ORDER BY f.path, n.start_line, n.id");
+        sqlite3_bind_int64(stmt, 1, base.id);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t id = sqlite3_column_int64(stmt, 0);
+            if (!seen.insert(id).second) continue;
+
+            auto* qn = sqlite3_column_text(stmt, 2);
+            auto* sig = sqlite3_column_text(stmt, 4);
+            auto* fp = sqlite3_column_text(stmt, 5);
+            std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+            
+            ImplRow row{
+                id,
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
+                qn ? reinterpret_cast<const char*>(qn) : "",
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
+                sig ? reinterpret_cast<const char*>(sig) : "",
+                file_path,
+                sqlite3_column_int(stmt, 6),
+                {}
+            };
+            
+            // Compute ranking scores (Phase 1 heuristic)
+            row.rank.visibility_score = compute_visibility_score(row.kind);
+            row.rank.proximity_score = 0.5; // no query file context for implementations
+            row.rank.term_frequency_score = compute_term_frequency_score(id, conn);
+            row.rank.file_path = file_path;
+            
+            rows.push_back(std::move(row));
+        }
+    }
+
+    int64_t total_results = static_cast<int64_t>(rows.size());
+
+    // Apply ranking if max_tokens is set
+    bool ranked = (max_tokens > 0);
+    if (ranked) {
+        std::sort(rows.begin(), rows.end(), [](const ImplRow& a, const ImplRow& b) {
+            double score_a = a.rank.total();
+            double score_b = b.rank.total();
+            if (std::abs(score_a - score_b) > 1e-6) return score_a > score_b;
+            // Tie-breaker: alphabetical by file path
+            return a.rank.file_path < b.rank.file_path;
+        });
+    }
+
+    // Apply cursor offset
+    size_t start_offset = cursor.offset > 0 ? static_cast<size_t>(cursor.offset) : 0;
+    if (start_offset >= rows.size()) {
+        // Cursor past end — return empty with meta
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        doc.set_root(root);
+        if (bases.size() == 1) {
+            yyjson_mut_obj_add_int(doc.doc, root, "base_node_id", bases.front().id);
+            yyjson_mut_obj_add_strcpy(doc.doc, root, "base_symbol", bases.front().name.c_str());
+        }
+        auto* implementations = doc.new_arr();
+        yyjson_mut_obj_add_val(doc.doc, root, "implementations", implementations);
+        
+        // Backward-compat: also add empty "results"
+        auto* results = doc.new_arr();
+        yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+        
+        mcp::MetaBlock meta;
+        meta.tokens_estimated = 50; // empty response
+        meta.tokens_budget = max_tokens;
+        meta.truncated = false;
+        meta.next_cursor = "";
+        meta.ranking_algorithm = ranked ? "heuristic-v1" : "none";
+        if (ranked) meta.ranking_signals = {"visibility", "proximity", "term_frequency"};
+        meta.add_to_json(doc.doc, root);
+        
+        return doc.to_string();
+    }
+
+    // Pack results into token budget
+    std::vector<size_t> selected_indices;
+    int64_t accumulated_tokens = 100; // base overhead for JSON structure
+    bool truncated = false;
+    std::string next_cursor;
+
+    for (size_t i = start_offset; i < rows.size(); ++i) {
+        // Estimate tokens for this result item
+        int64_t item_tokens = 50 + // base object overhead
+            tokens::estimate_token_count(rows[i].name) +
+            tokens::estimate_token_count(rows[i].qualname) +
+            tokens::estimate_token_count(rows[i].signature) +
+            tokens::estimate_token_count(rows[i].file);
+        
+        if (max_tokens > 0 && accumulated_tokens + item_tokens > max_tokens && !selected_indices.empty()) {
+            truncated = true;
+            mcp::Cursor next{};
+            next.offset = static_cast<int64_t>(i);
+            next_cursor = next.encode();
+            break;
+        }
+        
+        selected_indices.push_back(i);
+        accumulated_tokens += item_tokens;
+        
+        if (static_cast<int64_t>(selected_indices.size()) >= limit) {
+            if (i + 1 < rows.size()) {
+                truncated = true;
+                mcp::Cursor next{};
+                next.offset = static_cast<int64_t>(i + 1);
+                next_cursor = next.encode();
+            }
+            break;
+        }
+    }
+
+    // Build JSON response
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    if (bases.size() == 1) {
+        yyjson_mut_obj_add_int(doc.doc, root, "base_node_id", bases.front().id);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "base_symbol", bases.front().name.c_str());
+    }
+
+    auto emit_row = [&](const ImplRow& row) -> yyjson_mut_val* {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", row.id);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", row.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", row.kind.c_str());
+        if (!row.qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", row.qualname.c_str());
+        if (!row.signature.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", row.signature.c_str());
+        if (!row.file.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", row.file.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", row.file.c_str());
+        }
+        yyjson_mut_obj_add_int(doc.doc, item, "line", row.line);
+        return item;
+    };
+
+    auto* implementations = doc.new_arr();
+    for (size_t idx : selected_indices) {
+        yyjson_mut_arr_append(implementations, emit_row(rows[idx]));
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "implementations", implementations);
+    
+    // Backward-compat: duplicate to "results" array
+    auto* results = doc.new_arr();
+    for (size_t idx : selected_indices) {
+        yyjson_mut_arr_append(results, emit_row(rows[idx]));
+    }
     yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+
+    // Add _meta block (Phase 1 always includes it)
+    std::string final_json = doc.to_string(); // temporary serialize to count tokens
+    mcp::MetaBlock meta;
+    meta.tokens_estimated = tokens::estimate_json_tokens(final_json);
+    meta.tokens_budget = max_tokens;
+    meta.truncated = truncated;
+    meta.next_cursor = next_cursor;
+    meta.ranking_algorithm = ranked ? "heuristic-v1" : "none";
+    if (ranked) meta.ranking_signals = {"visibility", "proximity", "term_frequency"};
+    meta.add_to_json(doc.doc, root);
+    
     return doc.to_string();
 }
 
