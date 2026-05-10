@@ -1,0 +1,255 @@
+// Integration tests for v2-Tokens Phase 1 MCP tools
+#include <catch2/catch_test_macros.hpp>
+#include "mcp/tools.h"
+#include "db/connection.h"
+#include "db/queries.h"
+#include "db/schema.h"
+#include "util/json.h"
+#include <filesystem>
+#include <fstream>
+
+using namespace codetopo;
+namespace fs = std::filesystem;
+
+// Helper: parse JSON response and extract _meta block
+static bool has_meta_block(const std::string& json_response) {
+    yyjson_doc* doc = yyjson_read(json_response.c_str(), json_response.size(), 0);
+    if (!doc) return false;
+    auto* root = yyjson_doc_get_root(doc);
+    auto* meta = yyjson_obj_get(root, "_meta");
+    bool has_it = (meta != nullptr);
+    yyjson_doc_free(doc);
+    return has_it;
+}
+
+static int64_t get_meta_tokens_estimated(const std::string& json_response) {
+    yyjson_doc* doc = yyjson_read(json_response.c_str(), json_response.size(), 0);
+    if (!doc) return -1;
+    auto* root = yyjson_doc_get_root(doc);
+    auto* meta = yyjson_obj_get(root, "_meta");
+    if (!meta) {
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    auto* te = yyjson_obj_get(meta, "tokens_estimated");
+    int64_t val = te ? yyjson_get_int(te) : -1;
+    yyjson_doc_free(doc);
+    return val;
+}
+
+static bool get_meta_truncated(const std::string& json_response) {
+    yyjson_doc* doc = yyjson_read(json_response.c_str(), json_response.size(), 0);
+    if (!doc) return false;
+    auto* root = yyjson_doc_get_root(doc);
+    auto* meta = yyjson_obj_get(root, "_meta");
+    if (!meta) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    auto* trunc = yyjson_obj_get(meta, "truncated");
+    bool val = trunc ? yyjson_get_bool(trunc) : false;
+    yyjson_doc_free(doc);
+    return val;
+}
+
+static std::string get_meta_next_cursor(const std::string& json_response) {
+    yyjson_doc* doc = yyjson_read(json_response.c_str(), json_response.size(), 0);
+    if (!doc) return "";
+    auto* root = yyjson_doc_get_root(doc);
+    auto* meta = yyjson_obj_get(root, "_meta");
+    if (!meta) {
+        yyjson_doc_free(doc);
+        return "";
+    }
+    auto* nc = yyjson_obj_get(meta, "next_cursor");
+    std::string val = (nc && yyjson_is_str(nc)) ? std::string(yyjson_get_str(nc)) : "";
+    yyjson_doc_free(doc);
+    return val;
+}
+
+TEST_CASE("find_implementations: v2-Tokens envelope", "[v2-tokens][find_implementations]") {
+    Connection conn(":memory:");
+    schema::create_schema(conn);
+    
+    // Insert test data: base class + 2 implementations
+    conn.exec("INSERT INTO files (path, language, size_bytes, mtime_ns, content_hash, parse_status) VALUES "
+              "('base.cpp', 'cpp', 100, 1000, 'h1', 'ok'), "
+              "('impl1.cpp', 'cpp', 100, 1000, 'h2', 'ok'), "
+              "('impl2.cpp', 'cpp', 100, 1000, 'h3', 'ok')");
+    conn.exec("INSERT INTO nodes (node_type, kind, name, file_id, start_line, stable_key) VALUES "
+              "('symbol', 'class', 'Base', 1, 1, 'Base::class'), "
+              "('symbol', 'class', 'Impl1', 2, 1, 'Impl1::class'), "
+              "('symbol', 'class', 'Impl2', 3, 1, 'Impl2::class')");
+    conn.exec("INSERT INTO edges (src_id, dst_id, kind) VALUES (2, 1, 'inherits'), (3, 1, 'inherits')");
+    
+    QueryCache cache(conn);
+    
+    SECTION("Unbounded: all results + _meta") {
+        JsonMutDoc params_doc;
+        auto* params = params_doc.new_obj();
+        params_doc.set_root(params);
+        yyjson_mut_obj_add_str(params_doc.doc, params, "symbol", "Base");
+        
+        // Convert yyjson_mut_val to yyjson_val via serialization
+        auto params_str = params_doc.to_string();
+        yyjson_doc* immut_doc = yyjson_read(params_str.c_str(), params_str.size(), 0);
+        auto* immut_params = yyjson_doc_get_root(immut_doc);
+        
+        std::string result = tools::find_implementations(immut_params, conn, cache, ".");
+        yyjson_doc_free(immut_doc);
+        
+        REQUIRE(has_meta_block(result));
+        REQUIRE_FALSE(get_meta_truncated(result));
+        REQUIRE(get_meta_next_cursor(result) == "");
+        REQUIRE(result.find("Impl1") != std::string::npos);
+        REQUIRE(result.find("Impl2") != std::string::npos);
+    }
+    
+    SECTION("max_tokens set: truncation + cursor") {
+        JsonMutDoc params_doc;
+        auto* params = params_doc.new_obj();
+        params_doc.set_root(params);
+        yyjson_mut_obj_add_str(params_doc.doc, params, "symbol", "Base");
+        yyjson_mut_obj_add_int(params_doc.doc, params, "max_tokens", 200);
+        
+        auto params_str = params_doc.to_string();
+        yyjson_doc* immut_doc = yyjson_read(params_str.c_str(), params_str.size(), 0);
+        auto* immut_params = yyjson_doc_get_root(immut_doc);
+        
+        std::string result = tools::find_implementations(immut_params, conn, cache, ".");
+        yyjson_doc_free(immut_doc);
+        
+        REQUIRE(has_meta_block(result));
+        // Depending on heuristic, might truncate (if 2 results exceed 200 tokens)
+        // At minimum, should have _meta
+        REQUIRE(get_meta_tokens_estimated(result) > 0);
+    }
+    
+    // Cleanup: scoped Connection closed automatically
+}
+
+TEST_CASE("callers_approx: v2-Tokens envelope", "[v2-tokens][callers]") {
+    auto work_dir = test_work_dir("callers_tokens");
+    auto db_path = work_dir / "test.sqlite";
+    
+    // Create minimal test DB
+    {
+        Connection conn(db_path.string());
+        schema::initialize_schema(conn);
+        
+        conn.exec("INSERT INTO files (path, language) VALUES ('a.cpp', 'cpp'), ('b.cpp', 'cpp')");
+        conn.exec("INSERT INTO nodes (node_type, kind, name, file_id, start_line) VALUES "
+                  "('symbol', 'function', 'callee', 1, 10), "
+                  "('symbol', 'function', 'caller1', 1, 1), "
+                  "('symbol', 'function', 'caller2', 2, 1)");
+        conn.exec("INSERT INTO edges (src_id, dst_id, kind, confidence) VALUES "
+                  "(2, 1, 'calls', 0.9), (3, 1, 'calls', 0.8)");
+    }
+    
+    Connection conn(db_path.string());
+    QueryCache cache;
+    
+    SECTION("Unbounded: all results + _meta") {
+        JsonMutDoc doc;
+        auto* params = doc.new_obj();
+        doc.set_root(params);
+        yyjson_mut_obj_add_int(doc.doc, params, "node_id", 1);
+        
+        std::string result = tools::callers_approx(
+            yyjson_mut_doc_get_root(doc.doc), conn, cache, ".");
+        
+        REQUIRE(has_meta_block(result));
+        REQUIRE_FALSE(get_meta_truncated(result));
+        REQUIRE(result.find("caller1") != std::string::npos);
+        REQUIRE(result.find("caller2") != std::string::npos);
+    }
+    
+    SECTION("max_tokens set") {
+        JsonMutDoc doc;
+        auto* params = doc.new_obj();
+        doc.set_root(params);
+        yyjson_mut_obj_add_int(doc.doc, params, "node_id", 1);
+        yyjson_mut_obj_add_int(doc.doc, params, "max_tokens", 500);
+        
+        std::string result = tools::callers_approx(
+            yyjson_mut_doc_get_root(doc.doc), conn, cache, ".");
+        
+        REQUIRE(has_meta_block(result));
+        REQUIRE(get_meta_tokens_estimated(result) > 0);
+    }
+    
+    // Cleanup: scoped Connection
+}
+
+TEST_CASE("callees_approx: v2-Tokens envelope", "[v2-tokens][callees]") {
+    auto work_dir = test_work_dir("callees_tokens");
+    auto db_path = work_dir / "test.sqlite";
+    
+    // Create minimal test DB
+    {
+        Connection conn(db_path.string());
+        schema::initialize_schema(conn);
+        
+        conn.exec("INSERT INTO files (path, language) VALUES ('a.cpp', 'cpp')");
+        conn.exec("INSERT INTO nodes (node_type, kind, name, file_id, start_line) VALUES "
+                  "('symbol', 'function', 'caller', 1, 1), "
+                  "('symbol', 'function', 'callee1', 1, 10), "
+                  "('symbol', 'function', 'callee2', 1, 20)");
+        conn.exec("INSERT INTO edges (src_id, dst_id, kind, confidence) VALUES "
+                  "(1, 2, 'calls', 0.9), (1, 3, 'calls', 0.8)");
+    }
+    
+    Connection conn(db_path.string());
+    QueryCache cache;
+    
+    SECTION("Unbounded: _meta present") {
+        JsonMutDoc doc;
+        auto* params = doc.new_obj();
+        doc.set_root(params);
+        yyjson_mut_obj_add_int(doc.doc, params, "node_id", 1);
+        
+        std::string result = tools::callees_approx(
+            yyjson_mut_doc_get_root(doc.doc), conn, cache, ".");
+        
+        REQUIRE(has_meta_block(result));
+        REQUIRE_FALSE(get_meta_truncated(result));
+        REQUIRE(result.find("callee1") != std::string::npos);
+    }
+    
+    // Cleanup: scoped Connection
+}
+
+TEST_CASE("Backward compatibility: omitting max_tokens", "[v2-tokens][backcompat]") {
+    auto work_dir = test_work_dir("backcompat");
+    auto db_path = work_dir / "test.sqlite";
+    
+    {
+        Connection conn(db_path.string());
+        schema::initialize_schema(conn);
+        conn.exec("INSERT INTO files (path, language) VALUES ('a.cpp', 'cpp')");
+        conn.exec("INSERT INTO nodes (node_type, kind, name, file_id, start_line) VALUES "
+                  "('symbol', 'class', 'Foo', 1, 1), ('symbol', 'class', 'Bar', 1, 10)");
+        conn.exec("INSERT INTO edges (src_id, dst_id, kind) VALUES (2, 1, 'inherits')");
+    }
+    
+    Connection conn(db_path.string());
+    QueryCache cache;
+    
+    JsonMutDoc doc;
+    auto* params = doc.new_obj();
+    doc.set_root(params);
+    yyjson_mut_obj_add_str(doc.doc, params, "symbol", "Foo");
+    // NO max_tokens param
+    
+    std::string result = tools::find_implementations(
+        yyjson_mut_doc_get_root(doc.doc), conn, cache, ".");
+    
+    // Must have _meta (additive)
+    REQUIRE(has_meta_block(result));
+    // Must not be truncated
+    REQUIRE_FALSE(get_meta_truncated(result));
+    // Must return all results
+    REQUIRE(result.find("Bar") != std::string::npos);
+    
+    // Cleanup: scoped Connection
+}

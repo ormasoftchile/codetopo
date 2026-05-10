@@ -128,6 +128,7 @@ set(CODETOPO_TEST_SOURCES
     tests/integration/test_index_real_repo.cpp
     tests/integration/test_mcp_enhancements.cpp
     tests/integration/test_mcp_round_trip.cpp
+    tests/integration/test_v2_tokens_integration.cpp
     tests/integration/test_watch.cpp
     tests/unit/test_change_detect.cpp
     tests/unit/test_cli_exit_codes.cpp
@@ -140,6 +141,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
     tests/unit/test_stable_key.cpp
+    tests/unit/test_v2_tokens_unit.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
