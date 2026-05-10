@@ -731,12 +731,23 @@ std::string symbol_get_batch(yyjson_val* params, Connection& conn,
 
 // T066: callers_approx
 std::string callers_approx(yyjson_val* params, Connection& conn,
-                                    QueryCache& cache, const std::string& repo_root) {
+                                    QueryCache& cache, const std::string& /*repo_root*/) {
     int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
-    int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
-    if (limit > 500) limit = 500;
+    int64_t max_tokens = mcp::get_max_tokens(params);
+    std::string cursor_str = mcp::get_cursor_param(params);
+    mcp::Cursor cursor;
+    if (!cursor_str.empty() && !mcp::Cursor::decode(cursor_str, cursor)) {
+        return McpError::invalid_input("Invalid cursor").to_json_rpc(0);
+    }
+
+    int64_t limit = -1;
+    if (params && yyjson_obj_get(params, "limit")) {
+        limit = json_get_int(params, "limit", -1);
+        if (limit < 0) limit = -1;
+        if (limit > 500) limit = 500;
+    }
 
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
 
@@ -746,21 +757,34 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         "JOIN nodes n ON e.src_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
         "WHERE e.dst_id = ? AND e.kind = 'calls' "
-        "ORDER BY e.confidence DESC LIMIT ?");
+        "ORDER BY e.confidence DESC");
 
     sqlite3_bind_int64(stmt, 1, node_id);
-    sqlite3_bind_int64(stmt, 2, limit);
 
-    // Collect raw results
-    struct CallerRow { int64_t id; std::string name; std::string file_path; double confidence; };
+    struct CallerRow {
+        int64_t id;
+        std::string name;
+        std::string file_path;
+        double confidence;
+        RankScore rank;
+    };
+
     std::vector<CallerRow> rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        CallerRow r;
-        r.id = sqlite3_column_int64(stmt, 0);
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        auto* name = sqlite3_column_text(stmt, 1);
         auto* fp = sqlite3_column_text(stmt, 2);
-        r.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
-        r.confidence = sqlite3_column_double(stmt, 3);
+        std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+        CallerRow r{
+            sqlite3_column_int64(stmt, 0),
+            name ? reinterpret_cast<const char*>(name) : "",
+            file_path,
+            sqlite3_column_double(stmt, 3),
+            {}
+        };
+        r.rank.visibility_score = compute_visibility_score("");
+        r.rank.proximity_score = 0.5;
+        r.rank.term_frequency_score = compute_term_frequency_score(r.id, conn);
+        r.rank.file_path = file_path;
         rows.push_back(std::move(r));
     }
 
@@ -768,8 +792,21 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     auto* root = doc.new_obj();
     doc.set_root(root);
 
-    if (group_by && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
-        // Group by file path (module uses file's directory as key)
+    auto emit_caller_item = [&](const CallerRow& r) -> yyjson_mut_val* {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
+        if (!r.file_path.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
+        yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
+        return item;
+    };
+
+    bool grouped_response = group_by && (strcmp(group_by, "file") == 0 ||
+                                         strcmp(group_by, "module") == 0 ||
+                                         strcmp(group_by, "symbol") == 0);
+
+    if (grouped_response && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
         std::unordered_map<std::string, std::vector<size_t>> groups;
         for (size_t i = 0; i < rows.size(); ++i) {
             std::string key = rows[i].file_path;
@@ -782,54 +819,93 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         auto* grouped = doc.new_obj();
         for (auto& [gkey, indices] : groups) {
             auto* arr = doc.new_arr();
-            for (size_t idx : indices) {
-                auto& r = rows[idx];
-                auto* item = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-                if (!r.file_path.empty())
-                    yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-                yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-                yyjson_mut_arr_append(arr, item);
-            }
+            for (size_t idx : indices)
+                yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
             yyjson_mut_obj_add_val(doc.doc, grouped, gkey.empty() ? "(unknown)" : gkey.c_str(), arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
-    } else if (group_by && strcmp(group_by, "symbol") == 0) {
-        // Group by caller name
+    } else if (grouped_response && strcmp(group_by, "symbol") == 0) {
         std::unordered_map<std::string, std::vector<size_t>> groups;
         for (size_t i = 0; i < rows.size(); ++i) groups[rows[i].name].push_back(i);
         auto* grouped = doc.new_obj();
         for (auto& [gkey, indices] : groups) {
             auto* arr = doc.new_arr();
-            for (size_t idx : indices) {
-                auto& r = rows[idx];
-                auto* item = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-                if (!r.file_path.empty())
-                    yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-                yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-                yyjson_mut_arr_append(arr, item);
-            }
+            for (size_t idx : indices)
+                yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
             yyjson_mut_obj_add_val(doc.doc, grouped, gkey.c_str(), arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else {
-        // Flat list (default / backward-compatible)
-        auto* results = doc.new_arr();
-        for (auto& r : rows) {
-            auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-            if (!r.file_path.empty())
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-            yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-            yyjson_mut_arr_append(results, item);
+        bool ranked = (max_tokens > 0);
+        if (ranked) {
+            std::sort(rows.begin(), rows.end(), [](const CallerRow& a, const CallerRow& b) {
+                double score_a = a.rank.total();
+                double score_b = b.rank.total();
+                if (std::abs(score_a - score_b) > 1e-6) return score_a > score_b;
+                return a.rank.file_path < b.rank.file_path;
+            });
         }
+
+        size_t start_offset = cursor.offset > 0 ? static_cast<size_t>(cursor.offset) : 0;
+        std::vector<size_t> selected_indices;
+        int64_t accumulated_tokens = 100;
+        bool truncated = false;
+        std::string next_cursor;
+
+        for (size_t i = start_offset; i < rows.size(); ++i) {
+            int64_t item_tokens = 40 +
+                tokens::estimate_token_count(rows[i].name) +
+                tokens::estimate_token_count(rows[i].file_path);
+
+            if (max_tokens > 0 && accumulated_tokens + item_tokens > max_tokens && !selected_indices.empty()) {
+                truncated = true;
+                mcp::Cursor next{};
+                next.offset = static_cast<int64_t>(i);
+                next_cursor = next.encode();
+                break;
+            }
+
+            selected_indices.push_back(i);
+            accumulated_tokens += item_tokens;
+
+            if (limit >= 0 && static_cast<int64_t>(selected_indices.size()) >= limit) {
+                if (i + 1 < rows.size()) {
+                    truncated = true;
+                    mcp::Cursor next{};
+                    next.offset = static_cast<int64_t>(i + 1);
+                    next_cursor = next.encode();
+                }
+                break;
+            }
+        }
+
+        auto* results = doc.new_arr();
+        for (size_t idx : selected_indices)
+            yyjson_mut_arr_append(results, emit_caller_item(rows[idx]));
         yyjson_mut_obj_add_val(doc.doc, root, "results", results);
-        yyjson_mut_obj_add_bool(doc.doc, root, "has_more", false);
+        yyjson_mut_obj_add_bool(doc.doc, root, "has_more", truncated);
+
+        std::string final_json = doc.to_string();
+        mcp::MetaBlock meta;
+        meta.tokens_estimated = tokens::estimate_json_tokens(final_json);
+        meta.tokens_budget = max_tokens;
+        meta.truncated = truncated;
+        meta.next_cursor = next_cursor;
+        meta.ranking_algorithm = ranked ? "heuristic-v1" : "none";
+        if (ranked) meta.ranking_signals = {"visibility", "proximity", "term_frequency"};
+        meta.add_to_json(doc.doc, root);
+
+        return doc.to_string();
     }
+
+    std::string final_json = doc.to_string();
+    mcp::MetaBlock meta;
+    meta.tokens_estimated = tokens::estimate_json_tokens(final_json);
+    meta.tokens_budget = max_tokens;
+    meta.truncated = false;
+    meta.next_cursor = "";
+    meta.ranking_algorithm = "none";
+    meta.add_to_json(doc.doc, root);
 
     return doc.to_string();
 }
@@ -840,8 +916,19 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
     int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
-    int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
-    if (limit > 500) limit = 500;
+    int64_t max_tokens = mcp::get_max_tokens(params);
+    std::string cursor_str = mcp::get_cursor_param(params);
+    mcp::Cursor cursor;
+    if (!cursor_str.empty() && !mcp::Cursor::decode(cursor_str, cursor)) {
+        return McpError::invalid_input("Invalid cursor").to_json_rpc(0);
+    }
+
+    int64_t limit = -1;
+    if (params && yyjson_obj_get(params, "limit")) {
+        limit = json_get_int(params, "limit", -1);
+        if (limit < 0) limit = -1;
+        if (limit > 500) limit = 500;
+    }
 
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
 
@@ -851,25 +938,40 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         "JOIN nodes n ON e.dst_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
         "WHERE e.src_id = ? AND e.kind = 'calls' "
-        "ORDER BY e.confidence DESC LIMIT ?");
+        "ORDER BY e.confidence DESC");
 
     sqlite3_bind_int64(stmt, 1, node_id);
-    sqlite3_bind_int64(stmt, 2, limit);
 
-    // Collect raw results
-    struct CalleeRow { int64_t id; std::string name; std::string qualname; std::string signature; std::string file_path; double confidence; };
+    struct CalleeRow {
+        int64_t id;
+        std::string name;
+        std::string qualname;
+        std::string signature;
+        std::string file_path;
+        double confidence;
+        RankScore rank;
+    };
+
     std::vector<CalleeRow> rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
-        CalleeRow r;
-        r.id = sqlite3_column_int64(stmt, 0);
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        auto* name = sqlite3_column_text(stmt, 1);
         auto* qn = sqlite3_column_text(stmt, 2);
-        r.qualname = qn ? reinterpret_cast<const char*>(qn) : "";
         auto* sig = sqlite3_column_text(stmt, 3);
-        r.signature = sig ? reinterpret_cast<const char*>(sig) : "";
-        r.confidence = sqlite3_column_double(stmt, 4);
         auto* fp = sqlite3_column_text(stmt, 5);
-        r.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+        std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+        CalleeRow r{
+            sqlite3_column_int64(stmt, 0),
+            name ? reinterpret_cast<const char*>(name) : "",
+            qn ? reinterpret_cast<const char*>(qn) : "",
+            sig ? reinterpret_cast<const char*>(sig) : "",
+            file_path,
+            sqlite3_column_double(stmt, 4),
+            {}
+        };
+        r.rank.visibility_score = compute_visibility_score("");
+        r.rank.proximity_score = 0.5;
+        r.rank.term_frequency_score = compute_term_frequency_score(r.id, conn);
+        r.rank.file_path = file_path;
         rows.push_back(std::move(r));
     }
 
@@ -891,7 +993,11 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         return item;
     };
 
-    if (group_by && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
+    bool grouped_response = group_by && (strcmp(group_by, "file") == 0 ||
+                                         strcmp(group_by, "module") == 0 ||
+                                         strcmp(group_by, "symbol") == 0);
+
+    if (grouped_response && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
         std::unordered_map<std::string, std::vector<size_t>> groups;
         for (size_t i = 0; i < rows.size(); ++i) {
             std::string key = rows[i].file_path;
@@ -909,7 +1015,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
             yyjson_mut_obj_add_val(doc.doc, grouped, gkey.empty() ? "(unknown)" : gkey.c_str(), arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
-    } else if (group_by && strcmp(group_by, "symbol") == 0) {
+    } else if (grouped_response && strcmp(group_by, "symbol") == 0) {
         std::unordered_map<std::string, std::vector<size_t>> groups;
         for (size_t i = 0; i < rows.size(); ++i) groups[rows[i].name].push_back(i);
         auto* grouped = doc.new_obj();
@@ -921,12 +1027,77 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else {
-        // Flat list (default)
+        bool ranked = (max_tokens > 0);
+        if (ranked) {
+            std::sort(rows.begin(), rows.end(), [](const CalleeRow& a, const CalleeRow& b) {
+                double score_a = a.rank.total();
+                double score_b = b.rank.total();
+                if (std::abs(score_a - score_b) > 1e-6) return score_a > score_b;
+                return a.rank.file_path < b.rank.file_path;
+            });
+        }
+
+        size_t start_offset = cursor.offset > 0 ? static_cast<size_t>(cursor.offset) : 0;
+        std::vector<size_t> selected_indices;
+        int64_t accumulated_tokens = 100;
+        bool truncated = false;
+        std::string next_cursor;
+
+        for (size_t i = start_offset; i < rows.size(); ++i) {
+            int64_t item_tokens = 50 +
+                tokens::estimate_token_count(rows[i].name) +
+                tokens::estimate_token_count(rows[i].qualname) +
+                tokens::estimate_token_count(rows[i].signature) +
+                tokens::estimate_token_count(rows[i].file_path);
+
+            if (max_tokens > 0 && accumulated_tokens + item_tokens > max_tokens && !selected_indices.empty()) {
+                truncated = true;
+                mcp::Cursor next{};
+                next.offset = static_cast<int64_t>(i);
+                next_cursor = next.encode();
+                break;
+            }
+
+            selected_indices.push_back(i);
+            accumulated_tokens += item_tokens;
+
+            if (limit >= 0 && static_cast<int64_t>(selected_indices.size()) >= limit) {
+                if (i + 1 < rows.size()) {
+                    truncated = true;
+                    mcp::Cursor next{};
+                    next.offset = static_cast<int64_t>(i + 1);
+                    next_cursor = next.encode();
+                }
+                break;
+            }
+        }
+
         auto* results = doc.new_arr();
-        for (auto& r : rows)
-            yyjson_mut_arr_append(results, emit_callee_item(r));
+        for (size_t idx : selected_indices)
+            yyjson_mut_arr_append(results, emit_callee_item(rows[idx]));
         yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+
+        std::string final_json = doc.to_string();
+        mcp::MetaBlock meta;
+        meta.tokens_estimated = tokens::estimate_json_tokens(final_json);
+        meta.tokens_budget = max_tokens;
+        meta.truncated = truncated;
+        meta.next_cursor = next_cursor;
+        meta.ranking_algorithm = ranked ? "heuristic-v1" : "none";
+        if (ranked) meta.ranking_signals = {"visibility", "proximity", "term_frequency"};
+        meta.add_to_json(doc.doc, root);
+
+        return doc.to_string();
     }
+
+    std::string final_json = doc.to_string();
+    mcp::MetaBlock meta;
+    meta.tokens_estimated = tokens::estimate_json_tokens(final_json);
+    meta.tokens_budget = max_tokens;
+    meta.truncated = false;
+    meta.next_cursor = "";
+    meta.ranking_algorithm = "none";
+    meta.add_to_json(doc.doc, root);
 
     return doc.to_string();
 }
