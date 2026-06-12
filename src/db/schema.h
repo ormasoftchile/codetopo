@@ -11,7 +11,7 @@ namespace codetopo {
 
 // T011: Schema DDL creation and version check logic per data-model.md.
 // Schema version 1 = initial schema.
-static constexpr int CURRENT_SCHEMA_VERSION = 2;
+static constexpr int CURRENT_SCHEMA_VERSION = 4;
 static constexpr const char* INDEXER_VERSION = "1.0.0";
 
 namespace schema {
@@ -116,6 +116,30 @@ inline void create_fts(Connection& conn) {
     )SQL");
 }
 
+// Content FTS: trigram index for arbitrary substring search across source files.
+// Uses contentless-delete so we can update/delete without storing full content in SQLite.
+// file_id is UNINDEXED but stored (contentless_unindexed=1) for joining back to files table.
+inline void create_content_fts(Connection& conn) {
+    conn.exec(R"SQL(
+        CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
+            content,
+            file_id UNINDEXED,
+            line_no UNINDEXED,
+            tokenize="trigram",
+            content='',
+            contentless_delete=1,
+            contentless_unindexed=1
+        );
+    )SQL");
+    // Tracker table: contentless FTS5 tables cannot be scanned without MATCH,
+    // so we track which file_ids have been indexed in a regular table.
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS content_fts_tracker (
+            file_id INTEGER PRIMARY KEY
+        );
+    )SQL");
+}
+
 // Check schema version. Returns:
 //   0 = fresh DB (no kv table)
 //   positive = version number
@@ -198,6 +222,7 @@ inline int ensure_schema(Connection& conn) {
         // Fresh DB
         create_tables(conn);
         create_fts(conn);
+        create_content_fts(conn);
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         return 0;
     }
@@ -210,8 +235,26 @@ inline int ensure_schema(Connection& conn) {
         return 3;  // Newer version — abort
     }
 
+    // v3→v4: content_fts gained line_no column. Preserve structural index,
+    // only recreate content_fts + tracker. Backfill will repopulate.
+    if (version == 3) {
+        conn.exec("DROP TABLE IF EXISTS content_fts_tracker");
+        conn.exec("DROP TABLE IF EXISTS content_fts");
+        // FTS5 shadow tables may survive DROP on contentless tables
+        conn.exec("DROP TABLE IF EXISTS content_fts_content");
+        conn.exec("DROP TABLE IF EXISTS content_fts_data");
+        conn.exec("DROP TABLE IF EXISTS content_fts_idx");
+        conn.exec("DROP TABLE IF EXISTS content_fts_docsize");
+        conn.exec("DROP TABLE IF EXISTS content_fts_config");
+        create_content_fts(conn);
+        set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
+        return 0;
+    }
+
     // Older version — recreate from scratch
     // Drop all tables and recreate
+    conn.exec("DROP TABLE IF EXISTS content_fts_tracker");
+    conn.exec("DROP TABLE IF EXISTS content_fts");
     conn.exec("DROP TABLE IF EXISTS nodes_fts");
     conn.exec("DROP TABLE IF EXISTS edges");
     conn.exec("DROP TABLE IF EXISTS refs");
@@ -222,6 +265,7 @@ inline int ensure_schema(Connection& conn) {
 
     create_tables(conn);
     create_fts(conn);
+    create_content_fts(conn);
     set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     return 0;
 }

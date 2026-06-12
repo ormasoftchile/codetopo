@@ -222,12 +222,19 @@ private:
             "- When the user asks to refactor, split, decompose, or reorganize code\n"
             "- When you need to understand callers, callees, or impact of a change\n"
             "- When files are large (>500 lines) — use symbol_search + context_for instead of reading\n"
-            "- When you need to find all references or implementations of a type\n\n"
-            "KEY WORKFLOW: symbol_search (find symbols) -> context_for (get source + callers + callees) -> "
-            "impact_of (blast radius). For refactoring: dependency_cluster (find coupled methods) -> "
-            "method_fields (classify field access) -> context_for (get method bodies to extract).\n\n"
-            "NEVER read large source files directly. Use file_summary to list symbols, then context_for "
-            "to get individual symbol source code with full structural context.");
+            "- When you need to find all references or implementations of a type\n"
+            "- When you need to browse a directory or understand project layout\n\n"
+            "NEVER read source files or directories directly. ALL indexed data is available through these tools:\n"
+            "- dir_list: browse directories (files + subdirectories) — use INSTEAD of built-in Read/list_dir\n"
+            "- file_summary: list symbols in a file — use INSTEAD of reading the file\n"
+            "- file_search: find files by glob pattern — use INSTEAD of find/grep on filenames\n"
+            "- code_search: full-text trigram search across all source — use INSTEAD of grep/ripgrep\n"
+            "- context_for: get a symbol's source code + callers + callees in one call\n"
+            "- symbol_search: find symbols by name (FTS)\n\n"
+            "KEY WORKFLOW: dir_list (orient) -> symbol_search (find symbols) -> context_for "
+            "(get source + callers + callees) -> impact_of (blast radius). "
+            "For refactoring: dependency_cluster (find coupled methods) -> "
+            "method_fields (classify field access) -> context_for (get method bodies to extract).");
 
         yyjson_mut_obj_add_val(doc.doc, root, "result", result);
 

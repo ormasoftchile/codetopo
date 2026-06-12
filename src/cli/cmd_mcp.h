@@ -196,6 +196,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Read source code lines from a file. Returns the raw source text for the specified line range. Use when you need to see code at specific locations without knowing the symbol node_id.",
         R"J({"type":"object","properties":{"path":{"type":"string","description":"Relative file path from repository root"},"start_line":{"type":"integer","description":"First line to read (1-based)"},"end_line":{"type":"integer","description":"Last line to read (1-based, inclusive)"}},"required":["path","start_line","end_line"]})J");
 
+    server.register_tool("code_search", tools::code_search,
+        "Search for arbitrary text patterns across all source file contents. Uses a trigram index for fast substring matching. Finds identifiers, string literals, comments, error messages, or any text in code. Returns matching file paths with line numbers and surrounding context. Prefer this over file-by-file grepping.",
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 20, max 100)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 2, max 5)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
+
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
                                           QueryCache& cache, const std::string& /*root*/) -> std::string {
@@ -297,6 +301,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"subgraph", tools::subgraph},
         {"shortest_path", tools::shortest_path},
         {"find_implementations", tools::find_implementations},
+        {"code_search", tools::code_search},
     };
 
     auto it = all_tools.find(tool_name);

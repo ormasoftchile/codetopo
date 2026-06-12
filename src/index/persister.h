@@ -108,6 +108,9 @@ public:
     }
     bool is_cold_index() const { return cold_index_; }
 
+    // Returns the file_id assigned by the last persist_file() call.
+    int64_t last_file_id() const { return last_file_id_; }
+
     // T040: Persist a single file's extraction results.
     // When used with begin_batch/commit_batch, caller manages the transaction.
     // When used standalone, wraps in its own transaction.
@@ -147,6 +150,7 @@ public:
                 }
                 sqlite3_step(stmt_insert_file_);
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
+                last_file_id_ = file_id;
             }
 
             // Insert file node
@@ -707,6 +711,7 @@ private:
     
     bool stmts_cached_ = false;
     bool cold_index_ = false;   // R4: skip DELETE on cold index (empty files table)
+    int64_t last_file_id_ = -1;  // file_id from the last persist_file() call
 
     void ensure_stmts_cached() {
         if (stmts_cached_) return;

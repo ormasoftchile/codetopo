@@ -103,5 +103,9 @@ std::string dependency_cluster(yyjson_val* params, Connection& conn,
 std::string source_at(yyjson_val* params, Connection& conn,
                       QueryCache& cache, const std::string& repo_root);
 
+// T093: code_search — search source file contents using trigram FTS index
+std::string code_search(yyjson_val* params, Connection& conn,
+                        QueryCache& cache, const std::string& repo_root);
+
 } // namespace tools
 } // namespace codetopo
