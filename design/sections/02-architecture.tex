@@ -48,11 +48,15 @@ since the previous HEAD.
 Storage is a single SQLite database file (\texttt{.codetopo/index.sqlite})
 co-located with or near the server binary. It holds the symbol graph, file
 metadata, workspace roots, and FTS indexes. The schema is described in detail
+<<<<<<< HEAD
 in \S\ref{sec:data-model}. SQLite WAL mode\footnote{In SQLite's default
 DELETE journal mode any write transaction blocks all readers. WAL
 (Write-Ahead Log) mode permits concurrent readers alongside one active
 writer; readers see a consistent snapshot of the last committed state.}
 allows the Query Engine to serve
+=======
+in \S\ref{sec:data-model}. SQLite WAL mode allows the Query Engine to serve
+>>>>>>> origin/main
 reads while the Indexer is writing.
 
 \subsection{Query Engine}

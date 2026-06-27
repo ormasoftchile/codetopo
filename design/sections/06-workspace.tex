@@ -55,12 +55,16 @@ live at different absolute paths on different machines.
   \item Canonicalize the path (resolve symlinks).
   \item Ensure the path is indexed: if no \texttt{roots} row exists, run a
         full index first.
+<<<<<<< HEAD
   \item \texttt{ATTACH} the source database (if separate).\footnote{A SQLite
         gotcha: \texttt{ATTACH DATABASE} must be issued \emph{before}
         \texttt{BEGIN TRANSACTION} on the same connection. Attempting to
         attach inside an open transaction raises \texttt{SQLITE\_ERROR}. The
         workspace-add flow therefore attaches the source database first, then
         opens the write transaction for the row copy.}
+=======
+  \item \texttt{ATTACH} the source database (if separate).
+>>>>>>> origin/main
   \item \texttt{INSERT} a row into \texttt{roots} to obtain the new
         \texttt{root\_id}.
   \item Copy all \texttt{files}, \texttt{nodes}, \texttt{edges}, and
