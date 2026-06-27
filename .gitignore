@@ -86,3 +86,8 @@ image.png
 # Squad documentation (team coordination)
 !.squad/
 
+.squad/orchestration-log/
+.squad/log/
+.squad/decisions/inbox/
+.squad/sessions/
+.squad-workstream
