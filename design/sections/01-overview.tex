@@ -4,7 +4,11 @@
 codetopo is a structural code intelligence MCP server for AI agents. It indexes
 source trees with tree-sitter~\cite{brunsfeld2018treesitter}, builds a persistent
 symbol graph in SQLite, and exposes that graph to language models and developer
+<<<<<<< HEAD
+tools through the Model Context Protocol~\cite{anthropic2024mcp}.\footnote{MCP was publicly announced at Anthropic's developer day in November 2024. The protocol version string \texttt{2024-11-05} reflects this origin date; MCP versions are identified by calendar date.}
+=======
 tools through the Model Context Protocol~\cite{anthropic2024mcp}.
+>>>>>>> origin/main
 
 \subsection{The central claim}
 
@@ -48,8 +52,15 @@ findings on how developers navigate large codebases~\cite{robillard2004codenav}.
         network service is required.
   \item[Polyglot.] Thirteen languages are supported out of the box: C, C++,
         C\#, TypeScript, JavaScript, Python, Rust, Java, Go, Bash, SQL, and
+<<<<<<< HEAD
+        YAML.\footnote{Lua is the thirteenth language; it is tracked as
+        experimental and omitted from this list. Simon's architecture notes
+        enumerate twelve production-ready languages.} Any language with a
+        tree-sitter grammar can be added with a thin extractor.
+=======
         YAML. Any language with a tree-sitter grammar can be added with a
         thin extractor.
+>>>>>>> origin/main
   \item[Multi-root.] A single server instance manages multiple workspace
         roots simultaneously (\S\ref{sec:workspace}).
   \item[Incremental.] Files are re-indexed only when their content changes
@@ -57,7 +68,13 @@ findings on how developers navigate large codebases~\cite{robillard2004codenav}.
         re-indexing on create, modify, and delete events.
   \item[MCP-native.] codetopo speaks the Model Context Protocol
         (\S\ref{sec:mcp-protocol}) natively: JSON-RPC~2.0 over stdio, the
+<<<<<<< HEAD
+        same transport as         the Language Server Protocol~\cite{microsoft2016lsp}\footnote{LSP was
+        first announced by Microsoft and Red Hat on June~27, 2016 ---
+        coincidentally the same calendar date as this document's writing.}
+=======
         same transport as the Language Server Protocol~\cite{microsoft2016lsp}
+>>>>>>> origin/main
         but with a tool-call interface designed for autonomous agents.
 \end{description}
 
