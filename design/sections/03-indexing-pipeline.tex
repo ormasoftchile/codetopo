@@ -1,0 +1,118 @@
+\section{Indexing Pipeline}
+\label{sec:indexing-pipeline}
+
+The indexing pipeline transforms a directory tree of source files into the
+symbol graph stored in SQLite~\cite{brunsfeld2018treesitter}. It runs in five
+stages organized into two phases: a structural phase that builds the symbol
+graph and a deferred FTS phase that populates the content index.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw, fill=green!8, rounded corners,
+              minimum width=4.2cm, minimum height=0.9cm,
+              text centered, font=\small\sffamily},
+  phase/.style={draw=gray, dashed, rounded corners, inner sep=6pt},
+  ann/.style={font=\scriptsize\ttfamily, text=gray},
+  >=stealth, node distance=0.6cm
+]
+\node[box] (discover)  {File Discovery};
+\node[box] (parse)     [below=of discover]  {tree-sitter Parse};
+\node[box] (extract)   [below=of parse]     {Symbol \& Edge Extraction};
+\node[box] (persist)   [below=of extract]   {Persist (batched SQLite)};
+\node[box] (fts)       [below=0.9cm of persist]   {content\_fts Rebuild (phase 2)};
+
+\draw[->] (discover) -- (parse);
+\draw[->] (parse)    -- (extract);
+\draw[->] (extract)  -- (persist);
+\draw[->, dashed] (persist) -- (fts)
+  node[ann, right, midway] {after structural commit};
+\end{tikzpicture}
+\caption{The codetopo indexing pipeline. FTS population is deferred to phase 2
+         after the structural commit to avoid holding a write lock during
+         content hashing.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{File discovery}
+
+The pipeline begins by enumerating candidate files. When the workspace root
+contains a \texttt{.git} directory, codetopo prefers \texttt{git ls-files} to
+enumerate tracked files; this automatically respects \texttt{.gitignore} rules
+and avoids scanning build artifacts. When no Git repository is detected, the
+pipeline falls back to a recursive directory walk using the embedded
+\texttt{.gitignore}-aware walker. Files are filtered by extension against the
+registered set of language grammars.
+
+Each candidate file is checked against its stored \texttt{mtime} and xxHash
+fingerprint. If both match the stored values, the file is skipped entirely
+(no parse, no write). This incremental check is the primary source of
+startup-time savings on large repositories.
+
+\subsection{Supported languages}
+
+The following 13 languages are supported via tree-sitter grammars and
+language-specific extractors: C, C++, C\#, TypeScript, JavaScript, Python,
+Rust, Java, Go, Bash, SQL, YAML, and Lua.\footnote{Simon's architecture
+summary lists 12; Lua is tracked as experimental.}
+
+\subsection{Parsing}
+
+Accepted files are parsed with the tree-sitter grammar for their detected
+language (\texttt{src/index/parser.h:30--101}). Tree-sitter produces a
+concrete syntax tree (CST) in memory. Parse errors are tolerated:
+tree-sitter performs error-recovery and returns partial trees for files with
+syntax errors. The CST is the input to the extractor.
+
+\subsection{Symbol and edge extraction}
+
+The extractor (\texttt{src/index/extractor.cpp:207--297}) walks the CST using
+an \emph{iterative stack-based DFS} rather than recursion. This avoids stack
+overflow on deeply nested ASTs (e.g., generated files with thousands of nested
+expressions).
+
+For each traversed node the extractor identifies:
+\begin{itemize}
+  \item \textbf{Symbol definitions}: functions, methods, classes, structs,
+        enums, type aliases, variables, and constants. Each definition
+        produces a \texttt{nodes} row with kind, name, qualified name,
+        signature, source span, visibility, and optional docstring.
+  \item \textbf{Call expressions}: recorded as \texttt{edges} of kind
+        \texttt{calls}. Where the callee can be resolved to a known symbol
+        in the current or previously indexed root, the edge carries both
+        \texttt{src\_id} and \texttt{dst\_id}; unresolved calls carry
+        \texttt{dst\_name} only and are flagged as approximate. A confidence
+        floor of 0.3 is applied: edges below that threshold are discarded.
+  \item \textbf{References}: import/include, inheritance, field access, and
+        type references are recorded in the \texttt{refs} table.
+\end{itemize}
+
+\subsection{Persistence}
+
+Extracted symbols, edges, and references are written to SQLite in
+\emph{batched inserts} (\texttt{src/index/persister.h:117--380}):
+\begin{itemize}
+  \item Symbol (node) batch size: 100 rows per statement.
+  \item Reference batch size: 80 rows per statement.
+  \item Edge batch size: 150 rows per statement.
+\end{itemize}
+
+Before inserting, existing rows for the file are deleted
+(\texttt{DELETE WHERE file\_id = ?}), so the operation is idempotent. The
+entire insert sequence for one file runs inside a single transaction.
+
+\paragraph{Bulk mode.} When the initial index covers more than 1\,000 files,
+the pipeline enters \emph{bulk mode}: it drops secondary indexes and FTS
+triggers before the load and rebuilds them afterwards. This avoids repeated
+B-tree rebalancing during the insert flood and significantly reduces total
+indexing time on large repositories.
+
+\subsection{FTS rebuild (phase 2)}
+
+After the structural commit (nodes, edges, refs) is finalized, the pipeline
+runs a second phase that populates \texttt{content\_fts}. This table is a
+\emph{contentless} FTS5 trigram index over source lines
+(\S\ref{sec:data-model}). Because it is contentless, rows cannot be copied
+from another database; they must be inserted by reading source files from
+disk line-by-line. Deferring this phase means the write lock is held for only
+as long as the structural data requires.

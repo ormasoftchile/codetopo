@@ -16,6 +16,8 @@
 | Grag | Systems Engineer | C++ core, threading, concurrency, file I/O, data structures, indexer pipeline | 🔧 |
 | Otho | Performance Engineer | Arenas, memory management, optimization, benchmarking, ML modeling | ⚡ |
 | Joan | Tester / QA | Validity tests, efficiency scenarios, regression, crash reproduction | 🧪 |
+| Ezra | Technical Writer | Design document, LaTeX, diagrams, bibliography | 📝 |
+| Quorn | Research Analyst | Academic references, competitive analysis, gap mapping | 🔬 |
 | Scribe | Session Logger | Memory, decisions, session logs | 📋 |
 | Ralph | Work Monitor | Work queue, backlog, keep-alive | 🔄 |
 

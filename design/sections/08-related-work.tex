@@ -1,0 +1,139 @@
+\section{Related Work}
+\label{sec:related-work}
+
+\subsection{Tag-based tools}
+
+\textbf{Universal Ctags} (and its predecessor \texttt{ctags}) produces a flat
+tag file by applying regex patterns to source text. It supports over 150
+languages via \texttt{optlib} extensions and is the de facto standard for
+``jump to definition'' in lightweight editors. However, it records no call
+graph, no import/include graph, and no FTS index. The tag file is editor-local
+and has no query API. Research on call graph construction
+(\cite{ryder1979callgraph}) established that a flat tag file is insufficient for
+understanding program control flow.
+
+\textbf{cscope} extends this approach for C-family code by building an
+inverted reference table: ``who calls what'', ``called by'', text grep, and
+file includes. Its coverage is effectively C-only, it has no semantic graph, no
+FTS, and its interface is a curses TUI or a custom binary protocol with no
+JSON/REST surface.
+
+\subsection{Visual graph explorers}
+
+\textbf{Sourcetrail} (archived 2021) used libclang (C/C++), Eclipse JDT (Java),
+and a custom Python extractor to build a cross-reference graph stored in
+SQLite --- conceptually the closest prior art to codetopo. It covered only four
+languages, required compilation setup for C/C++, and had no query API (visual
+explorer only). It is no longer maintained.
+
+\textbf{Kythe}~\cite{google2014kythe} is Google's production system for
+cross-language semantic cross-references. It uses build-system integration
+(primarily Bazel) to hook into compilers, producing a fact/edge graph stored in
+LevelDB. Kythe achieves full type resolution and supports C++, Go, Java, Python,
+and TypeScript. Its principal limitation for local developer use is complexity:
+it requires a Bazel build and a serving infrastructure. It has no MCP surface,
+no FTS, and no incremental content hashing. codetopo trades type-resolution
+completeness for zero-setup local deployment.
+
+\subsection{Language Server Protocol servers}
+
+LSP-based tools~\cite{microsoft2016lsp} such as \textbf{rust-analyzer} (Rust)
+and \textbf{clangd} (C/C++) achieve deep semantic analysis through full
+compiler integration. rust-analyzer uses an incremental computation graph
+(Salsa) with type inference across generics. clangd uses the Clang AST with a
+background disk index. Both are single-language and communicate over the LSP
+protocol designed for editor interactions, not autonomous agent queries. Their
+indexes are ephemeral (in-memory for rust-analyzer; session-local for clangd)
+and not designed for batch or cross-file structural queries outside the LSP
+session.
+
+\subsection{AI-native tools}
+
+\textbf{GitHub Copilot Code Search} uses the ``Blackbird'' engine: a trigram
+plus symbol index (Rust, proprietary) combined with dense embedding retrieval.
+It operates over all of GitHub and supports natural language and regex queries.
+The index is remote, non-exportable, and has no MCP server surface exposing
+the structural graph. Copilot is an MCP \emph{client}, not a server.
+
+\textbf{Semgrep} performs AST-based structural pattern matching (e.g.,
+\texttt{\$X.foo(\$Y)}) for security linting. Its Pro tier adds taint and
+dataflow analysis. Semgrep has no persistent symbol graph, no call-graph
+navigation, and no blast-radius analysis. It is purpose-built for security
+pattern detection, not code navigation.
+
+\subsection{Competitive summary}
+
+Table~\ref{tab:competitive} summarizes the landscape against codetopo.
+
+\begin{longtable}{p{2.0cm}p{2.6cm}p{1.7cm}p{1.8cm}p{1.6cm}p{1.4cm}p{0.7cm}p{3.2cm}}
+\caption{Competitive landscape: code intelligence tools.}
+\label{tab:competitive} \\
+\toprule
+\textbf{Tool} & \textbf{Indexing} & \textbf{Languages} & \textbf{Query Model} & \textbf{Storage} & \textbf{MCP/AI} & \textbf{OSS} & \textbf{Key Limitation} \\
+\midrule
+\endfirsthead
+\multicolumn{8}{l}{\small\itshape (continued)} \\
+\toprule
+\textbf{Tool} & \textbf{Indexing} & \textbf{Languages} & \textbf{Query Model} & \textbf{Storage} & \textbf{MCP/AI} & \textbf{OSS} & \textbf{Key Limitation} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{8}{r}{\small\itshape continued on next page} \\
+\endfoot
+\bottomrule
+\endlastfoot
+Universal Ctags & Regex patterns; no AST & 150+ & Tag file only & Flat \texttt{tags} file & None & GPL-2 & No call graph, no FTS, no API \\
+cscope & Lightweight C parser; inverted ref table & C, C++ (limited) & Who-calls-what; text grep & Custom binary \texttt{.out} & None & BSD & C-only; no semantic graph; curses TUI only \\
+Sourcetrail \mbox{(archived)} & libclang / Eclipse JDT / custom & C, C++, Java, Python (4) & Visual graph explorer & SQLite & None & GPL-3 & Archived 2021; no query API; no MCP \\
+CodeScene & Git history + complexity metrics & Polyglot (metric level) & Hotspot, temporal coupling & Cloud (proprietary) & None & No & No symbol index; process metrics only \\
+Kythe & Build-system hooks; semantic graph & C++, Go, Java, Python, TS & Cross-ref; type hierarchy & LevelDB & None & Apache-2 & Bazel required; complex setup; no FTS \\
+rust-analyzer & Salsa in-memory; full type inference & Rust only & LSP: go-to-def, find-refs & In-memory (no persistent) & LSP only & MIT & Single-language; ephemeral; no MCP \\
+clangd & Clang AST + background index & C, C++, ObjC & LSP: completion, refs & On-disk (\texttt{.cache}) & LSP only & Apache-2 & C/C++ only; no MCP; no FTS \\
+GitHub Code Search & Trigram + symbol index (Blackbird) & Polyglot (all GitHub) & NL, regex, symbol search & Remote cloud & Copilot is MCP \emph{client} & No & Remote-only; no call graph; subscription \\
+Semgrep & AST structural pattern matching & 30+ & Pattern matching; dataflow (Pro) & In-memory & None & LGPL/Pro & No persistent graph; no call-graph nav \\
+nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight, fold, local nav & In-memory (editor) & None & Apache-2 & No cross-file graph; editor-bound \\
+\textbf{codetopo} & tree-sitter AST; xxHash incremental & \textbf{13} & FTS5, call graph, blast-radius & SQLite (local) & \textbf{Full MCP server} & MIT & See \S\ref{sec:status} \\
+\end{longtable}
+
+\subsection{Gap analysis}
+
+\subsubsection{What codetopo uniquely provides}
+
+\begin{description}
+  \item[Unified MCP server with 27 graph-query tools.] No other tool in the
+        landscape exposes a persistent, queryable call graph + FTS + file-
+        dependency graph as an MCP server that AI agents can call directly.
+  \item[Polyglot call graph in a local SQLite database.] Sourcetrail also used
+        SQLite and cross-references but covered only four languages and is
+        abandoned. codetopo covers 13 languages with a unified schema, persists
+        between sessions, and is queryable via CLI.
+  \item[Blast-radius / impact analysis.] Transitive dependency queries
+        (\texttt{impact\_of}, \texttt{shortest\_path}) are not offered by any
+        LSP server. Kythe could support it in theory but offers no out-of-box
+        query.
+  \item[Incremental re-indexing via content hashing.] Combined with a file
+        watcher, codetopo re-indexes only changed files in real time. clangd
+        does incremental parsing but only within one LSP session; rust-analyzer
+        discards state on restart.
+  \item[One-command editor auto-configuration.] \texttt{codetopo init} writes
+        MCP server configuration into VS Code, Cursor, Windsurf, and Claude
+        Desktop automatically.
+\end{description}
+
+\subsubsection{Known gaps vs.\ competitors}
+
+\begin{description}
+  \item[No type resolution.] codetopo's call edges are AST-derived
+        approximations (\texttt{callers\_approx}, \texttt{callees\_approx}).
+        rust-analyzer and clangd resolve overloads, generics, and templates
+        with full type inference.
+  \item[No taint/dataflow analysis.] Security and refactoring use cases
+        benefit from tracking whether data flows between two symbols. Semgrep
+        Pro and Kythe provide this; codetopo does not.
+  \item[No formal LSP endpoint.] codetopo speaks MCP. Adding an LSP adapter
+        would expand editor coverage beyond the VS Code family.
+  \item[No remote/shared index.] The index is per-developer local. Kythe and
+        GitHub Code Search support team-shared indexes; codetopo does not.
+  \item[No symbol-importance ranking.] FTS5 BM25 scores text relevance but
+        codetopo has no PageRank-style scoring on the call graph.
+\end{description}
