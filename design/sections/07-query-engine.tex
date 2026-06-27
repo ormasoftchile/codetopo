@@ -66,7 +66,11 @@ When \texttt{dst\_id} is \texttt{NULL}, the callee is returned by name only
 
 \texttt{impact\_of} computes the transitive closure of the call graph starting
 from a seed node using a BFS/DFS over \texttt{calls} edges. A recursive
-CTE expresses this efficiently in SQLite:
+CTE\footnote{SQLite has supported recursive CTEs since version 3.8.3
+(released January 2014). The \texttt{UNION ALL} variant used here permits
+revisiting nodes at greater depths; a set-based \texttt{UNION} would
+deduplicate nodes but incur higher memory cost on large graphs.} expresses
+this efficiently in SQLite:
 
 \begin{lstlisting}[language=sql]
 WITH RECURSIVE impact(id, depth) AS (

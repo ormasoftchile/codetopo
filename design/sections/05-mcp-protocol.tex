@@ -26,7 +26,10 @@ working on a codebase.
   \item Transport: stdio (one server process per client session).
   \item Framing: newline-delimited JSON (NDJSON); each message is a UTF-8
         JSON object terminated by \verb|\n|.
-  \item Protocol version: \texttt{2024-11-05} (returned in the handshake
+  \item Protocol version: \texttt{2024-11-05}\footnote{MCP protocol versions
+        use calendar-date strings. \texttt{2024-11-05} is the version at which
+        the core tool-call, prompts, and resources primitives were stabilized
+        in the initial public specification.} (returned in the handshake
         \texttt{initialize} response).
 \end{itemize}
 

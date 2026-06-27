@@ -82,7 +82,12 @@ For each traversed node the extractor identifies:
         in the current or previously indexed root, the edge carries both
         \texttt{src\_id} and \texttt{dst\_id}; unresolved calls carry
         \texttt{dst\_name} only and are flagged as approximate. A confidence
-        floor of 0.3 is applied: edges below that threshold are discarded.
+        floor of 0.3 is applied: edges below that threshold are
+        discarded.\footnote{The 0.3 threshold eliminates near-zero-confidence
+        guesses (e.g.\ an unqualified \texttt{foo()} that matches dozens of
+        candidates) while retaining low-but-plausible edges. Unresolved calls
+        stored with only \texttt{dst\_name} are recorded at a default confidence
+        of 1.0 and bypass the filter entirely.}
   \item \textbf{References}: import/include, inheritance, field access, and
         type references are recorded in the \texttt{refs} table.
 \end{itemize}
@@ -94,7 +99,12 @@ Extracted symbols, edges, and references are written to SQLite in
 \begin{itemize}
   \item Symbol (node) batch size: 100 rows per statement.
   \item Reference batch size: 80 rows per statement.
-  \item Edge batch size: 150 rows per statement.
+  \item Edge batch size: 150 rows per statement.\footnote{These batch
+        sizes (100 symbols, 80 refs, 150 edges) were tuned empirically against
+        SQLite's per-statement bound-value limit of 999. A node row binds
+        $\approx$10 columns, so 100 nodes uses $\approx$1000 bindings --- at
+        the ceiling. Edge and ref rows bind fewer columns, allowing larger
+        batches before the limit is reached.}
 \end{itemize}
 
 Before inserting, existing rows for the file are deleted

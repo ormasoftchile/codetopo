@@ -20,7 +20,11 @@ JSON/REST surface.
 
 \subsection{Visual graph explorers}
 
-\textbf{Sourcetrail} (archived 2021) used libclang (C/C++), Eclipse JDT (Java),
+\textbf{Sourcetrail}\footnote{Sourcetrail's lead maintainer announced the
+archival in October 2021, citing an unsustainable maintenance burden across
+three language extractors with a small team. The project's SQLite-based
+cross-reference schema is the closest prior art to codetopo's data model.}
+(archived 2021) used libclang (C/C++), Eclipse JDT (Java),
 and a custom Python extractor to build a cross-reference graph stored in
 SQLite --- conceptually the closest prior art to codetopo. It covered only four
 languages, required compilation setup for C/C++, and had no query API (visual
