@@ -1,0 +1,66 @@
+\section{Status}
+\label{sec:status}
+
+\subsection{Implemented}
+
+The following capabilities are implemented and functional as of the document date:
+
+\begin{itemize}
+  \item SQLite schema with \texttt{roots}, \texttt{files}, \texttt{nodes},
+        \texttt{edges}, \texttt{refs}, \texttt{nodes\_fts},
+        \texttt{content\_fts}, and \texttt{content\_fts\_tracker}.
+  \item Tree-sitter parsing for 13 languages: C, C++, C\#, TypeScript,
+        JavaScript, Python, Rust, Java, Go, Bash, SQL, YAML, Lua.
+  \item Symbol extraction (definitions) and call-edge extraction for all
+        supported languages.
+  \item All 27 MCP tools registered and functional (24 core + 3 workspace).
+  \item Incremental indexing via mtime + xxHash fingerprinting.
+  \item Filesystem watcher (FSEvents / inotify / ReadDirectoryChangesW)
+        for live re-indexing on file changes.
+  \item Multi-root workspace with ID offset scheme and cascade removal.
+  \item Freshness policy: \texttt{eager}, \texttt{normal}, \texttt{lazy},
+        \texttt{off}.
+  \item \texttt{QueryCache}: prepared-statement cache cleared on reindex.
+  \item Staleness detection via \texttt{.git/HEAD} mtime tracking.
+  \item Bulk mode for repositories $> 1\,000$ files (drop/rebuild indexes).
+  \item Auto-editor configuration (\texttt{codetopo init}) for VS Code,
+        Cursor, Windsurf, and Claude Desktop.
+\end{itemize}
+
+\subsection{Known limitations}
+
+\begin{itemize}
+  \item \textbf{Approximate call edges.} Cross-file call resolution is
+        AST-derived without type resolution. Overloaded functions, virtual
+        dispatch, and generic instantiations are not distinguished. Tools
+        are named \texttt{callers\_approx} / \texttt{callees\_approx} to
+        make this explicit.
+  \item \textbf{No taint or dataflow analysis.} Security and refactoring
+        workflows that require tracing data flow between symbols are not
+        supported.
+  \item \textbf{No formal LSP endpoint.} codetopo speaks MCP. Editors that
+        rely on the Language Server Protocol~\cite{microsoft2016lsp} cannot
+        use codetopo directly as a language server.
+  \item \textbf{No remote or team-shared index.} The index is per-developer
+        local. There is no shared index server or sync protocol.
+  \item \textbf{No symbol-importance ranking.} FTS5 BM25 provides text
+        relevance; there is no PageRank-style scoring over the call graph.
+\end{itemize}
+
+\subsection{Future work}
+
+\begin{description}
+  \item[Type-resolved call edges.] Optionally invoke a language server for
+        type information to improve call-edge accuracy for overloaded and
+        generic code.
+  \item[Additional languages.] Add extractors for Ruby, Kotlin, Swift, PHP,
+        Zig, and Haskell. Grammars exist for all of these in the
+        tree-sitter~\cite{brunsfeld2018treesitter} ecosystem.
+  \item[LSP adapter.] Expose an LSP endpoint backed by the codetopo index
+        to expand editor coverage beyond the VS Code / Cursor / Windsurf family.
+  \item[PageRank on the call graph.] Weight symbol search results by structural
+        importance (in-degree on the call graph) in addition to BM25 text
+        relevance.
+  \item[Remote/shared index.] Implement a sync protocol so that large teams can
+        share a pre-built index rather than indexing individually.
+\end{description}

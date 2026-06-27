@@ -1,0 +1,109 @@
+\documentclass{MastersThesis}
+
+% ── Packages ────────────────────────────────────────────────────────────────
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{newunicodechar}
+\newunicodechar{—}{\textemdash}
+\newunicodechar{–}{\textendash}
+\newunicodechar{§}{\S}
+\newunicodechar{→}{$\rightarrow$}
+\newunicodechar{✓}{\checkmark}
+\newunicodechar{✗}{$\times$}
+\usepackage{listings}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{caption}
+\usepackage{fancyvrb}
+\usepackage{hyperref}
+\hypersetup{hidelinks}
+
+% ── TikZ ─────────────────────────────────────────────────────────────────────
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,calc}
+
+% ── Listings ────────────────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=true,
+  frame=single,
+  framerule=0.5pt,
+  rulecolor=\color{gray!50},
+  backgroundcolor=\color{gray!5},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  tabsize=2,
+  showstringspaces=false,
+  captionpos=b
+}
+
+% C++
+\lstdefinelanguage{cpp}{
+  morekeywords={auto,bool,break,case,catch,char,class,const,continue,default,
+    delete,do,double,else,enum,explicit,extern,false,float,for,friend,goto,if,
+    inline,int,long,mutable,namespace,new,noexcept,nullptr,operator,override,
+    private,protected,public,return,short,signed,sizeof,static,struct,switch,
+    template,this,throw,true,try,typedef,typename,union,unsigned,using,
+    virtual,void,volatile,while},
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]",
+  morestring=[b]'
+}
+
+% SQL
+\lstdefinelanguage{sql}{
+  morekeywords={SELECT,FROM,WHERE,JOIN,LEFT,RIGHT,INNER,OUTER,ON,AS,INSERT,
+    INTO,VALUES,UPDATE,SET,DELETE,CREATE,TABLE,INDEX,DROP,ALTER,ADD,COLUMN,
+    PRIMARY,KEY,FOREIGN,REFERENCES,UNIQUE,NOT,NULL,DEFAULT,WITH,RECURSIVE,
+    ORDER,BY,GROUP,HAVING,LIMIT,OFFSET,UNION,ALL,DISTINCT,MATCH,RANK},
+  sensitive=false,
+  comment=[l]{--},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
+}
+
+% ── Metadata ────────────────────────────────────────────────────────────────
+
+\title{codetopo\\[0.4em]\Large A Structural Code Intelligence MCP Server\\[0.3em]\normalsize Architecture \& Design}
+\author{codetopo Project}
+\date{June 2026}
+
+% ── Document ────────────────────────────────────────────────────────────────
+\begin{document}
+\maketitle
+
+\begin{quote}\small
+\textbf{Scope of this document.} This document describes codetopo \emph{as it
+is implemented and designed}. It covers the indexing pipeline, the symbol graph
+data model, the multi-root workspace design, the query engine, and the MCP
+protocol surface. Features that are not yet built are listed explicitly in
+\S\ref{sec:status}, not described as if they were. The document is intended to
+serve as both a design reference and an onboarding guide for contributors.
+\end{quote}
+
+\tableofcontents
+\newpage
+
+\input{sections/01-overview}
+\input{sections/02-architecture}
+\input{sections/03-indexing-pipeline}
+\input{sections/04-data-model}
+\input{sections/05-mcp-protocol}
+\input{sections/06-workspace}
+\input{sections/07-query-engine}
+\input{sections/08-related-work}
+\input{sections/09-status}
+
+\bibliographystyle{plainurl}
+\bibliography{codetopo}
+
+\end{document}

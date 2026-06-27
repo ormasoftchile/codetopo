@@ -1,0 +1,125 @@
+\section{Query Engine}
+\label{sec:query-engine}
+
+The Query Engine translates structured MCP tool requests into SQL queries
+against the symbol graph. This section describes the major query patterns.
+Motivation for tool-based code navigation is grounded in empirical studies of
+how developers investigate large codebases~\cite{robillard2004codenav}.
+
+\subsection{Symbol search}
+
+\texttt{symbol\_search} queries the \texttt{nodes\_fts} FTS5 virtual table
+(\S\ref{sec:data-model}) with a prefix \texttt{MATCH} on the \texttt{name}
+column:
+
+\begin{lstlisting}[language=sql]
+SELECT n.id, n.name, n.qualname, n.kind, f.path, n.span
+FROM   nodes n
+JOIN   files f ON f.id = n.file_id
+JOIN   nodes_fts nf ON nf.rowid = n.id
+WHERE  nf.name MATCH :query || '*'
+  AND  n.node_type = 'symbol'
+  AND  (:root_id IS NULL OR f.root_id = :root_id)
+ORDER  BY rank
+LIMIT  :limit;
+\end{lstlisting}
+
+A \texttt{kind='function'} filter expands to \texttt{kind IN ('function',
+'method')} to achieve polyglot parity: in Python a method has kind
+\texttt{method} while in C a standalone function has kind \texttt{function},
+but both are callable symbols.
+
+\subsection{Call graph traversal}
+\label{sec:qe-callgraph}
+
+Call graph construction at query time is based on edges extracted by the
+indexer~\cite{ryder1979callgraph,grove2001callgraph}. Because codetopo
+does not perform type resolution, these edges are AST-derived approximations
+--- hence the ``approx'' suffix on the tool names.
+
+\subsubsection{callers\_approx}
+
+\begin{lstlisting}[language=sql]
+SELECT n.id, n.name, n.kind, f.path, n.span
+FROM   edges e
+JOIN   nodes n ON n.id = e.src_id
+JOIN   files f ON f.id = n.file_id
+WHERE  e.dst_id = :node_id
+  AND  e.kind   = 'calls';
+\end{lstlisting}
+
+\subsubsection{callees\_approx}
+
+\begin{lstlisting}[language=sql]
+SELECT e.dst_id, e.dst_name, n.kind, f.path, n.span
+FROM   edges e
+LEFT   JOIN nodes n ON n.id = e.dst_id
+LEFT   JOIN files f ON f.id = n.file_id
+WHERE  e.src_id = :node_id
+  AND  e.kind   = 'calls';
+\end{lstlisting}
+
+When \texttt{dst\_id} is \texttt{NULL}, the callee is returned by name only
+(\texttt{dst\_name}): an unresolved reference retained from the extractor.
+
+\subsection{Impact analysis}
+
+\texttt{impact\_of} computes the transitive closure of the call graph starting
+from a seed node using a BFS/DFS over \texttt{calls} edges. A recursive
+CTE expresses this efficiently in SQLite:
+
+\begin{lstlisting}[language=sql]
+WITH RECURSIVE impact(id, depth) AS (
+  SELECT :seed_id, 0
+  UNION ALL
+  SELECT e.dst_id, i.depth + 1
+  FROM   edges e
+  JOIN   impact i ON e.src_id = i.id
+  WHERE  e.kind = 'calls' AND i.depth < :max_depth
+)
+SELECT DISTINCT n.id, n.name, n.kind, f.path, i.depth
+FROM   impact i
+JOIN   nodes n ON n.id = i.id
+JOIN   files f ON f.id = n.file_id
+ORDER  BY i.depth, n.name;
+\end{lstlisting}
+
+\texttt{shortest\_path} uses a similar CTE with early termination when the
+target node is reached.
+
+\subsection{Path resolution}
+
+\texttt{resolve\_db\_path()} converts a filesystem path into a database
+\texttt{file\_id}. It tries three strategies:
+
+\begin{enumerate}
+  \item \textbf{Absolute match}: \texttt{roots.path || '/' || files.path = :abs}
+  \item \textbf{Exact relative match}: \texttt{files.path = :rel}
+  \item \textbf{Suffix LIKE match}: \texttt{files.path LIKE '\%' || :suffix}
+\end{enumerate}
+
+Strategy 3 handles workspace roots with absolute paths that differ between
+machines, and editor integrations that pass workspace-relative paths.
+
+\subsection{Content full-text search}
+
+\texttt{code\_search} uses \texttt{content\_fts}, the contentless trigram FTS5
+table populated per source line~\cite{cox2012trigram}:
+
+\begin{lstlisting}[language=sql]
+SELECT f.path, r.path AS root_path,
+       cft.line_no,
+       snippet(content_fts, 0, '', '', '...', 10) AS excerpt
+FROM   content_fts
+JOIN   content_fts_tracker cft USING (file_id)
+JOIN   files f ON f.id = cft.file_id
+JOIN   roots r ON r.id = f.root_id
+WHERE  content_fts MATCH :query
+  AND  (:root_id IS NULL OR f.root_id = :root_id)
+ORDER  BY rank
+LIMIT  :limit;
+\end{lstlisting}
+
+Because the table is contentless, \texttt{content\_fts\_tracker} is joined to
+retrieve the file ID and line number, which are stored as unindexed columns in
+the FTS row.

@@ -1,0 +1,95 @@
+\section{Multi-Root Workspace}
+\label{sec:workspace}
+
+\subsection{Problem}
+
+A developer working on a project often needs to navigate \emph{reference
+codebases} alongside their main project: a dependency's source, a shared
+library, or a related service. codetopo supports this via \emph{workspace
+roots}: named, absolute filesystem paths that are all indexed and queryable
+within a single server instance.
+
+\subsection{Design}
+
+All roots share a single \texttt{index.sqlite} database with no mode
+switching. The \texttt{roots} table (\S\ref{sec:data-model}) maps each root
+to an integer ID; the \texttt{files} table records \texttt{root\_id} on every
+file row. There is no separate per-root database.
+
+\subsection{ID offset scheme}
+
+Nodes, files, and edges across all roots share a single ID space. codetopo
+ensures uniqueness with a multiplicative offset:
+
+\[
+  \text{global\_id} = \text{root\_id} \times 10^9 + \text{local\_id}
+\]
+
+\texttt{local\_id} is the SQLite autoincrement rowid within the root's space
+(values $1$ through $10^9 - 1$). A signed 64-bit integer ($\approx 9.2 \times
+10^{18}$) supports around 9 billion root-slots at this scale, far beyond any
+practical need. Because all IDs are stored in a single file, no cross-root
+join is needed: a node ID uniquely identifies both the root and the local
+record.
+
+\subsection{Path handling}
+
+All paths stored in the database are \emph{relative to their root}. Tools that
+accept filesystem paths call \texttt{resolve\_db\_path()}, which tries three
+strategies in order:
+\begin{enumerate}
+  \item Absolute path match: \texttt{root.path || '/' || file.path = :abs}.
+  \item Exact relative match against \texttt{files.path}.
+  \item Suffix \texttt{LIKE} match: \texttt{files.path LIKE '\%' || :suffix}.
+\end{enumerate}
+The suffix match handles editors that pass workspace-relative paths without
+specifying the root. This approach is necessary because workspace roots may
+live at different absolute paths on different machines.
+
+\subsection{Workspace operations}
+
+\subsubsection{Adding a root}
+
+\texttt{workspace\_add} accepts an absolute path. The flow is:
+\begin{enumerate}
+  \item Canonicalize the path (resolve symlinks).
+  \item Ensure the path is indexed: if no \texttt{roots} row exists, run a
+        full index first.
+  \item \texttt{ATTACH} the source database (if separate).
+  \item \texttt{INSERT} a row into \texttt{roots} to obtain the new
+        \texttt{root\_id}.
+  \item Copy all \texttt{files}, \texttt{nodes}, \texttt{edges}, and
+        \texttt{refs} rows, re-keying IDs using the offset formula.
+  \item Rebuild \texttt{content\_fts} from disk (line by line per file),
+        because contentless FTS tables cannot be copied directly.
+\end{enumerate}
+
+\subsubsection{Removing a root}
+
+\texttt{workspace\_remove} runs:
+\begin{enumerate}
+  \item Delete \texttt{content\_fts} rows for the root's files.
+  \item \texttt{DELETE FROM roots WHERE id = :root\_id}.
+  \item Foreign-key cascades remove dependent rows in \texttt{files},
+        \texttt{nodes}, \texttt{edges}, and \texttt{refs}.
+\end{enumerate}
+The entire operation runs in a single transaction.
+
+\subsubsection{Listing roots}
+
+\texttt{workspace\_list} returns all roots with path, symbol count, file
+count, last-indexed timestamp, and indexing status.
+
+\subsection{Indexer guard}
+
+The normal \texttt{codetopo index} command only re-indexes files belonging to
+the main project (\texttt{files.root\_id IS NULL} or the root with
+\texttt{id = 0}). It does not overwrite data for workspace roots added via
+\texttt{workspace\_add}. This prevents accidental resets of externally indexed
+roots.
+
+\subsection{Concurrent access}
+
+SQLite WAL mode allows the Query Engine to serve reads while the Indexer is
+writing. The Indexer acquires a write lock only during the commit phase of each
+file transaction; reads proceed unblocked during parse and extraction.

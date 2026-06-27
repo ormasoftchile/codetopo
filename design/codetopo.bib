@@ -1,0 +1,173 @@
+% codetopo.bib — Bibliography for the codetopo design document
+% Last updated: 2026-06-27
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 1. Tree-sitter — incremental parsing library
+%%    Source: github.com/tree-sitter/tree-sitter (README verified 2026-06-27)
+%% ─────────────────────────────────────────────────────────────────────────────
+@software{brunsfeld2018treesitter,
+  author       = {Brunsfeld, Max and {tree-sitter contributors}},
+  title        = {Tree-sitter: A Parser Generator Tool and Incremental
+                  Parsing Library},
+  year         = {2018},
+  publisher    = {GitHub},
+  url          = {https://github.com/tree-sitter/tree-sitter},
+  note         = {Version tracked at
+                  \url{https://zenodo.org/badge/latestdoi/14164618}.
+                  Runtime library in pure C; supports error-recovery
+                  and incremental re-parsing on every keystroke.}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 2. SQLite FTS5 — Full-Text Search extension
+%%    Source: https://www.sqlite.org/fts5.html (verified 2026-06-27)
+%% ─────────────────────────────────────────────────────────────────────────────
+@techreport{hipp2014fts5,
+  author       = {Hipp, D. Richard},
+  title        = {{FTS5}: Full-Text Search Extension for {SQLite}},
+  institution  = {SQLite Consortium},
+  year         = {2014},
+  url          = {https://www.sqlite.org/fts5.html},
+  note         = {Defines the FTS5 virtual-table module providing
+                  BM25-ranked full-text search over SQLite databases.
+                  Successor to FTS3/FTS4.}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 3a. Call graph construction — foundational paper
+%%     Ryder (1979), IEEE TSE
+%% ─────────────────────────────────────────────────────────────────────────────
+@article{ryder1979callgraph,
+  author       = {Ryder, Barbara G.},
+  title        = {Constructing the Call Graph of a Program},
+  journal      = {{IEEE} Transactions on Software Engineering},
+  volume       = {SE-5},
+  number       = {3},
+  pages        = {216--226},
+  year         = {1979},
+  month        = may,
+  doi          = {10.1109/TSE.1979.234183},
+  url          = {https://doi.org/10.1109/TSE.1979.234183}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 3b. Call graph construction — comprehensive framework
+%%     Grove & Chambers (2001), ACM TOPLAS
+%% ─────────────────────────────────────────────────────────────────────────────
+@article{grove2001callgraph,
+  author       = {Grove, David and Chambers, Craig},
+  title        = {A Framework for Call Graph Construction Algorithms},
+  journal      = {{ACM} Transactions on Programming Languages and Systems},
+  volume       = {23},
+  number       = {6},
+  pages        = {685--746},
+  year         = {2001},
+  month        = nov,
+  doi          = {10.1145/504709.504710},
+  url          = {https://doi.org/10.1145/504709.504710}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 4. Language Server Protocol (LSP) — Microsoft, announced 2016
+%%    Spec: https://microsoft.github.io/language-server-protocol/
+%% ─────────────────────────────────────────────────────────────────────────────
+@techreport{microsoft2016lsp,
+  author       = {{Microsoft Corporation} and {Red Hat, Inc.} and {Codenvy, Inc.}},
+  title        = {Language Server Protocol Specification, Version 3.17},
+  institution  = {Microsoft Corporation},
+  year         = {2016},
+  note         = {Originally announced at DevNation, San Francisco, June 27, 2016.
+                  JSON-RPC 2.0 over stdio or TCP between editors and language
+                  servers. Current spec 3.17 at
+                  \url{https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/}.},
+  url          = {https://microsoft.github.io/language-server-protocol/}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 5. Model Context Protocol (MCP) — Anthropic, 2024
+%%    Spec repo: https://github.com/modelcontextprotocol/modelcontextprotocol
+%% ─────────────────────────────────────────────────────────────────────────────
+@techreport{anthropic2024mcp,
+  author       = {Soria Parra, David and Spahr-Summers, Justin
+                  and {Anthropic, PBC}},
+  title        = {Model Context Protocol ({MCP}) Specification},
+  institution  = {Anthropic, PBC},
+  year         = {2024},
+  note         = {Open protocol (MIT) for connecting LLM applications to
+                  external data sources and tools over JSON-RPC 2.0.
+                  Current version: 2025-11-25. Schema defined in TypeScript.
+                  Inspired by LSP.},
+  url          = {https://spec.modelcontextprotocol.io/specification/2025-11-25/}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 6. Incremental data-flow analysis — Ryder & Paull (1988), ACM TOPLAS
+%% ─────────────────────────────────────────────────────────────────────────────
+@article{ryder1988incremental,
+  author       = {Ryder, Barbara G. and Paull, Marvin C.},
+  title        = {Incremental Data-Flow Analysis},
+  journal      = {{ACM} Transactions on Programming Languages and Systems},
+  volume       = {10},
+  number       = {1},
+  pages        = {1--50},
+  year         = {1988},
+  month        = jan,
+  doi          = {10.1145/42190.42193},
+  url          = {https://doi.org/10.1145/42190.42193}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 7. Trigram indexing for code search — Russ Cox (2012)
+%% ─────────────────────────────────────────────────────────────────────────────
+@misc{cox2012trigram,
+  author       = {Cox, Russ},
+  title        = {Regular Expression Matching with a Trigram Index,
+                  or How {Google Code Search} Worked},
+  year         = {2012},
+  month        = jan,
+  howpublished = {Online article},
+  url          = {https://swtch.com/~rsc/regexp/regexp4.html},
+  note         = {Describes construction of a trigram inverted index for
+                  efficient regular-expression search over large code
+                  corpora, as used in Google Code Search (launched 2006,
+                  retired 2011).}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 8. Graph-based code navigation — Google Kythe
+%%    Source: https://kythe.io/docs/kythe-overview.html (verified 2026-06-27)
+%% ─────────────────────────────────────────────────────────────────────────────
+@misc{google2014kythe,
+  author       = {{Google, Inc.}},
+  title        = {Kythe: A Pluggable, (Mostly) Language-Agnostic Ecosystem
+                  for Building Tools That Work with Code},
+  year         = {2014},
+  howpublished = {Open-source project (Apache 2.0)},
+  url          = {https://kythe.io/},
+  note         = {Defines a universal schema for cross-language semantic
+                  cross-references; includes extractors for C++, Go, Java,
+                  Python, TypeScript. Schema:
+                  \url{https://kythe.io/docs/schema/}.
+                  Repository: \url{https://github.com/kythe/kythe}.}
+}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+%% 9. Code intelligence / IDE tooling — empirical study
+%%    Robillard, Coelho & Murphy (2004), IEEE TSE
+%% ─────────────────────────────────────────────────────────────────────────────
+@article{robillard2004codenav,
+  author       = {Robillard, Martin P. and Coelho, Wesley and Murphy, Gail C.},
+  title        = {How Effective Developers Investigate Source Code:
+                  An Exploratory Study},
+  journal      = {{IEEE} Transactions on Software Engineering},
+  volume       = {30},
+  number       = {12},
+  pages        = {889--903},
+  year         = {2004},
+  month        = dec,
+  doi          = {10.1109/TSE.2004.101},
+  url          = {https://doi.org/10.1109/TSE.2004.101},
+  note         = {Empirical study of how professional developers navigate
+                  large codebases; motivates tooling for cross-reference
+                  and call-graph traversal.}
+}

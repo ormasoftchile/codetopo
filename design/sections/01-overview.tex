@@ -1,0 +1,69 @@
+\section{Overview}
+\label{sec:overview}
+
+codetopo is a structural code intelligence MCP server for AI agents. It indexes
+source trees with tree-sitter~\cite{brunsfeld2018treesitter}, builds a persistent
+symbol graph in SQLite, and exposes that graph to language models and developer
+tools through the Model Context Protocol~\cite{anthropic2024mcp}.
+
+\subsection{The central claim}
+
+Language models that navigate codebases today overwhelmingly rely on text
+search: grep-style substring matching or embedding-vector approximate retrieval.
+Both approaches treat source code as a bag of tokens. codetopo takes a
+different stance: source code has \emph{structure}, and that structure---the
+symbol graph---is the right primary index.
+
+A symbol graph records what symbols exist (\emph{nodes}: functions, classes,
+variables, types), how they relate (\emph{edges}: calls, imports, inheritance,
+field access), and where they live (\emph{location}: file, line, column). Given
+a symbol graph an LLM can answer questions that text search cannot:
+``what calls \texttt{parse\_expr}?'', ``what does \texttt{Widget} inherit from?'',
+``what symbols does \texttt{server.cpp} export?'' --- in milliseconds, without
+reading source files.
+
+\subsection{The problem it solves}
+
+Current LLM-assisted coding tools face a fundamental tension: context windows
+are finite, but codebases are large. The standard response is to retrieve
+snippets by embedding similarity. This works for local, semantic queries but
+fails for structural ones. A call-graph traversal expressed as a text search
+requires the model to read every file that might contain a call; with codetopo
+the traversal is a single SQL join.
+
+codetopo shifts the \emph{navigation burden} from the model to the index.
+The model asks a precise structural question (``give me the callers of
+\texttt{foo} up to depth~3'') and receives a compact, structured answer. It
+never needs to load intermediate files. This design is motivated by empirical
+findings on how developers navigate large codebases~\cite{robillard2004codenav}.
+
+\subsection{Design properties}
+
+\begin{description}
+  \item[Structural-first.] The primary index is a symbol graph, not a text
+        corpus. Full-text search is provided as a complement via an FTS5
+        trigram index~\cite{hipp2014fts5}, not as a substitute.
+  \item[Zero-dependency runtime.] The MCP server is a single compiled binary;
+        the index is a single SQLite file. No language server, no daemon, no
+        network service is required.
+  \item[Polyglot.] Thirteen languages are supported out of the box: C, C++,
+        C\#, TypeScript, JavaScript, Python, Rust, Java, Go, Bash, SQL, and
+        YAML. Any language with a tree-sitter grammar can be added with a
+        thin extractor.
+  \item[Multi-root.] A single server instance manages multiple workspace
+        roots simultaneously (\S\ref{sec:workspace}).
+  \item[Incremental.] Files are re-indexed only when their content changes
+        (mtime $+$ xxHash check). A filesystem watcher triggers live
+        re-indexing on create, modify, and delete events.
+  \item[MCP-native.] codetopo speaks the Model Context Protocol
+        (\S\ref{sec:mcp-protocol}) natively: JSON-RPC~2.0 over stdio, the
+        same transport as the Language Server Protocol~\cite{microsoft2016lsp}
+        but with a tool-call interface designed for autonomous agents.
+\end{description}
+
+\subsection{What codetopo is not}
+
+codetopo is a code intelligence \emph{index and query server}. It does
+\emph{not} compile code, does \emph{not} run tests, does \emph{not} generate
+code, and does \emph{not} replace a full language server. It provides the
+structural substrate on which tools and agents can build.

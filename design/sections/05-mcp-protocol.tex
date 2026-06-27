@@ -1,0 +1,152 @@
+\section{MCP Protocol}
+\label{sec:mcp-protocol}
+
+\subsection{Background}
+
+The Model Context Protocol~\cite{anthropic2024mcp} is an open JSON-RPC~2.0
+protocol, inspired by the Language Server Protocol~\cite{microsoft2016lsp},
+designed for connecting LLM applications to external data sources and tools.
+Like LSP, it runs over stdio with newline-delimited JSON messages. Unlike LSP
+(which is editor-to-language-server), MCP is agent-to-tool-server: the
+client is an LLM or AI agent, and the server exposes \emph{tools} --- named
+callable operations with typed input schemas.
+
+\subsection{Why MCP for code intelligence}
+
+The tool-call pattern maps naturally to code intelligence queries. An AI agent
+can call \texttt{symbol\_search} as naturally as it calls any other function.
+The structured JSON input/output means the agent never needs to parse
+grep-style output or interpret editor hover text. codetopo registers 27 tools
+that cover the full range of structural queries an AI agent needs when
+working on a codebase.
+
+\subsection{Transport and framing}
+
+\begin{itemize}
+  \item Transport: stdio (one server process per client session).
+  \item Framing: newline-delimited JSON (NDJSON); each message is a UTF-8
+        JSON object terminated by \verb|\n|.
+  \item Protocol version: \texttt{2024-11-05} (returned in the handshake
+        \texttt{initialize} response).
+\end{itemize}
+
+\subsection{Connection lifecycle}
+
+\begin{enumerate}
+  \item Client sends \texttt{initialize} with protocol version and
+        client capabilities.
+  \item Server responds with \texttt{protocolVersion}, server info, and the
+        full tool list.
+  \item Client sends \texttt{initialized} notification.
+  \item Client sends \texttt{tools/call} requests; server responds with results.
+  \item Either side may send \texttt{shutdown} to end the session.
+\end{enumerate}
+
+\subsection{Staleness detection}
+
+Each tool response includes a \texttt{\_meta} object. When the server detects
+that the index may be out of date --- by checking the mtime of
+\texttt{.git/HEAD} against the timestamp of the last index run --- it sets
+\texttt{\_meta.stale = true}. Clients should treat stale responses as advisory:
+the data is the last known good state, but a call to \texttt{reindex} is
+recommended.
+
+\subsection{QueryCache}
+
+The \texttt{QueryCache} is an in-process prepared-statement cache keyed by
+tool name. Preparing a SQLite statement compiles it to bytecode; caching avoids
+re-compilation on every tool call. The cache is cleared (all statements
+finalized) at the start of each re-index cycle so that schema changes take
+effect immediately.
+
+\subsection{Tool catalogue}
+
+The 27 tools are organized into eight categories.
+
+\subsubsection{Navigation}
+
+\begin{description}
+  \item[\texttt{dir\_list}] List files and directories under a path.
+  \item[\texttt{file\_search}] Find files by name pattern across all roots.
+  \item[\texttt{file\_summary}] Return symbol-annotated outline of a file.
+  \item[\texttt{source\_at}] Read raw source content at a given path.
+\end{description}
+
+\subsubsection{Symbol lookup}
+
+\begin{description}
+  \item[\texttt{symbol\_search}] FTS5 prefix search over symbol names,
+        qualified names, signatures, and docstrings. \texttt{kind='function'}
+        matches both \texttt{function} and \texttt{method} nodes for
+        polyglot parity.
+  \item[\texttt{symbol\_list}] List all symbols of a given kind in a root.
+  \item[\texttt{symbol\_get}] Fetch a single symbol by ID.
+  \item[\texttt{symbol\_get\_batch}] Fetch multiple symbols by ID in one
+        round-trip.
+\end{description}
+
+\subsubsection{Graph traversal}
+
+\begin{description}
+  \item[\texttt{callers\_approx}] Direct callers of a symbol (inbound
+        \texttt{calls} edges). Named ``approx'' because call edges are
+        AST-derived without full type resolution.
+  \item[\texttt{callees\_approx}] Direct callees of a symbol (outbound
+        \texttt{calls} edges), including unresolved name-only entries.
+  \item[\texttt{references}] All reference sites for a symbol across all roots.
+  \item[\texttt{context\_for}] Return the symbol context (enclosing function
+        or class) for a given file location.
+  \item[\texttt{entrypoints}] Identify symbols with no callers (potential
+        entry points or public API).
+\end{description}
+
+\subsubsection{Impact analysis}
+
+\begin{description}
+  \item[\texttt{impact\_of}] Transitive BFS/DFS over the call graph from a
+        seed node; returns all symbols reachable via \texttt{calls} edges.
+  \item[\texttt{subgraph}] Extract the subgraph reachable from a set of seed
+        nodes up to a given depth.
+  \item[\texttt{shortest\_path}] Find the shortest call path between two
+        symbols using BFS.
+  \item[\texttt{dependency\_cluster}] Group symbols by mutual dependency into
+        clusters.
+  \item[\texttt{find\_implementations}] Find concrete implementations of an
+        interface, trait, or abstract method.
+\end{description}
+
+\subsubsection{Metadata}
+
+\begin{description}
+  \item[\texttt{repo\_stats}] Row counts, language distribution, and index
+        size.
+  \item[\texttt{server\_info}] Server version, protocol version, and
+        supported languages.
+  \item[\texttt{reindex}] Trigger an incremental or full re-index of all roots.
+\end{description}
+
+\subsubsection{File analysis}
+
+\begin{description}
+  \item[\texttt{file\_deps}] Return the import/include dependency graph for a
+        file.
+  \item[\texttt{method\_fields}] List the fields accessed by a method (field
+        access edges).
+\end{description}
+
+\subsubsection{Workspace management}
+
+\begin{description}
+  \item[\texttt{workspace\_add}] Add a new root path to the workspace.
+  \item[\texttt{workspace\_remove}] Remove a root and cascade-delete its data.
+  \item[\texttt{workspace\_list}] List all registered roots with status and
+        statistics.
+\end{description}
+
+\subsubsection{Full-text search}
+
+\begin{description}
+  \item[\texttt{code\_search}] Trigram full-text search over source lines
+        using the \texttt{content\_fts} contentless FTS5 index~\cite{cox2012trigram}.
+        Returns matching lines with file path and line number.
+\end{description}
