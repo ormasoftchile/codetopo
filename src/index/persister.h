@@ -76,13 +76,14 @@ public:
         return false;
     }
 
-    // T041: Delete files that no longer exist on disk
+    // T041: Delete files that no longer exist on disk.
+    // Guards with root_id IS NULL so workspace root files are never pruned here.
     int prune_deleted(const std::vector<std::string>& deleted_paths) {
         if (deleted_paths.empty()) return 0;
 
         sqlite3_stmt* stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "DELETE FROM files WHERE path = ?", -1, &stmt, nullptr);
+            "DELETE FROM files WHERE path = ? AND root_id IS NULL", -1, &stmt, nullptr);
 
         int count = 0;
         for (const auto& path : deleted_paths) {
@@ -97,16 +98,21 @@ public:
     }
 
     // DEC-026 R4: Detect cold index — skip DELETE when DB has no existing files.
-    // Call once before the drain loop starts.
+    // Only count main-project files (root_id IS NULL) — extra workspace roots
+    // (root_id NOT NULL) should not affect cold-index detection for the main project.
     void enable_cold_index_if_empty() {
         sqlite3_stmt* stmt = nullptr;
-        sqlite3_prepare_v2(conn_.raw(), "SELECT count(*) FROM files", -1, &stmt, nullptr);
+        sqlite3_prepare_v2(conn_.raw(),
+            "SELECT count(*) FROM files WHERE root_id IS NULL", -1, &stmt, nullptr);
         if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int64(stmt, 0) == 0) {
             cold_index_ = true;
         }
         sqlite3_finalize(stmt);
     }
     bool is_cold_index() const { return cold_index_; }
+
+    // Returns the file_id assigned by the last persist_file() call.
+    int64_t last_file_id() const { return last_file_id_; }
 
     // T040: Persist a single file's extraction results.
     // When used with begin_batch/commit_batch, caller manages the transaction.
@@ -147,6 +153,7 @@ public:
                 }
                 sqlite3_step(stmt_insert_file_);
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
+                last_file_id_ = file_id;
             }
 
             // Insert file node
@@ -707,12 +714,13 @@ private:
     
     bool stmts_cached_ = false;
     bool cold_index_ = false;   // R4: skip DELETE on cold index (empty files table)
+    int64_t last_file_id_ = -1;  // file_id from the last persist_file() call
 
     void ensure_stmts_cached() {
         if (stmts_cached_) return;
 
         sqlite3_prepare_v2(conn_.raw(),
-            "DELETE FROM files WHERE path = ?", -1, &stmt_delete_file_, nullptr);
+            "DELETE FROM files WHERE path = ? AND root_id IS NULL", -1, &stmt_delete_file_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
             "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "

@@ -70,6 +70,7 @@ struct ParsedFile {
     std::string content_hash;
     std::string parse_status;   // ok, partial, failed, skipped
     std::string parse_error;
+    std::string file_content;   // raw content for content_fts (moved from parse thread)
     bool has_error = false;
 };
 
@@ -255,18 +256,24 @@ int run_index(const Config& config) {
     if (work_list.empty()) {
         std::cerr << "Nothing to index. Database is up to date.\n";
 
-        // Still run resolver if there are unresolved refs
-        std::cerr << "Resolving cross-file references...\n";
-        auto [refs_resolved, edges_created] = persister.resolve_references();
-        if (refs_resolved > 0 || edges_created > 0) {
-            std::cerr << "Resolved " << refs_resolved << " refs, created "
-                      << edges_created << " edges\n";
-        } else {
-            std::cerr << "All refs already resolved.\n";
-        }
+        // No files changed → no new refs to resolve. Skip the expensive resolver.
 
         // Ensure FTS triggers are active for future incremental updates
         fts::create_sync_triggers(conn);
+
+        // Backfill content_fts for any files missing from the content index
+        // (handles upgrade from pre-content-FTS databases)
+        {
+            auto cfts_start = std::chrono::steady_clock::now();
+            int backfilled = content_fts::backfill_missing(conn, repo_root.string());
+            if (backfilled > 0) {
+                auto cfts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - cfts_start).count();
+                std::cerr << "\r\033[KContent search index: " << backfilled
+                          << " files indexed in " << cfts_elapsed << "s\n";
+            }
+        }
+
         persister.write_metadata(repo_root.string());
         conn.wal_checkpoint();
         fs::remove(worklist_path);  // Clean up stale worklist
@@ -532,6 +539,13 @@ int run_index(const Config& config) {
             result.extraction = extractor.extract(tree.tree, content, file.language, file.relative_path);
         }
 
+        // Save content for content_fts insertion in persist thread (limit 1MB)
+        if (content.size() <= 1024 * 1024) {
+            result.file_content = std::move(content);
+        } else {
+            result.file_content = content.substr(0, 1024 * 1024);
+        }
+
         // Explicitly destroy the tree while the arena is still leased.
         // TreeGuard's destructor calls ts_tree_delete(), which accesses
         // arena-allocated tree internals. Must happen before ArenaLease
@@ -713,10 +727,17 @@ int run_index(const Config& config) {
     PersistThreadState persist_state;
     
     std::thread persist_thread([&persist_queue, &persist_state, &persister, &profiler, 
-                                 &config, &work_list, effective_batch_size, &progress_path]() {
+                                 &config, &work_list, effective_batch_size, &progress_path,
+                                 &conn]() {
         persister.begin_batch();
         int local_count = 0;
-        
+
+        // Collect (file_id, content) for deferred FTS insert after structural
+        // persist finishes — avoids interleaving FTS INSERTs with structural
+        // persistence (which caused a 6x throughput drop) and avoids re-reading
+        // files from disk.
+        std::vector<std::pair<int64_t, std::string>> fts_pending;
+
         while (true) {
             auto item_opt = persist_queue.pop();
             if (!item_opt.has_value()) break;  // closed and empty
@@ -738,6 +759,14 @@ int run_index(const Config& config) {
                     persist_state.persist_errors.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+
+            // Stash content for deferred FTS insert (move, no copy)
+            if (!result.file_content.empty()) {
+                int64_t fid = persister.last_file_id();
+                if (fid > 0) {
+                    fts_pending.emplace_back(fid, std::move(result.file_content));
+                }
+            }
             
             local_count++;
             bool committed = false;
@@ -756,6 +785,50 @@ int run_index(const Config& config) {
         }
         
         persister.commit_batch();
+
+        // Phase 2: Bulk-insert content FTS from stashed content (no disk re-reads).
+        // Runs in its own transaction after structural persist is fully committed.
+        if (!fts_pending.empty()) {
+            std::cerr << "Building content search index...\n";
+            sqlite3_stmt* cfts_ins = nullptr;
+            sqlite3_prepare_v2(conn.raw(),
+                "INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)",
+                -1, &cfts_ins, nullptr);
+            sqlite3_stmt* cfts_trk = nullptr;
+            sqlite3_prepare_v2(conn.raw(),
+                "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)",
+                -1, &cfts_trk, nullptr);
+
+            const int fts_batch = 10000;
+            conn.exec("BEGIN TRANSACTION");
+            int fts_count = 0;
+            auto fts_start = std::chrono::steady_clock::now();
+            for (auto& [fid, content] : fts_pending) {
+                content_fts::insert_lines(cfts_ins, cfts_trk, fid, content);
+                content.clear();           // free memory incrementally
+                ++fts_count;
+                if (fts_count % fts_batch == 0) {
+                    conn.exec("COMMIT");
+                    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+                    conn.exec("BEGIN TRANSACTION");
+                    auto now = std::chrono::steady_clock::now();
+                    auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - fts_start).count();
+                    double rate = secs > 0 ? static_cast<double>(fts_count) / secs : 0;
+                    std::cerr << "\r\033[K  " << fts_count << "/" << fts_pending.size()
+                              << " files (" << static_cast<int>(rate) << " files/s)" << std::flush;
+                }
+            }
+            conn.exec("COMMIT");
+            conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+            sqlite3_finalize(cfts_ins);
+            sqlite3_finalize(cfts_trk);
+            auto fts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - fts_start).count();
+            std::cerr << "\r\033[KContent search index: " << fts_count << " files in "
+                      << fts_elapsed << "s\n";
+            fts_pending.clear();
+        }
     });
 
     // Fill initial window (up to budget)
@@ -876,40 +949,58 @@ int run_index(const Config& config) {
 
     // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
     if (bulk_mode) {
-        std::cerr << "Rebuilding all indexes...\n";
+        std::cerr << "Rebuilding indexes...\n";
         ScopedPhase _ir(profiler.idx_read);
         auto idx_start = std::chrono::steady_clock::now();
         conn.exec("BEGIN TRANSACTION");
         // files
+        std::cerr << "  files...\n";
         conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
         // nodes
+        std::cerr << "  nodes...\n";
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
         // refs
+        std::cerr << "  refs...\n";
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
         // edges
+        std::cerr << "  edges...\n";
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
         conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
         conn.exec("COMMIT");
         auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - idx_start).count();
-        std::cerr << "All indexes rebuilt in " << idx_elapsed << "s\n";
+        std::cerr << "Indexes rebuilt in " << idx_elapsed << "s\n";
     }
 
-    // Rebuild FTS5 index in one pass (much faster than per-row triggers)
+    // Rebuild FTS5 symbol index in one pass (much faster than per-row triggers)
     if (bulk_mode) {
-        std::cerr << "Rebuilding FTS5 index...\n";
+        std::cerr << "Rebuilding symbol FTS index...\n";
         ScopedPhase _fts(profiler.fts_rebuild);
         auto fts_start = std::chrono::steady_clock::now();
         fts::rebuild(conn);
         auto fts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - fts_start).count();
-        std::cerr << "FTS5 rebuilt in " << fts_elapsed << "s\n";
+        std::cerr << "Symbol FTS rebuilt in " << fts_elapsed << "s\n";
+    }
+
+    // Content FTS: backfill only for incremental/upgrade scenarios where files
+    // were already in the DB but not yet in content_fts_tracker.  The bulk case
+    // is handled by the persist thread's deferred FTS pass above.
+    {
+        auto cfts_start = std::chrono::steady_clock::now();
+        int backfilled = content_fts::backfill_missing(conn, repo_root.string());
+        if (backfilled > 0) {
+            auto cfts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - cfts_start).count();
+            std::cerr << "\r\033[KContent search index: " << backfilled
+                      << " files backfilled in " << cfts_elapsed << "s\n";
+        }
     }
 
     // Re-create FTS sync triggers for future incremental updates

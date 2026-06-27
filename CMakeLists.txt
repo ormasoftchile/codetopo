@@ -87,6 +87,7 @@ set(CODETOPO_SOURCES
     src/core/arena.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
+    src/db/workspace.cpp
     src/index/extractor.cpp
     src/index/supervisor.cpp
     src/mcp/tools.cpp
@@ -153,6 +154,7 @@ set(CODETOPO_LIB_SOURCES
     src/core/arena.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
+    src/db/workspace.cpp
     src/index/extractor.cpp
     src/index/supervisor.cpp
     src/mcp/tools.cpp

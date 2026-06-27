@@ -3,6 +3,7 @@
 #include "core/config.h"
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/workspace.h"
 #include "mcp/server.h"
 #include "mcp/tools.h"
 #include "util/process.h"
@@ -57,6 +58,16 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                    int debounce_ms = 1000,
                    bool watch = false) {
     namespace fs = std::filesystem;
+
+    // Warn about legacy workspace.sqlite — it is no longer used.
+    {
+        std::string legacy_ws = (fs::path(root_hint) / ".codetopo" / "workspace.sqlite").string();
+        if (fs::exists(legacy_ws)) {
+            std::cerr << "WARNING: workspace.sqlite is no longer used. "
+                         "Run 'codetopo workspace add <path> --root " << root_hint
+                      << "' to re-add extra roots into index.sqlite.\n";
+        }
+    }
 
     if (!fs::exists(db_path)) {
         std::cerr << "ERROR: Database not found: " << db_path << "\n";
@@ -196,6 +207,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Read source code lines from a file. Returns the raw source text for the specified line range. Use when you need to see code at specific locations without knowing the symbol node_id.",
         R"J({"type":"object","properties":{"path":{"type":"string","description":"Relative file path from repository root"},"start_line":{"type":"integer","description":"First line to read (1-based)"},"end_line":{"type":"integer","description":"Last line to read (1-based, inclusive)"}},"required":["path","start_line","end_line"]})J");
 
+    server.register_tool("code_search", tools::code_search,
+        "Search for arbitrary text patterns across all source file contents. Uses a trigram index for fast substring matching. Finds identifiers, string literals, comments, error messages, or any text in code. Returns matching file paths with line numbers and surrounding context. Prefer this over file-by-file grepping.",
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 20, max 100)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 2, max 5)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
+
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
                                           QueryCache& cache, const std::string& /*root*/) -> std::string {
@@ -205,6 +220,19 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             return R"({"status":"started","message":"Re-indexing in background. Queries will reflect updated state once complete."})";
         },
         "Trigger a re-index of the repository. Runs in the background — subsequent tool calls will use fresh data once complete. Call this after making file changes (renames, moves, extractions) to ensure the index is up to date.",
+        R"J({"type":"object","properties":{}})J");
+
+    // Workspace tools — multi-root management
+    server.register_tool("workspace_add", tools::workspace_add,
+        "Add a directory root to the multi-root workspace. Indexes the target if needed, then merges into index.sqlite with globally unique node IDs.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the directory to add as a workspace root"}},"required":["path"]})J");
+
+    server.register_tool("workspace_remove", tools::workspace_remove,
+        "Remove a root from the multi-root workspace. Cascade-deletes all files, symbols, and edges for that root.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the workspace root to remove"}},"required":["path"]})J");
+
+    server.register_tool("workspace_list", tools::workspace_list,
+        "List all roots in the multi-root workspace with file/symbol/edge counts.",
         R"J({"type":"object","properties":{}})J");
 
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
@@ -297,6 +325,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"subgraph", tools::subgraph},
         {"shortest_path", tools::shortest_path},
         {"find_implementations", tools::find_implementations},
+        {"code_search", tools::code_search},
     };
 
     auto it = all_tools.find(tool_name);
