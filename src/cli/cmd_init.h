@@ -7,6 +7,7 @@
 #include "util/process.h"
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/workspace.h"
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -21,7 +22,7 @@
 namespace codetopo {
 
 // Supported editor targets for MCP config writing.
-enum class Editor { vscode, cursor, windsurf, claude };
+enum class Editor { vscode, cursor, windsurf, claude, copilot };
 
 // Parse a comma-separated editor list string into a vector.
 // "auto" is returned as an empty vector (caller detects).
@@ -35,10 +36,11 @@ inline std::vector<Editor> parse_editors(const std::string& input) {
             // trim
             while (!token.empty() && token.front() == ' ') token.erase(token.begin());
             while (!token.empty() && token.back() == ' ') token.pop_back();
-            if (token == "vscode")       result.push_back(Editor::vscode);
-            else if (token == "cursor")  result.push_back(Editor::cursor);
+            if (token == "vscode")        result.push_back(Editor::vscode);
+            else if (token == "cursor")   result.push_back(Editor::cursor);
             else if (token == "windsurf") result.push_back(Editor::windsurf);
-            else if (token == "claude")  result.push_back(Editor::claude);
+            else if (token == "claude")   result.push_back(Editor::claude);
+            else if (token == "copilot")  result.push_back(Editor::copilot);
             token.clear();
         } else {
             token += input[i];
@@ -56,6 +58,9 @@ inline std::vector<Editor> detect_editors(const std::filesystem::path& root) {
     if (fs::exists(root / ".windsurf")) found.push_back(Editor::windsurf);
     // Claude Desktop uses a global config — always include if user asked for auto
     // but we don't auto-detect it (no local dir to check).
+
+    // Copilot CLI uses a project-local .github/mcp.json — always valid to include.
+    found.push_back(Editor::copilot);
     return found;
 }
 
@@ -67,6 +72,7 @@ inline std::filesystem::path editor_config_dir(Editor e, const std::filesystem::
         case Editor::cursor:   return root / ".cursor";
         case Editor::windsurf: return root / ".windsurf";
         case Editor::claude:   return {};
+        case Editor::copilot:  return root / ".github";
     }
     return {};
 }
@@ -252,7 +258,100 @@ inline bool write_claude_mcp_config(const std::filesystem::path& repo_root,
     return ok;
 }
 
-// Query summary statistics from the database after indexing.
+// Write/update the Copilot CLI project-local MCP config at {repo_root}/.github/mcp.json.
+// Format: { "mcpServers": { "codetopo": { "type": "local", "command": ..., "args": [...], "env": {}, "tools": ["*"] } } }
+// Uses relative --root . since the config lives in the project alongside the workspace.
+// Merges with existing mcpServers entries — does not clobber them.
+inline bool write_copilot_cli_mcp_config(const std::filesystem::path& repo_root,
+                                          bool watch, const std::string& freshness) {
+    namespace fs = std::filesystem;
+    auto github_dir = repo_root / ".github";
+    if (!fs::exists(github_dir)) fs::create_directories(github_dir);
+    auto config_path = github_dir / "mcp.json";
+
+    yyjson_mut_doc* doc = read_or_create_json(config_path);
+    if (!doc) return false;
+
+    auto* root = yyjson_mut_doc_get_root(doc);
+    if (!root || !yyjson_mut_is_obj(root)) {
+        root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+    }
+
+    // Get or create "mcpServers" object, preserving any existing entries.
+    auto* servers = yyjson_mut_obj_get(root, "mcpServers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, "mcpServers", servers);
+    }
+
+    // Remove existing codetopo entry so we can write a fresh one.
+    yyjson_mut_obj_remove_key(servers, "codetopo");
+
+    // Build codetopo server entry.
+    auto* entry = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, entry, "type", "local");
+
+    auto exe_path = get_self_executable_path();
+    yyjson_mut_obj_add_strcpy(doc, entry, "command",
+        exe_path.empty() ? "codetopo" : exe_path.c_str());
+
+    // Use relative --root . — config lives in the project root.
+    auto* args = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, args, "mcp");
+    yyjson_mut_arr_add_str(doc, args, "--root");
+    yyjson_mut_arr_add_str(doc, args, ".");
+    if (watch) {
+        yyjson_mut_arr_add_str(doc, args, "--watch");
+    }
+    std::string freshness_arg = "--freshness=" + freshness;
+    yyjson_mut_arr_add_strcpy(doc, args, freshness_arg.c_str());
+
+    yyjson_mut_obj_add_val(doc, entry, "args", args);
+    yyjson_mut_obj_add_val(doc, entry, "env", yyjson_mut_obj(doc));
+
+    auto* tools = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, tools, "*");
+    yyjson_mut_obj_add_val(doc, entry, "tools", tools);
+
+    yyjson_mut_obj_add_val(doc, servers, "codetopo", entry);
+
+    bool ok = write_json_file(config_path, doc);
+    yyjson_mut_doc_free(doc);
+    return ok;
+}
+
+// Write .github/copilot-instructions.md telling the agent to use codetopo tools first.
+// Skips if the file already exists (don't overwrite user customizations).
+inline bool write_copilot_instructions(const std::filesystem::path& repo_root) {
+    namespace fs = std::filesystem;
+    auto github_dir = repo_root / ".github";
+    if (!fs::exists(github_dir)) fs::create_directories(github_dir);
+    auto path = github_dir / "copilot-instructions.md";
+    if (fs::exists(path)) return true;  // never overwrite
+
+    static const char* content =
+        "# Code Intelligence\n\n"
+        "This project is indexed with codetopo, a structural code intelligence MCP server.\n\n"
+        "**Always use codetopo MCP tools instead of grep, glob, or reading files directly.**\n\n"
+        "## Primary workflow\n\n"
+        "1. `symbol_search` — find any symbol by name, get its `node_id`\n"
+        "2. `context_for` — given a `node_id`, get source + callers + callees in one call\n"
+        "3. `file_summary` — list all symbols in a file (use instead of reading the file)\n"
+        "4. `dir_list` — browse directories (use instead of ls/glob)\n"
+        "5. `code_search` — full-text search across all source\n"
+        "6. `callers_approx` / `callees_approx` — call graph traversal\n"
+        "7. `impact_of` — blast radius of a change\n\n"
+        "## Multi-root workspace\n\n"
+        "Extra reference repositories may be indexed alongside this project via "
+        "`codetopo workspace add <path>`. Their files appear in results with absolute paths. "
+        "`dir_list('.')` lists all indexed roots.\n";
+
+    std::ofstream f(path);
+    if (!f) return false;
+    f << content;
+    return f.good();
+}
 struct IndexStats {
     int64_t file_count = 0;
     int64_t symbol_count = 0;
@@ -284,6 +383,7 @@ inline const char* editor_name(Editor e) {
         case Editor::cursor:   return "Cursor";
         case Editor::windsurf: return "Windsurf";
         case Editor::claude:   return "Claude Desktop";
+        case Editor::copilot:  return "GitHub Copilot";
     }
     return "Unknown";
 }
@@ -295,6 +395,7 @@ inline std::string editor_config_display(Editor e, const std::filesystem::path& 
         case Editor::cursor:   return ".cursor/mcp.json";
         case Editor::windsurf: return ".windsurf/mcp.json";
         case Editor::claude:   return claude_config_path().string();
+        case Editor::copilot:  return ".github/mcp.json";
     }
     return "";
 }
@@ -308,7 +409,8 @@ inline int run_init(const std::string& root_str,
                     int parse_timeout,
                     bool turbo,
                     const std::vector<std::string>& exclude_patterns,
-                    bool watch, const std::string& freshness) {
+                    bool watch, const std::string& freshness,
+                    const std::vector<std::string>& extra_roots = {}) {
     namespace fs = std::filesystem;
 
     // 1. Resolve repo root
@@ -376,6 +478,13 @@ inline int run_init(const std::string& root_str,
             } else {
                 std::cerr << "WARNING: Could not write Claude Desktop config\n";
             }
+        } else if (e == Editor::copilot) {
+            if (write_copilot_cli_mcp_config(repo_root, watch, freshness)) {
+                written_configs.push_back(editor_config_display(e, repo_root));
+                write_copilot_instructions(repo_root);  // best-effort, never overwrites
+            } else {
+                std::cerr << "WARNING: Could not write Copilot CLI MCP config\n";
+            }
         } else {
             auto dir = editor_config_dir(e, repo_root);
             if (!fs::exists(dir)) fs::create_directories(dir);
@@ -385,6 +494,25 @@ inline int run_init(const std::string& root_str,
             } else {
                 std::cerr << "WARNING: Could not write " << editor_config_display(e, repo_root) << "\n";
             }
+        }
+    }
+
+    // 5b. Process extra roots into workspace.sqlite
+    if (!extra_roots.empty()) {
+        auto ws_path = workspace_db_path(repo_root.string());
+        try {
+            WorkspaceDB ws(ws_path);
+            // Also add the main root to the workspace
+            ws.add_root(repo_root.string(), cfg);
+            for (const auto& extra : extra_roots) {
+                std::cerr << "Adding workspace root: " << extra << "\n";
+                auto result = ws.add_root(extra, cfg);
+                std::cerr << "  -> " << result.files << " files, "
+                          << result.symbols << " symbols, "
+                          << result.edges << " edges\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "WARNING: workspace setup failed: " << e.what() << "\n";
         }
     }
 

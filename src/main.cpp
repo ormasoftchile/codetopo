@@ -10,6 +10,7 @@
 #include "cli/cmd_doctor.h"
 #include "cli/cmd_watch.h"
 #include "cli/cmd_skills.h"
+#include "cli/cmd_workspace.h"
 #include "cli/cmd_parse_file.h"
 #include "index/supervisor.h"
 #include "util/repo.h"
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
 
     sub_init->add_option("--root", init_root, "Repository root directory")->default_val(".");
     sub_init->add_option("--editors", init_editors,
-        "Comma-separated editors: vscode,cursor,windsurf,claude,auto")->default_val("auto");
+        "Comma-separated editors: vscode,cursor,windsurf,claude,copilot,auto")->default_val("auto");
     sub_init->add_option("--threads", init_threads, "Worker thread count (0=auto)")->default_val(0);
     sub_init->add_option("--arena-size", init_arena_size, "Arena size in MB per thread")->default_val(128);
     sub_init->add_option("--large-arena-size", init_large_arena_size, "Large arena size in MB for oversized files (0=disabled)")->default_val(0);
@@ -94,6 +95,9 @@ int main(int argc, char** argv) {
         "Include --watch in MCP config (default: true)")->default_val(true);
     sub_init->add_option("--freshness", init_freshness,
         "Freshness policy for MCP config: eager|normal|lazy|off")->default_val("normal");
+    std::vector<std::string> init_extra_roots;
+    sub_init->add_option("--extra-roots", init_extra_roots,
+        "Additional root paths to add to workspace (comma-separated or repeatable)");
 
     // --- mcp subcommand ---
     auto* sub_mcp = app.add_subcommand("mcp", "Start MCP server over stdio");
@@ -174,6 +178,46 @@ int main(int argc, char** argv) {
     sub_parse_file->add_flag("--refs", pf_refs, "Show all extracted references");
     sub_parse_file->add_flag("--edges", pf_edges, "Show all extracted edges");
 
+    // --- workspace subcommand ---
+    auto* sub_workspace = app.add_subcommand("workspace", "Manage multi-root workspace");
+    sub_workspace->require_subcommand(1);
+
+    auto* ws_add = sub_workspace->add_subcommand("add", "Add a root to the workspace");
+    std::string ws_add_target;
+    std::string ws_add_root_pos = ".";
+    std::string ws_add_root_flag = ".";
+    int ws_threads = 0;
+    int ws_arena_size = 128;
+    int ws_max_file_size = 10240;
+    int ws_parse_timeout = 5;
+    bool ws_turbo = false;
+
+    ws_add->add_option("target", ws_add_target, "Path to add as workspace root")->required();
+    auto* ws_add_root_pos_opt = ws_add->add_option("workspace-root", ws_add_root_pos,
+        "Main project root (positional, default: current dir)")->default_val(".");
+    ws_add->add_option("--root", ws_add_root_flag, "Main project root directory (flag)")->default_val(".");
+    ws_add->add_option("--threads", ws_threads, "Worker thread count (0=auto)")->default_val(0);
+    ws_add->add_option("--arena-size", ws_arena_size, "Arena size in MB per thread")->default_val(128);
+    ws_add->add_option("--max-file-size", ws_max_file_size, "Max file size in KB")->default_val(10240);
+    ws_add->add_option("--parse-timeout", ws_parse_timeout, "Per-file parse timeout in seconds")->default_val(5);
+    ws_add->add_flag("--turbo", ws_turbo, "Aggressive perf mode");
+
+    auto* ws_remove = sub_workspace->add_subcommand("remove", "Remove a root from the workspace");
+    std::string ws_remove_target;
+    std::string ws_remove_root_pos = ".";
+    std::string ws_remove_root_flag = ".";
+    ws_remove->add_option("target", ws_remove_target, "Path to remove from workspace")->required();
+    auto* ws_remove_root_pos_opt = ws_remove->add_option("workspace-root", ws_remove_root_pos,
+        "Main project root (positional, default: current dir)")->default_val(".");
+    ws_remove->add_option("--root", ws_remove_root_flag, "Main project root directory (flag)")->default_val(".");
+
+    auto* ws_list = sub_workspace->add_subcommand("list", "List workspace roots");
+    std::string ws_list_root_pos = ".";
+    std::string ws_list_root_flag = ".";
+    auto* ws_list_root_pos_opt = ws_list->add_option("workspace-root", ws_list_root_pos,
+        "Main project root (positional, default: current dir)")->default_val(".");
+    ws_list->add_option("--root", ws_list_root_flag, "Main project root directory (flag)")->default_val(".");
+
     // --- Parse and dispatch ---
     CLI11_PARSE(app, argc, argv);
 
@@ -225,7 +269,8 @@ int main(int argc, char** argv) {
                                       init_parse_timeout,
                                       init_turbo,
                                       init_exclude,
-                                      init_watch, init_freshness);
+                                      init_watch, init_freshness,
+                                      init_extra_roots);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
@@ -291,6 +336,33 @@ int main(int argc, char** argv) {
         pf_cfg.show_edges = pf_edges;
         try {
             return codetopo::run_parse_file(pf_cfg);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (sub_workspace->parsed()) {
+        try {
+            if (ws_add->parsed()) {
+                // Positional workspace-root wins over --root flag when explicitly provided
+                std::string ws_root = (ws_add_root_pos_opt->count() > 0) ? ws_add_root_pos : ws_add_root_flag;
+                codetopo::Config cfg;
+                cfg.repo_root = ws_add_target;
+                cfg.thread_count = ws_threads;
+                cfg.arena_size_mb = ws_arena_size;
+                cfg.max_file_size_kb = ws_max_file_size;
+                cfg.parse_timeout_s = ws_parse_timeout;
+                cfg.turbo = ws_turbo;
+                return codetopo::run_workspace_add(ws_root, ws_add_target, cfg);
+            }
+            if (ws_remove->parsed()) {
+                std::string ws_root = (ws_remove_root_pos_opt->count() > 0) ? ws_remove_root_pos : ws_remove_root_flag;
+                return codetopo::run_workspace_remove(ws_root, ws_remove_target);
+            }
+            if (ws_list->parsed()) {
+                std::string ws_root = (ws_list_root_pos_opt->count() > 0) ? ws_list_root_pos : ws_list_root_flag;
+                return codetopo::run_workspace_list(ws_root);
+            }
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;

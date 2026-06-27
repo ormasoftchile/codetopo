@@ -217,6 +217,10 @@ private:
         yyjson_mut_obj_add_str(doc.doc, result, "instructions",
             "codetopo provides structural code intelligence for large codebases. "
             "It pre-indexes all source files into a symbol graph with call relationships.\n\n"
+            "PRIMARY WORKFLOW — always start here:\n"
+            "1. symbol_search: find a symbol by name → get its node_id\n"
+            "2. context_for: pass that node_id → get source code + callers + callees in one call\n"
+            "Never skip symbol_search. Never guess node_id values — always obtain them from symbol_search results.\n\n"
             "WHEN TO USE THESE TOOLS (prefer over reading files or grep/regex):\n"
             "- When the user asks about code structure, classes, functions, or symbols\n"
             "- When the user asks to refactor, split, decompose, or reorganize code\n"
@@ -228,13 +232,22 @@ private:
             "- dir_list: browse directories (files + subdirectories) — use INSTEAD of built-in Read/list_dir\n"
             "- file_summary: list symbols in a file — use INSTEAD of reading the file\n"
             "- file_search: find files by glob pattern — use INSTEAD of find/grep on filenames\n"
-            "- code_search: full-text trigram search across all source — use INSTEAD of grep/ripgrep\n"
+            "- symbol_search: find symbols by name (FTS) — PRIMARY entry point for code exploration\n"
             "- context_for: get a symbol's source code + callers + callees in one call\n"
-            "- symbol_search: find symbols by name (FTS)\n\n"
-            "KEY WORKFLOW: dir_list (orient) -> symbol_search (find symbols) -> context_for "
-            "(get source + callers + callees) -> impact_of (blast radius). "
-            "For refactoring: dependency_cluster (find coupled methods) -> "
-            "method_fields (classify field access) -> context_for (get method bodies to extract).");
+            "- code_search: full-text trigram search — NOTE: requires a content index which may NOT be "
+            "available in workspace mode. Prefer symbol_search over code_search when searching for "
+            "symbols by name.\n\n"
+            "MULTI-ROOT WORKSPACE (when extra roots have been added via 'codetopo workspace add'):\n"
+            "- All roots are indexed together in one database — results span all roots transparently\n"
+            "- Extra-root file paths are ABSOLUTE (e.g. /Volumes/Projects/elkjs/src/foo.ts)\n"
+            "- Use file_search with absolute glob patterns to target a specific root, e.g. /Volumes/Projects/elkjs/**/*.ts\n"
+            "- dir_list('.') lists all workspace roots — use those as starting points\n"
+            "- code_search may be unavailable for extra roots; use symbol_search instead\n\n"
+            "KEY WORKFLOW: symbol_search (find symbol, get node_id) → context_for (source + callers + callees) "
+            "→ impact_of (blast radius). "
+            "For browsing: dir_list (orient) → file_summary (list symbols in file) → symbol_search + context_for. "
+            "For refactoring: dependency_cluster (find coupled methods) → "
+            "method_fields (classify field access) → context_for (get method bodies to extract).");
 
         yyjson_mut_obj_add_val(doc.doc, root, "result", result);
 

@@ -11,12 +11,23 @@ namespace codetopo {
 
 // T011: Schema DDL creation and version check logic per data-model.md.
 // Schema version 1 = initial schema.
-static constexpr int CURRENT_SCHEMA_VERSION = 4;
+// Schema version 5 = roots table + root_id on files (unified workspace).
+static constexpr int CURRENT_SCHEMA_VERSION = 5;
 static constexpr const char* INDEXER_VERSION = "1.0.0";
 
 namespace schema {
 
 inline void create_tables(Connection& conn) {
+    // roots table: extra workspace roots merged into this DB.
+    // id=0 is implicit (main project, files with root_id IS NULL).
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS roots (
+            id       INTEGER PRIMARY KEY,
+            path     TEXT NOT NULL UNIQUE,
+            added_at TEXT NOT NULL
+        );
+    )SQL");
+
     conn.exec(R"SQL(
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
@@ -26,9 +37,11 @@ inline void create_tables(Connection& conn) {
             mtime_ns INTEGER NOT NULL,
             content_hash TEXT NOT NULL,
             parse_status TEXT NOT NULL CHECK(parse_status IN ('ok','partial','failed','skipped')),
-            parse_error TEXT
+            parse_error TEXT,
+            root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id);
     )SQL");
 
     conn.exec(R"SQL(
@@ -185,6 +198,7 @@ inline std::string get_kv(Connection& conn, const std::string& key, const std::s
 // Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
 inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
+    conn.exec("DROP INDEX IF EXISTS idx_files_root");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_file_id");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_type_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_qualname");
@@ -201,6 +215,7 @@ inline void drop_bulk_indexes(Connection& conn) {
 // Rebuild secondary indexes after bulk loading.
 inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
@@ -247,6 +262,39 @@ inline int ensure_schema(Connection& conn) {
         conn.exec("DROP TABLE IF EXISTS content_fts_docsize");
         conn.exec("DROP TABLE IF EXISTS content_fts_config");
         create_content_fts(conn);
+        // Fall through to v4→v5 migration below
+        version = 4;
+    }
+
+    // v4→v5: add roots table + root_id column on files (unified workspace).
+    // Additive migration — existing data is preserved; new column is nullable.
+    if (version == 4) {
+        // Create roots table
+        conn.exec(R"SQL(
+            CREATE TABLE IF NOT EXISTS roots (
+                id       INTEGER PRIMARY KEY,
+                path     TEXT NOT NULL UNIQUE,
+                added_at TEXT NOT NULL
+            );
+        )SQL");
+
+        // Add root_id column to files (nullable for backward compat — NULL means main project)
+        // Use a probe to check if the column already exists (idempotent)
+        {
+            sqlite3_stmt* probe = nullptr;
+            bool has_root_id = false;
+            sqlite3_prepare_v2(conn.raw(), "PRAGMA table_info(files)", -1, &probe, nullptr);
+            while (sqlite3_step(probe) == SQLITE_ROW) {
+                const char* col = reinterpret_cast<const char*>(sqlite3_column_text(probe, 1));
+                if (col && std::string(col) == "root_id") { has_root_id = true; break; }
+            }
+            sqlite3_finalize(probe);
+            if (!has_root_id) {
+                conn.exec("ALTER TABLE files ADD COLUMN root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE");
+            }
+        }
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
+
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         return 0;
     }
@@ -377,6 +425,34 @@ inline int rehab_quarantine(Connection& conn, const std::vector<ScannedFile>& sc
 // Clear all quarantine entries (used on fresh init to reset stale state)
 inline void clear_quarantine(Connection& conn) {
     conn.exec("DELETE FROM quarantine");
+}
+
+// Ensure roots table and root_id column exist in an existing DB.
+// Idempotent — safe to call on any DB version (including fresh v5 DBs).
+// Used by WorkspaceDB to make the workspace tables available without running
+// the full ensure_schema() migration.
+inline void ensure_roots_schema(Connection& conn) {
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS roots (
+            id       INTEGER PRIMARY KEY,
+            path     TEXT NOT NULL UNIQUE,
+            added_at TEXT NOT NULL
+        );
+    )SQL");
+
+    // Add root_id column if not present (ALTER TABLE is idempotent via try/ignore)
+    bool has_root_id = false;
+    sqlite3_stmt* probe = nullptr;
+    sqlite3_prepare_v2(conn.raw(), "PRAGMA table_info(files)", -1, &probe, nullptr);
+    while (sqlite3_step(probe) == SQLITE_ROW) {
+        const char* col = reinterpret_cast<const char*>(sqlite3_column_text(probe, 1));
+        if (col && std::string(col) == "root_id") { has_root_id = true; break; }
+    }
+    sqlite3_finalize(probe);
+    if (!has_root_id) {
+        conn.exec("ALTER TABLE files ADD COLUMN root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE");
+    }
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
 }
 
 } // namespace schema

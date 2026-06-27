@@ -3,6 +3,7 @@
 #include "core/config.h"
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/workspace.h"
 #include "mcp/server.h"
 #include "mcp/tools.h"
 #include "util/process.h"
@@ -57,6 +58,16 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                    int debounce_ms = 1000,
                    bool watch = false) {
     namespace fs = std::filesystem;
+
+    // Warn about legacy workspace.sqlite — it is no longer used.
+    {
+        std::string legacy_ws = (fs::path(root_hint) / ".codetopo" / "workspace.sqlite").string();
+        if (fs::exists(legacy_ws)) {
+            std::cerr << "WARNING: workspace.sqlite is no longer used. "
+                         "Run 'codetopo workspace add <path> --root " << root_hint
+                      << "' to re-add extra roots into index.sqlite.\n";
+        }
+    }
 
     if (!fs::exists(db_path)) {
         std::cerr << "ERROR: Database not found: " << db_path << "\n";
@@ -209,6 +220,19 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             return R"({"status":"started","message":"Re-indexing in background. Queries will reflect updated state once complete."})";
         },
         "Trigger a re-index of the repository. Runs in the background — subsequent tool calls will use fresh data once complete. Call this after making file changes (renames, moves, extractions) to ensure the index is up to date.",
+        R"J({"type":"object","properties":{}})J");
+
+    // Workspace tools — multi-root management
+    server.register_tool("workspace_add", tools::workspace_add,
+        "Add a directory root to the multi-root workspace. Indexes the target if needed, then merges into index.sqlite with globally unique node IDs.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Absolute path to the directory to add as a workspace root"}},"required":["path"]})J");
+
+    server.register_tool("workspace_remove", tools::workspace_remove,
+        "Remove a root from the multi-root workspace. Cascade-deletes all files, symbols, and edges for that root.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the workspace root to remove"}},"required":["path"]})J");
+
+    server.register_tool("workspace_list", tools::workspace_list,
+        "List all roots in the multi-root workspace with file/symbol/edge counts.",
         R"J({"type":"object","properties":{}})J");
 
     std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
