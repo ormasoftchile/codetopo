@@ -335,17 +335,24 @@ inline bool write_copilot_instructions(const std::filesystem::path& repo_root) {
         "This project is indexed with codetopo, a structural code intelligence MCP server.\n\n"
         "**Always use codetopo MCP tools instead of grep, glob, or reading files directly.**\n\n"
         "## Primary workflow\n\n"
-        "1. `symbol_search` — find any symbol by name, get its `node_id`\n"
-        "2. `context_for` — given a `node_id`, get source + callers + callees in one call\n"
-        "3. `file_summary` — list all symbols in a file (use instead of reading the file)\n"
-        "4. `dir_list` — browse directories (use instead of ls/glob)\n"
-        "5. `code_search` — full-text search across all source\n"
-        "6. `callers_approx` / `callees_approx` — call graph traversal\n"
-        "7. `impact_of` — blast radius of a change\n\n"
+        "1. `symbols_in_path` — list all symbols under a directory in one call (replaces repeated dir+file queries)\n"
+        "2. `context_by_name` — get full context for a symbol by name (merges symbol_search + context_for)\n"
+        "3. `dir_tree` — browse directory structure with file sizes (use instead of ls/glob)\n"
+        "4. `file_overview` — top-level symbols in a file without reading the body\n"
+        "5. `symbol_search` — find any symbol by name, get its `node_id`\n"
+        "6. `context_for` — given a `node_id`, get source + callers + callees in one call\n"
+        "7. `code_search` — full-text search across all source\n"
+        "8. `callers_approx` / `callees_approx` — call graph traversal\n"
+        "9. `impact_of` — blast radius of a change\n\n"
+        "## Symbol kinds\n\n"
+        "codetopo indexes these kinds: `function`, `class`, `method`, `interface`, `enum`, `type`, "
+        "`macro`, `field`, `variable`, `namespace`, `constructor_fn`.\n\n"
+        "**`constructor_fn`** — pre-ES6 JavaScript factory pattern: `let Foo = function() { this.x = ...; }`. "
+        "Use `symbols_in_path(kind=[\"constructor_fn\"])` to find all factory classes in a JS codebase.\n\n"
         "## Multi-root workspace\n\n"
         "Extra reference repositories may be indexed alongside this project via "
         "`codetopo workspace add <path>`. Their files appear in results with absolute paths. "
-        "`dir_list('.')` lists all indexed roots.\n";
+        "`dir_tree('.')` lists all indexed roots.\n";
 
     std::ofstream f(path);
     if (!f) return false;
