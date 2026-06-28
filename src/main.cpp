@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
     bool index_supervised = false;
     bool index_safe_mode = false;
     bool index_resume = false;
+    bool index_force = false;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
     sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
+    sub_index->add_flag("--force", index_force, "Re-extract all files even if content is unchanged");
     int index_progress_offset = 0;
     int index_progress_total = 0;
     int index_max_files = 0;
@@ -78,6 +80,7 @@ int main(int argc, char** argv) {
     int init_max_file_size = 10240;
     bool init_watch = true;
     bool init_turbo = false;
+    bool init_force = false;
     std::vector<std::string> init_exclude;
     std::string init_freshness = "normal";
 
@@ -92,6 +95,7 @@ int main(int argc, char** argv) {
     sub_init->add_option("--max-file-size", init_max_file_size, "Max file size in KB")->default_val(10240);
     sub_init->add_option("--parse-timeout", init_parse_timeout, "Per-file parse timeout in seconds (0=no limit)")->default_val(5);
     sub_init->add_flag("--turbo", init_turbo, "Aggressive perf: synchronous=OFF, batch=1000, larger cache");
+    sub_init->add_flag("--force", init_force, "Re-extract all files even if content is unchanged");
     sub_init->add_option("--exclude", init_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
     sub_init->add_flag("--watch,!--no-watch", init_watch,
         "Include --watch in MCP config (default: true)")->default_val(true);
@@ -239,6 +243,7 @@ int main(int argc, char** argv) {
         cfg.max_symbols_per_file = index_max_symbols;
         cfg.no_gitignore = index_no_gitignore;
         cfg.turbo = index_turbo;
+        cfg.force_reindex = index_force;
         cfg.exclude_patterns = index_exclude;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
@@ -270,6 +275,7 @@ int main(int argc, char** argv) {
                                       init_max_file_size,
                                       init_parse_timeout,
                                       init_turbo,
+                                      init_force,
                                       init_exclude,
                                       init_watch, init_freshness,
                                       init_extra_roots);

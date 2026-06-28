@@ -408,6 +408,7 @@ inline int run_init(const std::string& root_str,
                     int max_file_size,
                     int parse_timeout,
                     bool turbo,
+                    bool force_reindex,
                     const std::vector<std::string>& exclude_patterns,
                     bool watch, const std::string& freshness,
                     const std::vector<std::string>& extra_roots = {}) {
@@ -431,6 +432,7 @@ inline int run_init(const std::string& root_str,
     cfg.max_file_size_kb = max_file_size;
     cfg.parse_timeout_s = parse_timeout;
     cfg.turbo = turbo;
+    cfg.force_reindex = force_reindex;
     cfg.profile = false;
     cfg.max_files = 0;
     cfg.exclude_patterns = exclude_patterns;
