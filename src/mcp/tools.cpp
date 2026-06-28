@@ -219,7 +219,8 @@ struct DirTreeNode {
     std::string language;
     int64_t size_bytes = 0;
     bool truncated = false;
-    int64_t truncated_file_count = 0;
+    int64_t children_count = 0;
+    int64_t descendant_file_count = 0;
     std::map<std::string, std::unique_ptr<DirTreeNode>> children;
 };
 
@@ -246,7 +247,7 @@ static yyjson_mut_val* serialize_dir_tree_node(JsonMutDoc& doc, const DirTreeNod
 
     if (node.truncated) {
         yyjson_mut_obj_add_bool(doc.doc, json_node, "truncated", true);
-        yyjson_mut_obj_add_int(doc.doc, json_node, "file_count", node.truncated_file_count);
+        yyjson_mut_obj_add_int(doc.doc, json_node, "children_count", node.children_count);
         return json_node;
     }
 
@@ -256,6 +257,53 @@ static yyjson_mut_val* serialize_dir_tree_node(JsonMutDoc& doc, const DirTreeNod
     }
     yyjson_mut_obj_add_val(doc.doc, json_node, "children", children);
     return json_node;
+}
+
+static int64_t count_visible_dir_tree_files(const DirTreeNode& node) {
+    if (node.is_file) return 1;
+    if (node.truncated) return 0;
+
+    int64_t visible = 0;
+    for (const auto& [_, child] : node.children) {
+        visible += count_visible_dir_tree_files(*child);
+    }
+    return visible;
+}
+
+static void collect_truncatable_dir_nodes(DirTreeNode& node, int depth,
+                                          std::vector<std::pair<int, DirTreeNode*>>& out) {
+    if (node.is_file || node.truncated) return;
+    if (depth > 0) out.emplace_back(depth, &node);
+    for (auto& [_, child] : node.children) {
+        collect_truncatable_dir_nodes(*child, depth + 1, out);
+    }
+}
+
+static void apply_dir_tree_file_cap(DirTreeNode& root, int64_t max_files) {
+    if (max_files < 0) return;
+
+    int64_t visible_files = count_visible_dir_tree_files(root);
+    if (visible_files <= max_files) return;
+
+    std::vector<std::pair<int, DirTreeNode*>> candidates;
+    collect_truncatable_dir_nodes(root, 0, candidates);
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.first > rhs.first;
+              });
+
+    for (const auto& [_, node] : candidates) {
+        if (visible_files <= max_files) break;
+        if (!node || node->truncated) continue;
+
+        int64_t subtree_visible = count_visible_dir_tree_files(*node);
+        if (subtree_visible <= 0) continue;
+
+        node->truncated = true;
+        node->children_count = node->descendant_file_count;
+        node->children.clear();
+        visible_files -= subtree_visible;
+    }
 }
 
 // T060: server_info
@@ -565,9 +613,13 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     const char* requested_path = params ? json_get_str(params, "path") : nullptr;
     if (!requested_path) requested_path = ".";
 
-    int64_t depth = params ? json_get_int(params, "depth", 3) : 3;
+    int64_t depth = params ? json_get_int(params, "depth", 2) : 2;
+    int64_t max_files = params ? json_get_int(params, "max_files", 500) : 500;
     if (depth < 0) {
         return McpError::invalid_input("Invalid 'depth': must be >= 0").to_json_rpc(0);
+    }
+    if (max_files <= 0) {
+        return McpError::invalid_input("Invalid 'max_files': must be > 0").to_json_rpc(0);
     }
     int64_t max_depth = (depth == 0) ? 20 : std::min<int64_t>(depth, 20);
 
@@ -604,21 +656,18 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
         count_sql += " WHERE path GLOB ?";
         select_sql += " WHERE path GLOB ?";
     }
-    select_sql += " ORDER BY path LIMIT ?";
+    select_sql += " ORDER BY path";
 
     std::string cache_key = all_paths ? "dir_tree_all" : "dir_tree_dir";
     auto* count_stmt = cache.get(cache_key + "_count", count_sql);
     auto* stmt = cache.get(cache_key, select_sql);
-    int bind_idx = 1;
     if (!all_paths) {
         sqlite3_bind_text(count_stmt, 1, path_glob.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, bind_idx++, path_glob.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 1, path_glob.c_str(), -1, SQLITE_TRANSIENT);
     }
-    sqlite3_bind_int64(stmt, bind_idx, 2000);
 
     int64_t total = 0;
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
-    bool has_more = total > 2000;
 
     std::string root_name;
     if (all_paths) {
@@ -649,13 +698,15 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
         if (parts.empty()) continue;
 
         DirTreeNode* current = &tree_root;
+        current->descendant_file_count++;
         bool inserted = false;
         for (size_t i = 0; i + 1 < parts.size(); ++i) {
             int64_t dir_depth = static_cast<int64_t>(i) + 1;
             auto* child = ensure_dir_child(*current, parts[i]);
+            child->descendant_file_count++;
             if (dir_depth == max_depth) {
                 child->truncated = true;
-                child->truncated_file_count++;
+                child->children_count = child->descendant_file_count;
                 inserted = true;
                 break;
             }
@@ -673,6 +724,10 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
         file_node->size_bytes = sqlite3_column_int64(stmt, 2);
         current->children[file_node->name] = std::move(file_node);
     }
+
+    apply_dir_tree_file_cap(tree_root, max_files);
+    int64_t visible_file_count = count_visible_dir_tree_files(tree_root);
+    bool has_more = total > visible_file_count;
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -1707,7 +1762,7 @@ std::string file_overview(yyjson_val* params, Connection& conn,
         "SELECT name, qualname, kind, start_line, end_line, signature, visibility, doc "
         "FROM nodes "
         "WHERE file_id = ? AND node_type = 'symbol' "
-        "AND kind IN ('function', 'class', 'struct', 'interface', 'enum', 'type', 'macro', 'method', 'typedef', 'type_alias') "
+        "AND kind IN ('function', 'class', 'struct', 'interface', 'enum', 'type', 'macro', 'method', 'typedef', 'type_alias', 'constructor_fn') "
         "ORDER BY start_line, id");
     sqlite3_bind_int64(sym_stmt, 1, file_id);
 
