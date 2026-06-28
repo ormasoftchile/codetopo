@@ -1203,7 +1203,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
     bool recursive = params ? json_get_bool(params, "recursive", true) : true;
-    bool compact = params ? json_get_bool(params, "compact", false) : false;
+    bool compact = params ? json_get_bool(params, "compact", true) : true;
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
