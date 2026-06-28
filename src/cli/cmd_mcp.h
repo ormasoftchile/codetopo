@@ -174,11 +174,11 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("callers_approx", tools::callers_approx,
         "Find all functions/files that call or reference the given symbol. Returns caller names, file paths, and confidence scores. Optionally group results by file, module, or symbol.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callers for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."}},"required":["node_id"]})J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callers for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."}},"required":["node_id"]})J");
 
     server.register_tool("callees_approx", tools::callees_approx,
         "Find all functions/symbols that the given symbol calls or references. Optionally group results by file, module, or symbol.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callees for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."}},"required":["node_id"]})J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callees for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."}},"required":["node_id"]})J");
 
     server.register_tool("references", tools::references,
         "Find all references to a symbol across the codebase.",
@@ -194,7 +194,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("context_for", tools::context_for,
         "Get the full structural context of a symbol: its definition, source snippet, callers, callees, container (enclosing type/namespace), sibling members, and base/implements types. Best for understanding what a symbol does and how it connects to the codebase. Takes an internal node_id handle — never expose this to users.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"include_source":{"type":"boolean","description":"When false, omit the source field entirely. Defaults to true."},"max_source_lines":{"type":"integer","description":"Truncate source to at most N lines; 0 keeps the current full source behavior."},"max_callers":{"type":"integer","description":"Cap callers returned after query collection; 0 disables the cap. If omitted, preserves the current default behavior."},"max_callees":{"type":"integer","description":"Cap callees returned after query collection; 0 disables the cap. If omitted, preserves the current default behavior."}})J");
 
     server.register_tool("context_by_name", tools::context_by_name,
         "Find a symbol by name and, when uniquely resolved, return the same full structural context as context_for. If multiple matches exist, returns a disambiguation list instead.",
