@@ -142,19 +142,27 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("file_search", tools::file_search,
         "Search for files by path pattern (GLOB syntax). Use to find files containing a keyword in their path, e.g. '*numa*' finds sosnumap.h. Supports wildcards: * matches any chars, ? matches one char, [abc] matches char class.",
-        R"J({"type":"object","properties":{"pattern":{"type":"string","description":"GLOB pattern to match against file paths (e.g. '*numa*', 'Sql/DkTemp/sos/**/*.h')"},"language":{"type":"string","description":"Optional language filter (c, cpp, csharp, etc.)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}},"required":["pattern"]})J");
+        R"J({"type":"object","properties":{"pattern":{"type":"string","description":"GLOB pattern to match against file paths (e.g. '*numa*', 'Sql/DkTemp/sos/**/*.h')"},"language":{"type":"string","description":"Optional language filter (c, cpp, csharp, etc.)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["pattern"]})J");
 
     server.register_tool("dir_list", tools::dir_list,
         "List files and subdirectories in a given directory. Use to explore the neighborhood of a known file — find sibling source files in the same directory.",
-        R"J({"type":"object","properties":{"path":{"type":"string","description":"Directory path relative to repo root (e.g. 'Sql/DkTemp/sos/include')"},"limit":{"type":"integer","description":"Max files returned (default 200, max 2000)"}},"required":["path"]})J");
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Directory path relative to repo root (e.g. 'Sql/DkTemp/sos/include')"},"limit":{"type":"integer","description":"Max entries returned (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["path"]})J");
+
+    server.register_tool("dir_tree", tools::dir_tree,
+        "Return full directory subtree up to depth N with file sizes and language. Use instead of repeated dir_list calls.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Root path to traverse (default: '.')"},"depth":{"type":"integer","description":"Max depth (default: 3, 0=unlimited)"}}})J");
 
     server.register_tool("symbol_search", tools::symbol_search,
         "Search for symbols (functions, classes, macros, variables) by name. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns kind, name, file_path, span, and an internal node_id handle for chaining into other tools (context_for, callers_approx, impact_of). Never mention node_id values to the user — refer to symbols by name and file location instead.",
         R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for. Use '*' to list all (combine with kind filter)"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, etc."},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["query"]})J");
 
     server.register_tool("symbol_list", tools::symbol_list,
-        "List and filter symbols without full-text search. Supports filtering by kind (class, struct, function, variable, etc.), file_path, and name_glob (SQLite GLOB pattern). Ideal for enumerating all classes, all structs, or all symbols in a file.",
-        R"J({"type":"object","properties":{"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, macro, etc."},"file_path":{"type":"string","description":"Filter to symbols in this file (relative path)"},"name_glob":{"type":"string","description":"SQLite GLOB pattern for symbol name (e.g. 'Get*', '*Handler')"},"limit":{"type":"integer","description":"Max results (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":[]})J");
+        "List and filter symbols without full-text search. Supports filtering by kind (class, struct, function, variable, etc.), file_path, name_glob (SQLite GLOB pattern), and minimum span length. Ideal for enumerating all classes, all structs, or all symbols in a file.",
+        R"J({"type":"object","properties":{"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, macro, etc."},"file_path":{"type":"string","description":"Filter to symbols in this file (relative path)"},"name_glob":{"type":"string","description":"SQLite GLOB pattern for symbol name (e.g. 'Get*', '*Handler')"},"min_span_lines":{"type":"integer","description":"Optional minimum symbol span in lines (inclusive)"},"limit":{"type":"integer","description":"Max results (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":[]})J");
+
+    server.register_tool("symbols_in_path", tools::symbols_in_path,
+        "List symbols found under a directory path, optionally filtered by kinds, recursion, and minimum span length. Useful for surveying all classes, functions, or methods in a subtree.",
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Directory path to search under"},"kind":{"type":"array","items":{"type":"string"},"description":"Symbol kinds to include (empty = all)"},"recursive":{"type":"boolean","default":true},"min_span_lines":{"type":"integer","default":0},"limit":{"type":"integer","default":200},"offset":{"type":"integer","default":0}}})J");
 
     server.register_tool("symbol_get", tools::symbol_get,
         "Get detailed information about a specific symbol by its internal node_id handle, including source code snippet. Do not mention node_id to the user.",
@@ -178,11 +186,19 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("file_summary", tools::file_summary,
         "List all symbols defined in a file: functions, classes, structs, macros, variables.",
-        R"J({"type":"object","properties":{"file_path":{"type":"string","description":"Relative file path within the repository"}},"required":["file_path"])J");
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute file path within the repository or workspace"},"file_path":{"type":"string","description":"Backward-compatible alias for path"},"limit":{"type":"integer","description":"Max symbols returned (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":[]})J");
+
+    server.register_tool("file_overview", tools::file_overview,
+        "Structural overview of a file: top-level symbols with signatures and doc comments. Faster than context_for for large files.",
+        R"J({"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"File path (relative or absolute)"}}})J");
 
     server.register_tool("context_for", tools::context_for,
         "Get the full structural context of a symbol: its definition, source snippet, callers, callees, container (enclosing type/namespace), sibling members, and base/implements types. Best for understanding what a symbol does and how it connects to the codebase. Takes an internal node_id handle — never expose this to users.",
         R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
+
+    server.register_tool("context_by_name", tools::context_by_name,
+        "Find a symbol by name and, when uniquely resolved, return the same full structural context as context_for. If multiple matches exist, returns a disambiguation list instead.",
+        R"J({"type":"object","required":["name"],"properties":{"name":{"type":"string","description":"Symbol name to look up"},"file_pattern":{"type":"string","description":"Optional GLOB pattern to narrow by file path"}}})J");
 
     server.register_tool("entrypoints", tools::entrypoints,
         "Find entry point functions (main, DllMain, etc.) in the codebase. Optionally scope to a file path or directory prefix.",
@@ -328,15 +344,19 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"repo_stats", tools::repo_stats},
         {"file_search", tools::file_search},
         {"dir_list", tools::dir_list},
+        {"dir_tree", tools::dir_tree},
         {"symbol_search", tools::symbol_search},
         {"symbol_list", tools::symbol_list},
+        {"symbols_in_path", tools::symbols_in_path},
         {"symbol_get", tools::symbol_get},
         {"symbol_get_batch", tools::symbol_get_batch},
         {"callers_approx", tools::callers_approx},
         {"callees_approx", tools::callees_approx},
         {"references", tools::references},
         {"file_summary", tools::file_summary},
+        {"file_overview", tools::file_overview},
         {"context_for", tools::context_for},
+        {"context_by_name", tools::context_by_name},
         {"entrypoints", tools::entrypoints},
         {"impact_of", tools::impact_of},
         {"file_deps", tools::file_deps},
