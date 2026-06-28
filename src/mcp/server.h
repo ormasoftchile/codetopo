@@ -109,6 +109,7 @@ public:
             if (method_str == "notifications/initialized") {
                 // No response needed for notifications
                 initialized_ = true;
+                mcp_notify_active().store(true, std::memory_order_relaxed);
                 continue;
             }
 

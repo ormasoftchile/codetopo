@@ -3,6 +3,7 @@
 #include <yyjson.h>
 #include <string>
 #include <iostream>
+#include <mutex>
 #include <cstdint>
 
 namespace codetopo {
@@ -68,7 +69,14 @@ inline std::string json_read_line() {
 }
 
 // Write a JSON string to stdout followed by newline (NDJSON)
+// Mutex protecting all stdout writes (JSON-RPC responses + log notifications).
+inline std::mutex& mcp_stdout_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 inline void json_write_line(const std::string& json) {
+    std::lock_guard<std::mutex> lk(mcp_stdout_mutex());
     std::cout << json << "\n";
     std::cout.flush();
 }
