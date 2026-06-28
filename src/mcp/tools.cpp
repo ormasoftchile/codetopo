@@ -1365,6 +1365,24 @@ std::string read_source_snippet(const std::string& repo_root,
     return result;
 }
 
+static std::string truncate_source_lines(const std::string& source, int64_t max_source_lines) {
+    if (max_source_lines <= 0 || source.empty()) return source;
+
+    std::istringstream in(source);
+    std::string result;
+    std::string line;
+    int64_t line_count = 0;
+    while (std::getline(in, line)) {
+        if (line_count == max_source_lines) {
+            result += "...(truncated)";
+            return result;
+        }
+        result += line + "\n";
+        line_count++;
+    }
+    return source;
+}
+
 // T063: symbol_get
 std::string symbol_get(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root) {
@@ -1518,9 +1536,11 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     if (limit > 500) limit = 500;
 
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
+    bool compact = params ? json_get_bool(params, "compact", false) : false;
+    (void)repo_root;
 
     auto* stmt = cache.get("callers_approx",
-        "SELECT e.src_id, n.name, f.path, e.confidence "
+        "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
         "FROM edges e "
         "JOIN nodes n ON e.src_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
@@ -1531,21 +1551,52 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     sqlite3_bind_int64(stmt, 2, limit);
 
     // Collect raw results
-    struct CallerRow { int64_t id; std::string name; std::string file_path; double confidence; };
+    struct CallerRow {
+        int64_t id;
+        std::string kind;
+        std::string name;
+        std::string qualname;
+        std::string file_path;
+        int start_line = 0;
+        int end_line = 0;
+        double confidence;
+    };
     std::vector<CallerRow> rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CallerRow r;
         r.id = sqlite3_column_int64(stmt, 0);
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        auto* fp = sqlite3_column_text(stmt, 2);
+        r.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        auto* qn = sqlite3_column_text(stmt, 3);
+        r.qualname = qn ? reinterpret_cast<const char*>(qn) : "";
+        auto* fp = sqlite3_column_text(stmt, 4);
         r.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
-        r.confidence = sqlite3_column_double(stmt, 3);
+        r.start_line = sqlite3_column_int(stmt, 5);
+        r.end_line = sqlite3_column_int(stmt, 6);
+        r.confidence = sqlite3_column_double(stmt, 7);
         rows.push_back(std::move(r));
     }
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
     doc.set_root(root);
+
+    auto emit_caller_item = [&](const CallerRow& r) -> yyjson_mut_val* {
+        auto* item = doc.new_obj();
+        if (!compact) {
+            yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
+            if (!r.file_path.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
+        } else {
+            add_symbol_result(doc, item, r.id, r.kind.c_str(), r.name.c_str(),
+                r.qualname.empty() ? nullptr : r.qualname.c_str(),
+                r.file_path.empty() ? nullptr : r.file_path.c_str(),
+                r.start_line, r.end_line, true, true, "file", {}, false);
+        }
+        yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
+        return item;
+    };
 
     if (group_by && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
         // Group by file path (module uses file's directory as key)
@@ -1561,16 +1612,8 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         auto* grouped = doc.new_obj();
         for (auto& [gkey, indices] : groups) {
             auto* arr = doc.new_arr();
-            for (size_t idx : indices) {
-                auto& r = rows[idx];
-                auto* item = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-                if (!r.file_path.empty())
-                    yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-                yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-                yyjson_mut_arr_append(arr, item);
-            }
+            for (size_t idx : indices)
+                yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
             yyjson_mut_obj_add_val(doc.doc, grouped, gkey.empty() ? "(unknown)" : gkey.c_str(), arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
@@ -1581,31 +1624,16 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         auto* grouped = doc.new_obj();
         for (auto& [gkey, indices] : groups) {
             auto* arr = doc.new_arr();
-            for (size_t idx : indices) {
-                auto& r = rows[idx];
-                auto* item = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-                if (!r.file_path.empty())
-                    yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-                yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-                yyjson_mut_arr_append(arr, item);
-            }
+            for (size_t idx : indices)
+                yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
             yyjson_mut_obj_add_val(doc.doc, grouped, gkey.c_str(), arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else {
         // Flat list (default / backward-compatible)
         auto* results = doc.new_arr();
-        for (auto& r : rows) {
-            auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
-            if (!r.file_path.empty())
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
-            yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
-            yyjson_mut_arr_append(results, item);
-        }
+        for (auto& r : rows)
+            yyjson_mut_arr_append(results, emit_caller_item(r));
         yyjson_mut_obj_add_val(doc.doc, root, "results", results);
         yyjson_mut_obj_add_bool(doc.doc, root, "has_more", false);
     }
@@ -1623,9 +1651,10 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
     if (limit > 500) limit = 500;
 
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
+    bool compact = params ? json_get_bool(params, "compact", false) : false;
 
     auto* stmt = cache.get("callees_approx",
-        "SELECT e.dst_id, n.name, n.qualname, n.signature, e.confidence, f.path "
+        "SELECT e.dst_id, n.kind, n.name, n.qualname, n.signature, e.confidence, f.path, n.start_line, n.end_line "
         "FROM edges e "
         "JOIN nodes n ON e.dst_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
@@ -1636,19 +1665,32 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
     sqlite3_bind_int64(stmt, 2, limit);
 
     // Collect raw results
-    struct CalleeRow { int64_t id; std::string name; std::string qualname; std::string signature; std::string file_path; double confidence; };
+    struct CalleeRow {
+        int64_t id;
+        std::string kind;
+        std::string name;
+        std::string qualname;
+        std::string signature;
+        std::string file_path;
+        int start_line = 0;
+        int end_line = 0;
+        double confidence;
+    };
     std::vector<CalleeRow> rows;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CalleeRow r;
         r.id = sqlite3_column_int64(stmt, 0);
-        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        auto* qn = sqlite3_column_text(stmt, 2);
+        r.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        r.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        auto* qn = sqlite3_column_text(stmt, 3);
         r.qualname = qn ? reinterpret_cast<const char*>(qn) : "";
-        auto* sig = sqlite3_column_text(stmt, 3);
+        auto* sig = sqlite3_column_text(stmt, 4);
         r.signature = sig ? reinterpret_cast<const char*>(sig) : "";
-        r.confidence = sqlite3_column_double(stmt, 4);
-        auto* fp = sqlite3_column_text(stmt, 5);
+        r.confidence = sqlite3_column_double(stmt, 5);
+        auto* fp = sqlite3_column_text(stmt, 6);
         r.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+        r.start_line = sqlite3_column_int(stmt, 7);
+        r.end_line = sqlite3_column_int(stmt, 8);
         rows.push_back(std::move(r));
     }
 
@@ -1658,14 +1700,21 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
 
     auto emit_callee_item = [&](const CalleeRow& r) -> yyjson_mut_val* {
         auto* item = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, item, "callee_node_id", r.id);
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_name", r.name.c_str());
-        if (!r.qualname.empty())
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", r.qualname.c_str());
-        if (!r.signature.empty())
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", r.signature.c_str());
-        if (!r.file_path.empty())
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
+        if (!compact) {
+            yyjson_mut_obj_add_int(doc.doc, item, "callee_node_id", r.id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_name", r.name.c_str());
+            if (!r.qualname.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", r.qualname.c_str());
+            if (!r.signature.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", r.signature.c_str());
+            if (!r.file_path.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
+        } else {
+            add_symbol_result(doc, item, r.id, r.kind.c_str(), r.name.c_str(),
+                r.qualname.empty() ? nullptr : r.qualname.c_str(),
+                r.file_path.empty() ? nullptr : r.file_path.c_str(),
+                r.start_line, r.end_line, true, true, "file", {}, false);
+        }
         yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
         return item;
     };
@@ -2024,21 +2073,18 @@ std::string context_for(yyjson_val* params, Connection& conn,
     int64_t node_id = resolve_node_id(params, conn, cache);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
-    int64_t max_callers = params ? json_get_int(params, "max_callers", 10) : 10;
-    int64_t max_callees = params ? json_get_int(params, "max_callees", 10) : 10;
-
-    // Get the symbol itself
-    std::string sym_json = symbol_get(params, conn, cache, repo_root);
-
-    // Get callers
-    JsonMutDoc caller_params_doc;
-    auto* cp = caller_params_doc.new_obj();
-    caller_params_doc.set_root(cp);
-    yyjson_mut_obj_add_int(caller_params_doc.doc, cp, "node_id", node_id);
-    yyjson_mut_obj_add_int(caller_params_doc.doc, cp, "limit", max_callers);
-
-    // We reuse the callers/callees functions by creating param JSON
-    // For simplicity, build the response directly
+    bool include_source = params ? json_get_bool(params, "include_source", true) : true;
+    int64_t max_source_lines = params ? json_get_int(params, "max_source_lines", 0) : 0;
+    auto* max_callers_val = params ? yyjson_obj_get(params, "max_callers") : nullptr;
+    auto* max_callees_val = params ? yyjson_obj_get(params, "max_callees") : nullptr;
+    int64_t max_callers = max_callers_val ? yyjson_get_sint(max_callers_val) : 10;
+    int64_t max_callees = max_callees_val ? yyjson_get_sint(max_callees_val) : 10;
+    if (max_source_lines < 0)
+        return McpError::invalid_input("Invalid 'max_source_lines': must be >= 0").to_json_rpc(0);
+    if (max_callers < 0)
+        return McpError::invalid_input("Invalid 'max_callers': must be >= 0").to_json_rpc(0);
+    if (max_callees < 0)
+        return McpError::invalid_input("Invalid 'max_callees': must be >= 0").to_json_rpc(0);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -2070,10 +2116,13 @@ std::string context_for(yyjson_val* params, Connection& conn,
     std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
     if (!file_path.empty()) {
         yyjson_mut_obj_add_strcpy(doc.doc, symbol, "file_path", file_path.c_str());
-        int sl = sqlite3_column_int(sym_stmt, 6);
-        int el = sqlite3_column_int(sym_stmt, 7);
-        auto source = read_source_snippet(repo_root, file_path, sl, el);
-        if (!source.empty()) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "source", source.c_str());
+        if (include_source) {
+            int sl = sqlite3_column_int(sym_stmt, 6);
+            int el = sqlite3_column_int(sym_stmt, 7);
+            auto source = read_source_snippet(repo_root, file_path, sl, el);
+            source = truncate_source_lines(source, max_source_lines);
+            if (!source.empty()) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "source", source.c_str());
+        }
     }
 
     yyjson_mut_obj_add_val(doc.doc, root, "symbol", symbol);
@@ -2083,41 +2132,71 @@ std::string context_for(yyjson_val* params, Connection& conn,
         "SELECT e.src_id, n.name, f.path, e.confidence "
         "FROM edges e JOIN nodes n ON e.src_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
-        "WHERE e.dst_id = ? AND e.kind = 'calls' LIMIT ?");
+        "WHERE e.dst_id = ? AND e.kind = 'calls'");
     sqlite3_bind_int64(callers_stmt, 1, node_id);
-    sqlite3_bind_int64(callers_stmt, 2, max_callers);
+
+    struct ContextCallerRow {
+        std::string name;
+        std::string file_path;
+        double confidence = 0.0;
+    };
+    std::vector<ContextCallerRow> caller_rows;
+    while (sqlite3_step(callers_stmt) == SQLITE_ROW) {
+        ContextCallerRow row;
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(callers_stmt, 1));
+        auto* cfp = sqlite3_column_text(callers_stmt, 2);
+        row.file_path = cfp ? reinterpret_cast<const char*>(cfp) : "";
+        row.confidence = sqlite3_column_double(callers_stmt, 3);
+        caller_rows.push_back(std::move(row));
+    }
+    bool callers_truncated = max_callers > 0 && static_cast<int64_t>(caller_rows.size()) > max_callers;
+    if (callers_truncated) caller_rows.resize(static_cast<size_t>(max_callers));
 
     auto* callers_arr = doc.new_arr();
-    while (sqlite3_step(callers_stmt) == SQLITE_ROW) {
+    for (const auto& row : caller_rows) {
         auto* c = doc.new_obj();
-        yyjson_mut_obj_add_strcpy(doc.doc, c, "caller_name",
-            reinterpret_cast<const char*>(sqlite3_column_text(callers_stmt, 1)));
-        auto* cfp = sqlite3_column_text(callers_stmt, 2);
-        if (cfp) yyjson_mut_obj_add_strcpy(doc.doc, c, "file_path", reinterpret_cast<const char*>(cfp));
-        yyjson_mut_obj_add_real(doc.doc, c, "confidence", sqlite3_column_double(callers_stmt, 3));
+        yyjson_mut_obj_add_strcpy(doc.doc, c, "caller_name", row.name.c_str());
+        if (!row.file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, c, "file_path", row.file_path.c_str());
+        yyjson_mut_obj_add_real(doc.doc, c, "confidence", row.confidence);
         yyjson_mut_arr_append(callers_arr, c);
     }
     yyjson_mut_obj_add_val(doc.doc, root, "callers", callers_arr);
+    if (callers_truncated) yyjson_mut_obj_add_bool(doc.doc, root, "callers_truncated", true);
 
     // Callees
     auto* callees_stmt = cache.get("context_callees",
         "SELECT e.dst_id, n.name, n.qualname, n.signature, e.confidence "
         "FROM edges e JOIN nodes n ON e.dst_id = n.id "
-        "WHERE e.src_id = ? AND e.kind = 'calls' LIMIT ?");
+        "WHERE e.src_id = ? AND e.kind = 'calls'");
     sqlite3_bind_int64(callees_stmt, 1, node_id);
-    sqlite3_bind_int64(callees_stmt, 2, max_callees);
+
+    struct ContextCalleeRow {
+        std::string name;
+        std::string qualname;
+        double confidence = 0.0;
+    };
+    std::vector<ContextCalleeRow> callee_rows;
+    while (sqlite3_step(callees_stmt) == SQLITE_ROW) {
+        ContextCalleeRow row;
+        row.name = reinterpret_cast<const char*>(sqlite3_column_text(callees_stmt, 1));
+        auto* cqn = sqlite3_column_text(callees_stmt, 2);
+        row.qualname = cqn ? reinterpret_cast<const char*>(cqn) : "";
+        row.confidence = sqlite3_column_double(callees_stmt, 4);
+        callee_rows.push_back(std::move(row));
+    }
+    bool callees_truncated = max_callees > 0 && static_cast<int64_t>(callee_rows.size()) > max_callees;
+    if (callees_truncated) callee_rows.resize(static_cast<size_t>(max_callees));
 
     auto* callees_arr = doc.new_arr();
-    while (sqlite3_step(callees_stmt) == SQLITE_ROW) {
+    for (const auto& row : callee_rows) {
         auto* c = doc.new_obj();
-        yyjson_mut_obj_add_strcpy(doc.doc, c, "callee_name",
-            reinterpret_cast<const char*>(sqlite3_column_text(callees_stmt, 1)));
-        auto* cqn = sqlite3_column_text(callees_stmt, 2);
-        if (cqn) yyjson_mut_obj_add_strcpy(doc.doc, c, "qualname", reinterpret_cast<const char*>(cqn));
-        yyjson_mut_obj_add_real(doc.doc, c, "confidence", sqlite3_column_double(callees_stmt, 4));
+        yyjson_mut_obj_add_strcpy(doc.doc, c, "callee_name", row.name.c_str());
+        if (!row.qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, c, "qualname", row.qualname.c_str());
+        yyjson_mut_obj_add_real(doc.doc, c, "confidence", row.confidence);
         yyjson_mut_arr_append(callees_arr, c);
     }
     yyjson_mut_obj_add_val(doc.doc, root, "callees", callees_arr);
+    if (callees_truncated) yyjson_mut_obj_add_bool(doc.doc, root, "callees_truncated", true);
 
     // Container info: enclosing type/namespace/module (via 'contains' edge where dst = node_id)
     {
