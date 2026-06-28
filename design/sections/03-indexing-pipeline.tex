@@ -62,14 +62,50 @@ Accepted files are parsed with the tree-sitter grammar for their detected
 language (\texttt{src/index/parser.h:30--101}). Tree-sitter produces a
 concrete syntax tree (CST) in memory. Parse errors are tolerated:
 tree-sitter performs error-recovery and returns partial trees for files with
-syntax errors. The CST is the input to the extractor.
+syntax errors. The CST is the input to the extractor, and
+Figure~\ref{fig:cst-fragment} shows the kind of fragment the extractor walks.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.74\textwidth}
+\begin{triton}
+tree TD
+  title extractor view of a CST fragment
+  translation_unit :box
+    function_definition :box
+      symbol_node :leaf
+      parameters :leaf
+      block :box
+        call_expression :leaf
+          calls_edge :leaf
+        return_statement :leaf
+\end{triton}
+  \caption{A small CST fragment as seen by the extractor while it identifies
+           symbol and call sites.}
+  \label{fig:cst-fragment}
+\end{figure}
 
 \subsection{Symbol and edge extraction}
 
 The extractor (\texttt{src/index/extractor.cpp:207--297}) walks the CST using
 an \emph{iterative stack-based DFS} rather than recursion. This avoids stack
 overflow on deeply nested ASTs (e.g., generated files with thousands of nested
-expressions).
+expressions). Figure~\ref{fig:extractor-stack} sketches the live work stack
+during that traversal.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.62\textwidth}
+\begin{triton}
+stack
+  title extractor DFS stack
+  cells translation_unit function_definition block call_expression
+  capacity 6
+\end{triton}
+  \caption{Iterative DFS state in the extractor, with the next CST node at the
+           top of the stack.}
+  \label{fig:extractor-stack}
+\end{figure}
 
 For each traversed node the extractor identifies:
 \begin{itemize}

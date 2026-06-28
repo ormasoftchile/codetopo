@@ -111,6 +111,25 @@ LLM pipeline rather than a minimal local structural index.
 \subsection{Competitive summary}
 
 Table~\ref{tab:competitive} summarizes the landscape against codetopo.
+Figure~\ref{fig:capability-grid} provides a compact capability slice of the
+same comparison.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.84\textwidth}
+\begin{triton}
+matrix
+  title capability grid
+  row Tool MCP Graph FTS Incr Local
+  row ctags no no no no yes
+  row cscope no part part part yes
+  row clangd no yes no yes yes
+  row codetopo yes yes yes yes yes
+\end{triton}
+  \caption{A compact capability grid contrasting codetopo with representative
+           code-navigation tools.}
+  \label{fig:capability-grid}
+\end{figure}
 
 \begin{longtable}{p{2.0cm}p{2.6cm}p{1.7cm}p{1.8cm}p{1.6cm}p{1.4cm}p{0.7cm}p{3.2cm}}
 \caption{Competitive landscape: code intelligence tools.}

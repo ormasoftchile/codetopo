@@ -52,6 +52,28 @@ CREATE TABLE roots (
 Each row represents a workspace root. The \texttt{id} is used as the root
 offset in the ID allocation scheme described in \S\ref{sec:workspace}.
 
+In addition to the relational tables, the schema keeps build and repository
+metadata in a small \texttt{kv} store accessed through
+\texttt{set\_kv()}/\texttt{get\_kv()}; Figure~\ref{fig:schema-kv} sketches
+representative entries.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.82\textwidth}
+\begin{triton}
+hashmap
+  title schema kv
+  buckets 5
+  bucket 0: schema_version->8
+  bucket 1: indexer_version->2026.06, last_index_time->2026-06-28T12:48
+  bucket 2: repo_root->workspace, language_coverage->13langs
+  bucket 3: git_head->abc1234, git_branch->main
+\end{triton}
+  \caption{Representative \texttt{kv} metadata entries stored alongside the
+           structural tables.}
+  \label{fig:schema-kv}
+\end{figure}
+
 \subsection{files}
 
 \begin{lstlisting}[language=sql]

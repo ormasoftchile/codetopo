@@ -30,7 +30,23 @@ ensures uniqueness with a multiplicative offset:
 10^{18}$) supports around 9 billion root-slots at this scale, far beyond any
 practical need. Because all IDs are stored in a single file, no cross-root
 join is needed: a node ID uniquely identifies both the root and the local
-record.
+record. Figure~\ref{fig:id-offset-array} visualizes one root-local slot before
+the offset formula lifts it into the global ID space.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.7\textwidth}
+\begin{triton}
+array
+  title local_id within one root slot
+  cells 1 2 3 4 5
+  index
+  ptr local_id -> 2
+\end{triton}
+  \caption{A root-local ID slot before conversion into the global
+           \texttt{root\_id * 10\^{}9 + local\_id} namespace.}
+  \label{fig:id-offset-array}
+\end{figure}
 
 \subsection{Path handling}
 
