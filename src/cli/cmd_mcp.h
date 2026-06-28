@@ -6,6 +6,7 @@
 #include "db/workspace.h"
 #include "mcp/server.h"
 #include "mcp/tools.h"
+#include "util/log.h"
 #include "util/process.h"
 #include "watch/watcher.h"
 #include <iostream>
@@ -32,16 +33,26 @@ struct ReindexState {
                  std::function<void()> on_complete) {
         if (running.exchange(true)) {
             queued = true;  // collapse into next run
+            mcp_log("reindex: already running, queued");
             return;
         }
         if (monitor_thread.joinable()) monitor_thread.detach();
         monitor_thread = std::thread([=, this]() {
             do {
                 queued = false;
+                auto started = std::chrono::steady_clock::now();
+                mcp_log("reindex: started");
                 auto exe = get_self_executable_path();
                 int rc = spawn_and_wait(exe,
                     {"index", "--root", root, "--db", db, "--supervised"});
-                if (rc == 0 && on_complete) on_complete();
+                auto elapsed = std::chrono::steady_clock::now() - started;
+                if (rc == 0) {
+                    mcp_log("reindex: done (" + format_duration_seconds(elapsed) + ")");
+                    if (on_complete) on_complete();
+                } else {
+                    mcp_log("reindex: failed (" + format_duration_seconds(elapsed)
+                            + ", exit=" + std::to_string(rc) + ")");
+                }
             } while (queued.load());
             running = false;
         });
@@ -63,14 +74,13 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     {
         std::string legacy_ws = (fs::path(root_hint) / ".codetopo" / "workspace.sqlite").string();
         if (fs::exists(legacy_ws)) {
-            std::cerr << "WARNING: workspace.sqlite is no longer used. "
-                         "Run 'codetopo workspace add <path> --root " << root_hint
-                      << "' to re-add extra roots into index.sqlite.\n";
+            mcp_log("warning: workspace.sqlite is no longer used. Run 'codetopo workspace add <path> --root "
+                    + root_hint + "' to re-add extra roots into index.sqlite.");
         }
     }
 
     if (!fs::exists(db_path)) {
-        std::cerr << "ERROR: Database not found: " << db_path << "\n";
+        mcp_log("error: database not found: " + db_path);
         return 1;
     }
 
@@ -79,8 +89,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     // Schema version check
     int version = schema::get_schema_version(conn);
     if (version != CURRENT_SCHEMA_VERSION) {
-        std::cerr << "ERROR: Schema version mismatch (db=" << version
-                  << " expected=" << CURRENT_SCHEMA_VERSION << ")\n";
+        mcp_log("error: schema version mismatch (db=" + std::to_string(version)
+                + " expected=" + std::to_string(CURRENT_SCHEMA_VERSION) + ")");
         return 3;
     }
 
@@ -93,16 +103,20 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     //   lazy/off: skip startup reindex
     ReindexState reindex;
     if (freshness == FreshnessPolicy::eager) {
-        std::cerr << "Freshness=eager: blocking on startup reindex...\n";
+        auto started = std::chrono::steady_clock::now();
+        mcp_log("reindex: started");
         auto exe = get_self_executable_path();
         int rc = spawn_and_wait(exe,
             {"index", "--root", repo_root, "--db", db_path, "--supervised"});
         if (rc != 0) {
-            std::cerr << "WARNING: startup reindex exited with code " << rc << "\n";
+            mcp_log("reindex: failed (" + format_duration_seconds(std::chrono::steady_clock::now() - started)
+                    + ", exit=" + std::to_string(rc) + ")");
+        } else {
+            mcp_log("reindex: done (" + format_duration_seconds(std::chrono::steady_clock::now() - started)
+                    + ")");
         }
         // QueryCache is constructed fresh with the connection below, so no clear() needed.
     } else if (freshness == FreshnessPolicy::normal) {
-        std::cerr << "Freshness=normal: background startup reindex...\n";
         reindex.trigger(repo_root, db_path, [&]() {
             // Note: The child wrote to the DB. Since we open conn read-only and
             // SQLite WAL allows concurrent readers, the next query will pick up
@@ -111,7 +125,6 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             // reindex boundaries — but the cache is per-Connection and the conn
             // is opened once, so clearing is a no-op here. Future watch mode (P2)
             // will need to integrate cache invalidation more tightly.
-            std::cerr << "Background reindex completed.\n";
         });
     }
     // lazy and off: no startup reindex
@@ -235,10 +248,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "List all roots in the multi-root workspace with file/symbol/edge counts.",
         R"J({"type":"object","properties":{}})J");
 
-    std::cerr << "MCP server started (db=" << db_path << " repo=" << repo_root
-              << " freshness=" << static_cast<int>(freshness)
-              << " debounce=" << debounce_ms << "ms"
-              << " watch=" << (watch ? "on" : "off") << ")\n";
+    mcp_log("codetopo mcp started");
+    mcp_log("db: " + db_path);
+    mcp_log("repo: " + repo_root);
+    mcp_log("schema: v" + std::to_string(version) + "  tools: " + std::to_string(server.tool_count()));
 
     // P2: Start filesystem watcher for auto-reindex when --watch is enabled.
     // Cross-thread contract: watcher thread -> reindex monitor thread -> atomic flag
@@ -267,21 +280,26 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                 }
                 if (!has_relevant) return;
 
+                mcp_log("watcher: change detected, triggering reindex");
                 reindex.trigger(repo_root, db_path, [&]() {
                     server.request_refresh();
-                    std::cerr << "Watcher-triggered reindex completed, cache invalidated.\n";
+                    mcp_log("watcher: reindex complete, cache invalidated");
                 });
             },
             debounce
         );
         watcher->start();
-        std::cerr << "Filesystem watcher started (debounce=" << debounce_ms << "ms)\n";
+        mcp_log("watcher: started (" + std::to_string(debounce_ms) + "ms debounce)");
     }
 
     int rc = server.run();
 
     // Watcher::~Watcher() calls stop(), but be explicit about shutdown order.
-    if (watcher) watcher->stop();
+    if (watcher) {
+        watcher->stop();
+        mcp_log("watcher: stopped");
+    }
+    mcp_log("codetopo mcp stopped (rc=" + std::to_string(rc) + ")");
     return rc;
 }
 
@@ -291,7 +309,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
     namespace fs = std::filesystem;
 
     if (!fs::exists(db_path)) {
-        std::cerr << "ERROR: Database not found: " << db_path << "\n";
+        mcp_log("error: database not found: " + db_path);
         return 1;
     }
 
@@ -330,7 +348,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
 
     auto it = all_tools.find(tool_name);
     if (it == all_tools.end()) {
-        std::cerr << "ERROR: Unknown tool: " << tool_name << "\n";
+        mcp_log("error: unknown tool: " + tool_name);
         return 2;
     }
 
@@ -339,7 +357,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         std::cout << result << "\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
+        mcp_log("error: " + truncate_for_log(e.what()));
         return 1;
     }
 }
