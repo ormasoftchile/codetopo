@@ -39,6 +39,124 @@ static void add_pagination_fields(JsonMutDoc& doc, yyjson_mut_val* root,
     yyjson_mut_obj_add_int(doc.doc, root, "limit", limit);
 }
 
+static bool include_field(const std::unordered_set<std::string>& fields_set,
+                          const std::string& field) {
+    return fields_set.empty() || fields_set.count(field);
+}
+
+static bool parse_symbol_fields(yyjson_val* params,
+                                std::unordered_set<std::string>& fields_set,
+                                bool& fields_provided,
+                                std::string& error) {
+    fields_provided = false;
+    fields_set.clear();
+    error.clear();
+    if (!params) return true;
+
+    auto* fields = yyjson_obj_get(params, "fields");
+    if (!fields) return true;
+    if (!yyjson_is_arr(fields)) {
+        error = "'fields' must be an array of strings";
+        return false;
+    }
+
+    static const std::unordered_set<std::string> valid_fields = {
+        "node_id", "name", "qualname", "kind",
+        "start_line", "end_line", "span", "file_path", "file"
+    };
+
+    fields_provided = true;
+    yyjson_val* field_val;
+    size_t idx, max;
+    yyjson_arr_foreach(fields, idx, max, field_val) {
+        if (!yyjson_is_str(field_val)) {
+            error = "'fields' entries must be strings";
+            return false;
+        }
+        std::string field = yyjson_get_str(field_val);
+        if (!valid_fields.count(field)) {
+            error = "Invalid field name: " + field;
+            return false;
+        }
+        fields_set.insert(field);
+    }
+    return true;
+}
+
+static void add_symbol_span_object(JsonMutDoc& doc, yyjson_mut_val* item,
+                                   int start_line, int end_line) {
+    auto* span = doc.new_obj();
+    yyjson_mut_obj_add_int(doc.doc, span, "start_line", start_line);
+    yyjson_mut_obj_add_int(doc.doc, span, "end_line", end_line);
+    yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+}
+
+static void add_symbol_span_array(JsonMutDoc& doc, yyjson_mut_val* item,
+                                  int start_line, int end_line) {
+    auto* span = doc.new_arr();
+    yyjson_mut_arr_add_int(doc.doc, span, start_line);
+    yyjson_mut_arr_add_int(doc.doc, span, end_line);
+    yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+}
+
+static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
+                              int64_t node_id, const char* kind,
+                              const char* name, const char* qualname,
+                              const char* file_path, int start_line,
+                              int end_line, bool compact,
+                              bool compact_include_file,
+                              const char* compact_file_key,
+                              const std::unordered_set<std::string>& fields_set,
+                              bool fields_provided) {
+    if (fields_provided) {
+        if (fields_set.empty()) {
+            yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+            if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+            if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
+            add_symbol_span_object(doc, item, start_line, end_line);
+            return;
+        }
+
+        if (include_field(fields_set, "node_id"))
+            yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
+        if (include_field(fields_set, "kind"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+        if (include_field(fields_set, "name"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+        if (qualname && include_field(fields_set, "qualname"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+        if (file_path && include_field(fields_set, "file_path"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
+        if (file_path && include_field(fields_set, "file"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", file_path);
+        if (include_field(fields_set, "start_line"))
+            yyjson_mut_obj_add_int(doc.doc, item, "start_line", start_line);
+        if (include_field(fields_set, "end_line"))
+            yyjson_mut_obj_add_int(doc.doc, item, "end_line", end_line);
+        if (include_field(fields_set, "span"))
+            add_symbol_span_array(doc, item, start_line, end_line);
+        return;
+    }
+
+    yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+    if (!compact) {
+        if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+        if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
+        add_symbol_span_object(doc, item, start_line, end_line);
+        return;
+    }
+
+    if (qualname && strcmp(qualname, name) != 0)
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+    if (compact_include_file && file_path)
+        yyjson_mut_obj_add_strcpy(doc.doc, item, compact_file_key, file_path);
+    add_symbol_span_array(doc, item, start_line, end_line);
+}
+
 // Resolve a node by node_id, or by symbol+file name lookup.
 // Allows tools to be called with stable identifiers instead of volatile IDs.
 static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache& cache,
@@ -990,9 +1108,17 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
     const char* name_glob = params ? json_get_str(params, "name_glob") : nullptr;
+    bool compact = params ? json_get_bool(params, "compact", false) : false;
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+
+    std::unordered_set<std::string> fields_set;
+    bool fields_provided = false;
+    std::string fields_error;
+    if (!parse_symbol_fields(params, fields_set, fields_provided, fields_error)) {
+        return McpError::invalid_input(fields_error).to_json_rpc(0);
+    }
 
     if (limit > 2000) limit = 2000;
 
@@ -1053,20 +1179,15 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
         count++;
 
         auto* item = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
-        auto* qn = sqlite3_column_text(stmt, 3);
-        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
-        auto* fp = sqlite3_column_text(stmt, 4);
-        if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
-
-        auto* span = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
-        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 6));
-        yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+        add_symbol_result(doc, item,
+            sqlite3_column_int64(stmt, 0),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)),
+            sqlite3_column_int(stmt, 5),
+            sqlite3_column_int(stmt, 6),
+            compact, true, "file", fields_set, fields_provided);
 
         yyjson_mut_arr_append(results, item);
     }
@@ -1082,10 +1203,18 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
     bool recursive = params ? json_get_bool(params, "recursive", true) : true;
+    bool compact = params ? json_get_bool(params, "compact", false) : false;
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     if (limit > 2000) limit = 2000;
+
+    std::unordered_set<std::string> fields_set;
+    bool fields_provided = false;
+    std::string fields_error;
+    if (!parse_symbol_fields(params, fields_set, fields_provided, fields_error)) {
+        return McpError::invalid_input(fields_error).to_json_rpc(0);
+    }
 
     std::vector<std::string> kinds;
     if (params) {
@@ -1192,20 +1321,15 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         count++;
 
         auto* item = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
-        auto* qn = sqlite3_column_text(stmt, 3);
-        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
-        auto* fp = sqlite3_column_text(stmt, 4);
-        if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
-
-        auto* span = doc.new_obj();
-        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
-        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 6));
-        yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+        add_symbol_result(doc, item,
+            sqlite3_column_int64(stmt, 0),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)),
+            sqlite3_column_int(stmt, 5),
+            sqlite3_column_int(stmt, 6),
+            compact, false, "file_path", fields_set, fields_provided);
         yyjson_mut_arr_append(results, item);
     }
 
