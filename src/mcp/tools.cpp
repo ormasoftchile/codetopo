@@ -613,7 +613,7 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     const char* requested_path = params ? json_get_str(params, "path") : nullptr;
     if (!requested_path) requested_path = ".";
 
-    int64_t depth = params ? json_get_int(params, "depth", 2) : 2;
+    int64_t depth = params ? json_get_int(params, "depth", 1) : 1;
     int64_t max_files = params ? json_get_int(params, "max_files", 500) : 500;
     if (depth < 0) {
         return McpError::invalid_input("Invalid 'depth': must be >= 0").to_json_rpc(0);
