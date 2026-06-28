@@ -3422,7 +3422,7 @@ std::string code_search(yyjson_val* params, Connection& conn,
     if (limit > 100) limit = 100;
     if (limit < 1) limit = 1;
 
-    int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 2)) : 2;
+    int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 1)) : 1;
     if (context_lines > 5) context_lines = 5;
     if (context_lines < 0) context_lines = 0;
 
