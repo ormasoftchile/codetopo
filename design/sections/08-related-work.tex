@@ -61,6 +61,53 @@ dataflow analysis. Semgrep has no persistent symbol graph, no call-graph
 navigation, and no blast-radius analysis. It is purpose-built for security
 pattern detection, not code navigation.
 
+\textbf{codebase-memory-mcp}~\cite{deusdata2026codebasememory} indexes a
+repository into a persistent knowledge graph using tree-sitter across 158
+languages, with an additional ``Hybrid LSP'' layer for type-aware resolution in
+nine language families. It stores the graph locally in SQLite-backed caches and
+exposes 14 MCP tools plus a CLI for structural search, semantic retrieval, call
+tracing, and architecture queries. It is open source (MIT), but its public
+surface is centered on tool-owned graph queries rather than the smaller,
+explicitly local SQLite schema and stable query surface that codetopo
+prioritizes.
+
+\textbf{CodeCompass}~\cite{ericsson2016codecompass} is an earlier code
+comprehension framework for large projects, especially C/C++ and Java, with
+plugin-based deep parsing and optional incremental re-parsing from compilation
+databases. It persists parse results in SQLite or PostgreSQL and serves them
+through a web UI, a web server, and a limited C/C++ LSP-style HTTP endpoint.
+CodeCompass is open source (GPL-3.0), but it requires heavier setup than
+codetopo, is build-configuration-dependent for strong results, and has no MCP
+surface for autonomous agents.
+
+\textbf{code-review-graph}~\cite{tirth2026codereviewgraph} builds a local
+tree-sitter graph of files, symbols, calls, imports, tests, flows, and
+communities, stores it in SQLite with FTS5, and optionally augments search with
+embeddings. Its primary query surfaces are a CLI, 30 MCP tools, and GitHub
+Action / editor integrations aimed at token-efficient review workflows. It is
+open source (MIT) and close in spirit to codetopo, but it is deliberately
+review-centric, and its own evaluation documents weaker flow detection and
+conservative impact precision outside that review setting.
+
+\textbf{CodeGraphContext}~\cite{codegraphcontext2025cgc} turns repositories
+into graph databases using tree-sitter, with optional SCIP indexers for more
+precise C/C++ and C\# resolution. It offers both a CLI and an MCP server with
+roughly two dozen tools, backed by FalkorDB Lite, KuzuDB, LadybugDB, Neo4j, or
+Nornic rather than a single embedded format. CodeGraphContext is open source
+(MIT), but its storage/backend story and even its published counts (languages
+and tools) vary across documents, making it less lightweight and less
+internally uniform than codetopo's single-file SQLite deployment.
+
+\textbf{Repowise}~\cite{repowise2026repowise} extends the ``AI-native'' idea
+beyond code structure: tree-sitter-derived graph indexing is combined with git
+analytics, generated documentation, architectural-decision mining, and
+deterministic code-health scoring. It exposes 10 MCP tools in single-repo mode
+(13 in workspace mode), a CLI, and a local dashboard, storing data in
+\texttt{.repowise/wiki.db} by default (SQLite; PostgreSQL optional). Repowise
+is open source (AGPL-3.0), but its initialization is substantially heavier than
+codetopo's and many of its headline features assume a broader documentation /
+LLM pipeline rather than a minimal local structural index.
+
 \subsection{Competitive summary}
 
 Table~\ref{tab:competitive} summarizes the landscape against codetopo.
@@ -91,6 +138,11 @@ rust-analyzer & Salsa in-memory; full type inference & Rust only & LSP: go-to-de
 clangd & Clang AST + background index & C, C++, ObjC & LSP: completion, refs & On-disk (\texttt{.cache}) & LSP only & Apache-2 & C/C++ only; no MCP; no FTS \\
 GitHub Code Search & Trigram + symbol index (Blackbird) & Polyglot (all GitHub) & NL, regex, symbol search & Remote cloud & Copilot is MCP \emph{client} & No & Remote-only; no call graph; subscription \\
 Semgrep & AST structural pattern matching & 30+ & Pattern matching; dataflow (Pro) & In-memory & None & LGPL/Pro & No persistent graph; no call-graph nav \\
+codebase-memory-mcp & tree-sitter + Hybrid LSP + embeddings & 158 & 14 MCP tools; CLI & SQLite-backed local cache & Full MCP server & MIT & Tool-owned query surface; docs inconsistent on some counts \\
+CodeCompass & Compiler/plugin parsing; build DB & C, C++, Java; docs also mention C\#, Python & Web UI; HTTP server; partial LSP & SQLite / PostgreSQL & LSP only (no MCP) & GPL-3 & Heavy setup; build-dependent; no agent-native API \\
+code-review-graph & tree-sitter graph + FTS5 + optional embeddings & 30+ & 30 MCP tools; CLI; GitHub Action & SQLite (local) & Full MCP server & MIT & Review-centric; documented flow/precision limits \\
+CodeGraphContext & tree-sitter + optional SCIP & 20--23 (docs vary) & CLI; MCP; Cypher & Falkor/Kuzu/Ladybug/Neo4j/Nornic & Full MCP server & MIT & Multiple backends; documentation drift; heavier than SQLite \\
+Repowise & tree-sitter graph + git/docs/health layers & 15 & 10--13 MCP tools; CLI; dashboard & SQLite by default; PostgreSQL optional & Full MCP server & AGPL-3 & Heavier init; broader pipeline than a minimal local index \\
 nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight, fold, local nav & In-memory (editor) & None & Apache-2 & No cross-file graph; editor-bound \\
 \textbf{codetopo} & tree-sitter AST; xxHash incremental & \textbf{13} & FTS5, call graph, blast-radius & SQLite (local) & \textbf{Full MCP server} & MIT & See \S\ref{sec:status} \\
 \end{longtable}
@@ -127,13 +179,67 @@ nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight,
         approximations (\texttt{callers\_approx}, \texttt{callees\_approx}).
         rust-analyzer and clangd resolve overloads, generics, and templates
         with full type inference.
+
+        \emph{Tradeoff:} Adding precise resolution would force codetopo beyond a
+        uniform tree-sitter pipeline into language-specific semantic front-ends
+        or imported SCIP/LSIF data, increasing setup friction and making the
+        current single-schema abstraction harder to preserve across languages.
+        \emph{Cost:} XL (multiple person-months), with the hardest part being a
+        durable cross-language representation for resolved types, overloads, and
+        external dependencies that still fits incremental local indexing.
+        \emph{Value:} It would materially improve ``go to real callee'',
+        polymorphic impact analysis, and agent workflows that must distinguish
+        same-named methods, constructors, or generic instantiations.
   \item[No taint/dataflow analysis.] Security and refactoring use cases
         benefit from tracking whether data flows between two symbols. Semgrep
         Pro and Kythe provide this; codetopo does not.
+
+        \emph{Tradeoff:} Dataflow would add a second analysis stack beyond the
+        current symbol/reference graph, with substantially higher correctness
+        risk from path sensitivity, aliasing, interprocedural summaries, and
+        language-specific semantics. \emph{Cost:} XL, because tree-sitter alone
+        is insufficient; the hardest part is introducing and maintaining an IR
+        or SSA-like graph that can represent control/data dependencies across
+        supported languages without turning the indexer into a compiler.
+        \emph{Value:} It would unlock source-to-sink security queries, more
+        credible ``can this input reach here?'' agent answers, and safer
+        automated refactoring for parameter, return-value, and field propagation.
   \item[No formal LSP endpoint.] codetopo speaks MCP. Adding an LSP adapter
         would expand editor coverage beyond the VS Code family.
+
+        \emph{Tradeoff:} An LSP surface would widen compatibility, but it would
+        also impose JSON-RPC session management, text-document lifecycle
+        handling, and editor-oriented semantics that are distinct from the
+        current tool-style MCP contract. \emph{Cost:} M--L, with the hardest
+        part being a robust server loop plus enough workspace/\allowbreak
+        \texttt{textDocument} methods to be useful without duplicating a full
+        language server for each language. \emph{Value:} It would enable
+        lightweight editor integrations, make codetopo usable in clients that
+        cannot host MCP, and let developers reuse the local SQLite index for
+        jump-to-definition, references, and call-hierarchy views.
   \item[No remote/shared index.] The index is per-developer local. Kythe and
         GitHub Code Search support team-shared indexes; codetopo does not.
+
+        \emph{Tradeoff:} A shared index would sacrifice some of codetopo's
+        simplicity and privacy by introducing synchronization, trust, and
+        freshness problems that do not exist for a single local database.
+        \emph{Cost:} L--XL, because the hardest part is not storage but stable
+        cross-machine identity: syncing nodes/edges, reconciling divergent
+        repository states, and handling deletes or rebases without corrupting
+        graph consistency. \emph{Value:} It would help onboarding, CI-produced
+        indexes for very large repositories, and agent workflows that need a
+        common team view rather than per-laptop cold starts.
   \item[No symbol-importance ranking.] FTS5 BM25 scores text relevance but
         codetopo has no PageRank-style scoring on the call graph.
+
+        \emph{Tradeoff:} Ranking would improve prioritization, but it also
+        introduces another tunable heuristic whose outputs can appear
+        authoritative even when they reflect graph incompleteness or language
+        biases in the approximate call edges. \emph{Cost:} S--M, since the core
+        computation is comparatively small; the hardest part is choosing a
+        ranking formulation and update strategy that remains stable and
+        interpretable under incremental re-indexing. \emph{Value:} It would
+        improve search result ordering, help agents surface ``central'' symbols
+        first, and support architecture, hotspot, and review workflows that need
+        to separate core APIs from peripheral helpers.
 \end{description}

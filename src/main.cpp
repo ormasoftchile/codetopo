@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include "core/config.h"
+#include "db/schema.h"
 #include "cli/cmd_index.h"
 #include "cli/cmd_init.h"
 #include "cli/cmd_mcp.h"
@@ -17,6 +18,7 @@
 
 int main(int argc, char** argv) {
     CLI::App app{"codetopo — local code graph indexer + MCP server"};
+    app.set_version_flag("--version,-v", std::string(codetopo::INDEXER_VERSION));
     app.require_subcommand(1);
 
     // --- index subcommand ---
