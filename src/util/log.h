@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iomanip>
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <sstream>
@@ -16,6 +17,13 @@
 #include <cstdlib>
 
 namespace codetopo {
+
+// When true, mcp_log also sends notifications/message over stdout (JSON-RPC channel).
+// Set to true after the MCP client sends notifications/initialized.
+inline std::atomic<bool>& mcp_notify_active() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
 
 inline void mcp_log(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
@@ -28,7 +36,28 @@ inline void mcp_log(const std::string& msg) {
 #endif
     char buf[10];
     std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm_buf);
-    std::cerr << "[" << buf << "] " << msg << "\n" << std::flush;
+    std::string line = std::string("[") + buf + "] " + msg;
+
+    // Always write to stderr (visible in terminal / VS Code output channel).
+    std::cerr << line << "\n" << std::flush;
+
+    // Also send as MCP notifications/message over stdout once the session is live.
+    if (mcp_notify_active().load(std::memory_order_relaxed)) {
+        // Build: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"..."}}
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        doc.set_root(root);
+        yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
+        yyjson_mut_obj_add_str(doc.doc, root, "method", "notifications/message");
+        auto* params = doc.new_obj();
+        yyjson_mut_obj_add_str(doc.doc, params, "level", "info");
+        yyjson_mut_obj_add_strcpy(doc.doc, params, "data", line.c_str());
+        yyjson_mut_obj_add_val(doc.doc, root, "params", params);
+
+        std::lock_guard<std::mutex> lk(mcp_stdout_mutex());
+        std::cout << doc.to_string() << "\n";
+        std::cout.flush();
+    }
 }
 
 inline std::string truncate_for_log(std::string text, size_t max_len = 120) {
