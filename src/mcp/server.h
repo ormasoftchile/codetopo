@@ -8,6 +8,7 @@
 #include "db/queries.h"
 #include "util/log.h"
 #include <string>
+#include <string_view>
 #include <functional>
 #include <unordered_map>
 #include <iostream>
@@ -159,7 +160,7 @@ public:
 
                     // T070: Response size cap (512 KB)
                     if (result.size() > 512 * 1024) {
-                        result = truncate_response(result);
+                        result = truncate_response(tool_name, result);
                     }
 
                     std::string done = "done: " + std::string(tool_name) + " (" + format_duration_ms(elapsed);
@@ -372,15 +373,35 @@ private:
         json_write_line(err.to_json_rpc(id));
     }
 
-    static std::string truncate_response(const std::string& json) {
-        // Simple truncation: wrap in a truncation notice
-        JsonMutDoc doc;
-        auto* root = doc.new_obj();
-        doc.set_root(root);
-        yyjson_mut_obj_add_bool(doc.doc, root, "truncated", true);
-        yyjson_mut_obj_add_str(doc.doc, root, "truncated_reason", "response_size");
-        yyjson_mut_obj_add_str(doc.doc, root, "message", "Response exceeded 512 KB limit");
-        return doc.to_string();
+    static std::string truncate_response(std::string_view tool_name, const std::string& json) {
+        auto doc = json_parse(json);
+        if (!doc || !yyjson_is_obj(doc.root())) {
+            mcp_log("warn: oversized response from " + std::string(tool_name)
+                    + " (" + std::to_string(json.size())
+                    + " bytes) could not be annotated");
+            return json;
+        }
+
+        auto* root = doc.root();
+        auto* has_more = yyjson_obj_get(root, "has_more");
+        auto* offset = yyjson_obj_get(root, "offset");
+        if (has_more && offset) {
+            mcp_log("warn: oversized paginated response from " + std::string(tool_name)
+                    + " (" + std::to_string(json.size())
+                    + " bytes) left intact for caller pagination");
+            return json;
+        }
+
+        JsonMutDoc out;
+        auto* root_copy = yyjson_val_mut_copy(out.doc, root);
+        out.set_root(root_copy);
+        yyjson_mut_obj_add_bool(out.doc, root_copy, "_truncated", true);
+        yyjson_mut_obj_add_int(out.doc, root_copy, "_truncated_bytes",
+                               static_cast<int64_t>(json.size()));
+        mcp_log("warn: oversized response from " + std::string(tool_name)
+                + " (" + std::to_string(json.size())
+                + " bytes) annotated with _truncated metadata");
+        return out.to_string();
     }
 
     // R2: Stat .git/HEAD to cheaply detect branch switches / new commits.

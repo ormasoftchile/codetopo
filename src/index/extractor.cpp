@@ -1,8 +1,10 @@
 #include "index/extractor.h"
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <unordered_set>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -13,6 +15,92 @@
 #endif
 
 namespace codetopo {
+
+namespace {
+
+std::string source_text(TSNode node, const std::string& source) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (start >= source.size() || end > source.size() || start >= end) return "";
+    return source.substr(start, end - start);
+}
+
+bool is_js_function_like(const std::string& type) {
+    return type == "function_expression" || type == "arrow_function";
+}
+
+bool is_nested_function_boundary(const std::string& type) {
+    return type == "function_expression" || type == "arrow_function" ||
+           type == "function_declaration" || type == "generator_function" ||
+           type == "generator_function_declaration" || type == "method_definition";
+}
+
+bool starts_with_uppercase_ascii(const std::string& name) {
+    return !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) != 0;
+}
+
+std::string js_member_property_name(TSNode node, const std::string& source) {
+    TSNode property = ts_node_child_by_field_name(node, "property", 8);
+    if (!ts_node_is_null(property)) return source_text(property, source);
+    uint32_t count = ts_node_named_child_count(node);
+    if (count == 0) return "";
+    return source_text(ts_node_named_child(node, count - 1), source);
+}
+
+bool extract_this_assignment_field(TSNode node, const std::string& source, std::string& field_name) {
+    const char* type = ts_node_type(node);
+    if (!type || std::string(type) != "assignment_expression") return false;
+
+    TSNode left = ts_node_child_by_field_name(node, "left", 4);
+    if (ts_node_is_null(left)) left = ts_node_child(node, 0);
+    if (ts_node_is_null(left)) return false;
+    if (std::string(ts_node_type(left)) != "member_expression") return false;
+
+    TSNode object = ts_node_child_by_field_name(left, "object", 6);
+    if (ts_node_is_null(object) || std::string(ts_node_type(object)) != "this") return false;
+
+    field_name = js_member_property_name(left, source);
+    return !field_name.empty();
+}
+
+struct ThisAssignmentMatch {
+    std::string field_name;
+    TSNode assignment_node;
+};
+
+std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, const std::string& source) {
+    std::vector<ThisAssignmentMatch> matches;
+    TSNode body = ts_node_child_by_field_name(function_node, "body", 4);
+    if (ts_node_is_null(body)) return matches;
+
+    std::unordered_set<std::string> seen_fields;
+    std::vector<TSNode> stack{body};
+    while (!stack.empty()) {
+        TSNode current = stack.back();
+        stack.pop_back();
+
+        const char* current_type = ts_node_type(current);
+        if (!current_type) continue;
+        std::string current_type_str(current_type);
+
+        if (current.id != body.id && is_nested_function_boundary(current_type_str)) continue;
+
+        std::string field_name;
+        if (extract_this_assignment_field(current, source, field_name) &&
+            seen_fields.insert(field_name).second) {
+            matches.push_back({field_name, current});
+        }
+
+        uint32_t count = ts_node_named_child_count(current);
+        for (uint32_t i = 0; i < count; ++i) {
+            stack.push_back(ts_node_named_child(current, i));
+        }
+    }
+
+    return matches;
+}
+
+} // namespace
 
 // --- Extractor public ---
 
@@ -509,7 +597,66 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
     else if (type == "variable_declarator") {
         auto name = get_name_from_child(node, "name");
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        std::string value_type = ts_node_is_null(value) ? "" : ts_node_type(value);
+        if (!name.empty() && is_js_function_like(value_type)) {
+            auto this_assignments = collect_this_assignments(value, *source_);
+            // Conservative heuristic: require both an UpperCamelCase binding
+            // and at least one direct this.X assignment in the function body.
+            if (starts_with_uppercase_ascii(name) && !this_assignments.empty()) {
+                std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
+                int constructor_idx = static_cast<int>(result_->symbols.size());
+                add_symbol("constructor_fn", name, node, constructor_qn);
+                if (static_cast<int>(result_->symbols.size()) > constructor_idx) {
+                    for (const auto& assignment : this_assignments) {
+                        int field_idx = static_cast<int>(result_->symbols.size());
+                        add_symbol("field", assignment.field_name, assignment.assignment_node,
+                                   constructor_qn + "._fields." + assignment.field_name);
+                        if (static_cast<int>(result_->symbols.size()) > field_idx) {
+                            result_->edges.push_back({
+                                constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
+                            });
+                        }
+                    }
+                }
+                return;
+            }
+        }
         if (!name.empty()) add_symbol("variable", name, node);
+    }
+    else if (type == "assignment_expression") {
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        std::string right_type = ts_node_is_null(right) ? "" : ts_node_type(right);
+        if (!is_js_function_like(right_type)) return;
+
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        std::string name;
+        if (!ts_node_is_null(left) && std::string(ts_node_type(left)) == "identifier") {
+            name = node_text(left);
+        } else if (right_type == "function_expression") {
+            name = get_name_from_child(right, "name");
+        }
+
+        if (name.empty()) return;
+
+        auto this_assignments = collect_this_assignments(right, *source_);
+        if (!starts_with_uppercase_ascii(name) || this_assignments.empty()) return;
+
+        std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
+        int constructor_idx = static_cast<int>(result_->symbols.size());
+        add_symbol("constructor_fn", name, node, constructor_qn);
+        if (static_cast<int>(result_->symbols.size()) > constructor_idx) {
+            for (const auto& assignment : this_assignments) {
+                int field_idx = static_cast<int>(result_->symbols.size());
+                add_symbol("field", assignment.field_name, assignment.assignment_node,
+                           constructor_qn + "._fields." + assignment.field_name);
+                if (static_cast<int>(result_->symbols.size()) > field_idx) {
+                    result_->edges.push_back({
+                        constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
+                    });
+                }
+            }
+        }
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);

@@ -26,6 +26,10 @@ std::string file_search(yyjson_val* params, Connection& conn,
 std::string dir_list(yyjson_val* params, Connection& conn,
                      QueryCache& cache, const std::string& repo_root);
 
+// T081b: dir_tree — return a directory subtree up to a given depth
+std::string dir_tree(yyjson_val* params, Connection& conn,
+                     QueryCache& cache, const std::string& repo_root);
+
 // T062: symbol_search
 std::string symbol_search(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root);
@@ -33,6 +37,10 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
 // T062b: symbol_list — list/filter symbols without FTS
 std::string symbol_list(yyjson_val* params, Connection& conn,
                         QueryCache& cache, const std::string& repo_root);
+
+// T062c: symbols_in_path — list symbols under a directory subtree
+std::string symbols_in_path(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& repo_root);
 
 // Helper: read source snippet from disk
 std::string read_source_snippet(const std::string& repo_root,
@@ -63,9 +71,17 @@ std::string references(yyjson_val* params, Connection& conn,
 std::string file_summary(yyjson_val* params, Connection& conn,
                          QueryCache& cache, const std::string& repo_root);
 
+// T069b: file_overview
+std::string file_overview(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root);
+
 // T068: context_for (one-shot symbol understanding)
 std::string context_for(yyjson_val* params, Connection& conn,
                         QueryCache& cache, const std::string& repo_root);
+
+// T068b: context_by_name — resolve by symbol name, then return context
+std::string context_by_name(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& repo_root);
 
 // T084: entrypoints — find natural starting points
 std::string entrypoints(yyjson_val* params, Connection& conn,

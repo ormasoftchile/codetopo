@@ -20,11 +20,24 @@
 #include <ctime>
 #include <unordered_set>
 #include <unordered_map>
+#include <tuple>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <memory>
 
 namespace codetopo {
 namespace tools {
+
+static void add_pagination_fields(JsonMutDoc& doc, yyjson_mut_val* root,
+                                  yyjson_mut_val* results, int64_t total,
+                                  bool has_more, int64_t offset, int64_t limit) {
+    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+    yyjson_mut_obj_add_int(doc.doc, root, "total", total);
+    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
+    yyjson_mut_obj_add_int(doc.doc, root, "offset", offset);
+    yyjson_mut_obj_add_int(doc.doc, root, "limit", limit);
+}
 
 // Resolve a node by node_id, or by symbol+file name lookup.
 // Allows tools to be called with stable identifiers instead of volatile IDs.
@@ -63,6 +76,16 @@ static std::string resolve_db_path(sqlite3* db, const std::string& path, const s
         return found ? path : std::string();
     }
 
+    // Try exact match as provided (single-root indexes store repo-relative paths)
+    {
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(db, "SELECT 1 FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+        sqlite3_finalize(stmt);
+        if (found) return path;
+    }
+
     // Try exact match: repo_root/path
     std::string abs = repo_root;
     if (!abs.empty() && abs.back() != '/') abs += '/';
@@ -88,6 +111,151 @@ static std::string resolve_db_path(sqlite3* db, const std::string& path, const s
     }
     sqlite3_finalize(stmt);
     return result;
+}
+
+// Resolve a directory-or-file path to the canonical absolute path prefix as stored in the DB.
+// - If already absolute: accepts an exact file path, a directory prefix with indexed files,
+//   or a registered workspace root.
+// - If relative: resolves against repo_root.
+// Returns empty string if not found.
+static std::string resolve_db_dir_path(sqlite3* db, const std::string& path, const std::string& repo_root) {
+    std::string input = path;
+    if (input.empty() || input == "." || input == "./") return std::string();
+
+    auto exists_as_prefix = [&](const std::string& candidate) -> bool {
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(db,
+            "SELECT 1 FROM files WHERE path = ? OR path GLOB ? LIMIT 1",
+            -1, &stmt, nullptr);
+        std::string glob = candidate;
+        if (!glob.empty() && glob.back() != '/') glob += '/';
+        glob += '*';
+        sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, glob.c_str(), -1, SQLITE_TRANSIENT);
+        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+        sqlite3_finalize(stmt);
+        if (found) return true;
+
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM roots WHERE path = ? LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
+            found = (sqlite3_step(stmt) == SQLITE_ROW);
+            sqlite3_finalize(stmt);
+        }
+        return found;
+    };
+
+    if (std::filesystem::path(input).is_absolute()) {
+        if (exists_as_prefix(input)) return input;
+        std::error_code ec;
+        auto rel = std::filesystem::relative(std::filesystem::path(input), std::filesystem::path(repo_root), ec);
+        if (!ec) {
+            std::string rel_str = rel.generic_string();
+            if (exists_as_prefix(rel_str)) return rel_str;
+        }
+        return std::string();
+    }
+
+    if (input.find("..") != std::string::npos) return std::string();
+
+    std::error_code ec;
+    auto canonical = std::filesystem::canonical(std::filesystem::path(repo_root) / input, ec);
+    if (ec) return std::string();
+    auto canonical_root = std::filesystem::canonical(std::filesystem::path(repo_root), ec);
+    if (ec) return std::string();
+    auto rel = std::filesystem::relative(canonical, canonical_root, ec);
+    if (ec) return std::string();
+    std::string validated = rel.generic_string();
+    if (validated.starts_with("..")) return std::string();
+
+    if (exists_as_prefix(validated)) return validated;
+
+    std::string abs = repo_root;
+    if (!abs.empty() && abs.back() != '/') abs += '/';
+    abs += validated;
+    return exists_as_prefix(abs) ? abs : std::string();
+}
+
+static bool canonical_paths_equal(const std::string& lhs, const std::string& rhs) {
+    std::error_code ec;
+    auto lhs_canon = std::filesystem::weakly_canonical(std::filesystem::path(lhs), ec);
+    if (ec) return false;
+    auto rhs_canon = std::filesystem::weakly_canonical(std::filesystem::path(rhs), ec);
+    if (ec) return false;
+    return lhs_canon == rhs_canon;
+}
+
+static bool path_has_db_children(sqlite3* db, const std::string& path) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM files WHERE path GLOB ? LIMIT 1", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    std::string glob = path;
+    if (!glob.empty() && glob.back() != '/') glob += '/';
+    glob += '*';
+    sqlite3_bind_text(stmt, 1, glob.c_str(), -1, SQLITE_TRANSIENT);
+    bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static std::vector<std::string> split_path_components(const std::string& path) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '/')) {
+        if (!part.empty() && part != ".") parts.push_back(part);
+    }
+    return parts;
+}
+
+static std::string path_basename_or_default(const std::string& path, const std::string& fallback) {
+    auto filename = std::filesystem::path(path).filename().string();
+    return filename.empty() ? fallback : filename;
+}
+
+struct DirTreeNode {
+    std::string name;
+    bool is_file = false;
+    std::string language;
+    int64_t size_bytes = 0;
+    bool truncated = false;
+    int64_t truncated_file_count = 0;
+    std::map<std::string, std::unique_ptr<DirTreeNode>> children;
+};
+
+static DirTreeNode* ensure_dir_child(DirTreeNode& parent, const std::string& name) {
+    auto it = parent.children.find(name);
+    if (it == parent.children.end()) {
+        auto child = std::make_unique<DirTreeNode>();
+        child->name = name;
+        auto [inserted, _] = parent.children.emplace(name, std::move(child));
+        it = inserted;
+    }
+    return it->second.get();
+}
+
+static yyjson_mut_val* serialize_dir_tree_node(JsonMutDoc& doc, const DirTreeNode& node) {
+    auto* json_node = doc.new_obj();
+    yyjson_mut_obj_add_strcpy(doc.doc, json_node, "name", node.name.c_str());
+    yyjson_mut_obj_add_str(doc.doc, json_node, "type", node.is_file ? "file" : "dir");
+    if (node.is_file) {
+        yyjson_mut_obj_add_strcpy(doc.doc, json_node, "language", node.language.c_str());
+        yyjson_mut_obj_add_int(doc.doc, json_node, "size_bytes", node.size_bytes);
+        return json_node;
+    }
+
+    if (node.truncated) {
+        yyjson_mut_obj_add_bool(doc.doc, json_node, "truncated", true);
+        yyjson_mut_obj_add_int(doc.doc, json_node, "file_count", node.truncated_file_count);
+        return json_node;
+    }
+
+    auto* children = doc.new_arr();
+    for (const auto& [_, child] : node.children) {
+        yyjson_mut_arr_append(children, serialize_dir_tree_node(doc, *child));
+    }
+    yyjson_mut_obj_add_val(doc.doc, json_node, "children", children);
+    return json_node;
 }
 
 // T060: server_info
@@ -183,12 +351,13 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
 
 // T080: file_search — search file paths by GLOB pattern
 std::string file_search(yyjson_val* params, Connection& conn,
-                               QueryCache& cache, const std::string& /*repo_root*/) {
+                                QueryCache& cache, const std::string& /*repo_root*/) {
     const char* pattern = params ? json_get_str(params, "pattern") : nullptr;
     if (!pattern) return McpError::invalid_input("Missing 'pattern' parameter").to_json_rpc(0);
 
     const char* language = params ? json_get_str(params, "language") : nullptr;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
+    int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     if (limit > 500) limit = 500;
 
     // Pattern analysis: absolute paths use as-is; patterns with no '/' also match basename
@@ -196,28 +365,42 @@ std::string file_search(yyjson_val* params, Connection& conn,
     bool has_slash = strchr(pattern, '/') != nullptr;
     bool add_basename_or = !has_slash && !is_absolute_pat;
 
-    std::string sql;
+    std::string where_sql;
     if (add_basename_or) {
-        sql = "SELECT id, path, language, size_bytes FROM files WHERE (path GLOB ? OR path GLOB '*/' || ?)";
+        where_sql = " WHERE (path GLOB ? OR path GLOB '*/' || ?)";
     } else {
-        sql = "SELECT id, path, language, size_bytes FROM files WHERE path GLOB ?";
+        where_sql = " WHERE path GLOB ?";
     }
     std::string cache_key = "file_search";
     if (add_basename_or) cache_key += "_bn";
     if (language && strlen(language) > 0) {
-        sql += " AND language = ?";
+        where_sql += " AND language = ?";
         cache_key += "_lang";
     }
-    sql += " ORDER BY path LIMIT ?";
+
+    std::string sql =
+        "SELECT id, path, language, size_bytes FROM files" + where_sql + " ORDER BY path LIMIT ? OFFSET ?";
+    std::string count_sql = "SELECT COUNT(*) FROM files" + where_sql;
 
     auto* stmt = cache.get(cache_key, sql);
+    auto* count_stmt = cache.get(cache_key + "_count", count_sql);
     int bind_idx = 1;
+    int count_bind_idx = 1;
     sqlite3_bind_text(stmt, bind_idx++, pattern, -1, SQLITE_TRANSIENT);
-    if (add_basename_or)
+    sqlite3_bind_text(count_stmt, count_bind_idx++, pattern, -1, SQLITE_TRANSIENT);
+    if (add_basename_or) {
         sqlite3_bind_text(stmt, bind_idx++, pattern, -1, SQLITE_TRANSIENT);
-    if (language && strlen(language) > 0)
+        sqlite3_bind_text(count_stmt, count_bind_idx++, pattern, -1, SQLITE_TRANSIENT);
+    }
+    if (language && strlen(language) > 0) {
         sqlite3_bind_text(stmt, bind_idx++, language, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, language, -1, SQLITE_TRANSIENT);
+    }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
+    sqlite3_bind_int64(stmt, bind_idx++, offset);
+
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -240,18 +423,18 @@ std::string file_search(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(results, item);
     }
 
-    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
     return doc.to_string();
 }
 
 // T081: dir_list — list files in a directory (one level)
 std::string dir_list(yyjson_val* params, Connection& conn,
-                            QueryCache& cache, const std::string& /*repo_root*/) {
+                             QueryCache& cache, const std::string& /*repo_root*/) {
     const char* dir_path = params ? json_get_str(params, "path") : nullptr;
     if (!dir_path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
+    int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     if (limit > 2000) limit = 2000;
 
     // Normalize: ensure trailing /
@@ -263,68 +446,108 @@ std::string dir_list(yyjson_val* params, Connection& conn,
     std::string glob_one = dir + "*";
     std::string glob_deep = dir + "*/*";
 
-    auto* stmt = cache.get("dir_list",
-        "SELECT path, language, size_bytes FROM files "
-        "WHERE path GLOB ? AND path NOT GLOB ? "
-        "ORDER BY path LIMIT ?");
-    sqlite3_bind_text(stmt, 1, glob_one.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, limit);
-
     JsonMutDoc doc;
     auto* root = doc.new_obj();
     doc.set_root(root);
     yyjson_mut_obj_add_strcpy(doc.doc, root, "directory", dir_path);
     auto* files_arr = doc.new_arr();
-
-    // Also collect subdirectory names
-    std::unordered_set<std::string> subdirs;
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        auto* item = doc.new_obj();
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "path",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
-        yyjson_mut_obj_add_strcpy(doc.doc, item, "language",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-        yyjson_mut_obj_add_int(doc.doc, item, "size_bytes", sqlite3_column_int64(stmt, 2));
-        yyjson_mut_arr_append(files_arr, item);
-    }
-
-    // Find subdirectories by looking for paths one level deeper
-    auto* sub_stmt = cache.get("dir_list_subdirs",
-        "SELECT DISTINCT substr(path, 1, instr(substr(path, length(?) + 1), '/') + length(?)) "
-        "FROM files WHERE path GLOB ? AND path GLOB ? "
-        "LIMIT 500");
-    std::string glob_sub = dir + "*/*";
-    sqlite3_bind_text(sub_stmt, 1, dir.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(sub_stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(sub_stmt, 3, glob_one.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(sub_stmt, 4, glob_sub.c_str(), -1, SQLITE_TRANSIENT);
-
     auto* dirs_arr = doc.new_arr();
-    while (sqlite3_step(sub_stmt) == SQLITE_ROW) {
-        auto* text = sqlite3_column_text(sub_stmt, 0);
-        if (text) {
-            std::string subdir = reinterpret_cast<const char*>(text);
-            if (!subdir.empty() && subdirs.insert(subdir).second) {
-                yyjson_mut_arr_add_strcpy(doc.doc, dirs_arr, subdir.c_str());
-            }
+    auto* results = doc.new_arr();
+
+    int64_t total = 0;
+    bool has_more = false;
+    std::string entry_cte =
+        "WITH entries AS ("
+        "SELECT 'directory' AS entry_type, "
+        "substr(path, 1, instr(substr(path, length(?) + 1), '/') + length(?)) AS entry_path, "
+        "'' AS language, 0 AS size_bytes "
+        "FROM files WHERE path GLOB ? AND path GLOB ? "
+        "GROUP BY entry_path "
+        "UNION ALL "
+        "SELECT 'file' AS entry_type, path AS entry_path, language, size_bytes "
+        "FROM files WHERE path GLOB ? AND path NOT GLOB ?"
+        ")";
+
+    auto* count_stmt = cache.get("dir_list_count",
+        entry_cte + " SELECT COUNT(*) FROM entries");
+    sqlite3_bind_text(count_stmt, 1, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 3, glob_one.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 4, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 5, glob_one.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 6, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+
+    auto* stmt = cache.get("dir_list",
+        entry_cte + " SELECT entry_type, entry_path, language, size_bytes "
+        "FROM entries ORDER BY entry_path LIMIT ? OFFSET ?");
+    sqlite3_bind_text(stmt, 1, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, glob_one.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, glob_one.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 7, limit + 1);
+    sqlite3_bind_int64(stmt, 8, offset);
+
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
+        if (count == limit) { has_more = true; break; }
+        count++;
+
+        const char* entry_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        const char* entry_path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        if (!entry_type || !entry_path) continue;
+
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "type", entry_type);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "path", entry_path);
+
+        if (strcmp(entry_type, "file") == 0) {
+            auto* file_item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, file_item, "path", entry_path);
+            yyjson_mut_obj_add_strcpy(doc.doc, file_item, "language",
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+            yyjson_mut_obj_add_int(doc.doc, file_item, "size_bytes", sqlite3_column_int64(stmt, 3));
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "language",
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+            yyjson_mut_obj_add_int(doc.doc, item, "size_bytes", sqlite3_column_int64(stmt, 3));
+            yyjson_mut_arr_append(files_arr, file_item);
+        } else {
+            yyjson_mut_arr_add_strcpy(doc.doc, dirs_arr, entry_path);
         }
+
+        yyjson_mut_arr_append(results, item);
     }
 
     // Workspace mode fallback: if "." returned no results, list roots table as subdirectories.
     // In workspace mode, file paths are absolute so "." GLOB patterns won't match anything.
-    if (yyjson_mut_arr_size(files_arr) == 0 && yyjson_mut_arr_size(dirs_arr) == 0 &&
-        (strcmp(dir_path, ".") == 0 || strcmp(dir_path, "./") == 0)) {
+    if (total == 0 && (strcmp(dir_path, ".") == 0 || strcmp(dir_path, "./") == 0)) {
+        sqlite3_stmt* roots_count_stmt = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(), "SELECT COUNT(*) FROM roots", -1, &roots_count_stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(roots_count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(roots_count_stmt, 0);
+            sqlite3_finalize(roots_count_stmt);
+        }
+
         sqlite3_stmt* roots_stmt = nullptr;
-        const char* roots_sql = "SELECT path FROM roots ORDER BY path LIMIT 100";
-        if (sqlite3_prepare_v2(conn.raw(), roots_sql, -1, &roots_stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(roots_stmt) == SQLITE_ROW) {
-                auto* text = sqlite3_column_text(roots_stmt, 0);
-                if (text) {
-                    yyjson_mut_arr_add_strcpy(doc.doc, dirs_arr,
-                        reinterpret_cast<const char*>(text));
-                }
+        if (sqlite3_prepare_v2(conn.raw(),
+                "SELECT path FROM roots ORDER BY path LIMIT ? OFFSET ?", -1, &roots_stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(roots_stmt, 1, limit + 1);
+            sqlite3_bind_int64(roots_stmt, 2, offset);
+
+            int root_count = 0;
+            while (sqlite3_step(roots_stmt) == SQLITE_ROW && root_count <= limit) {
+                if (root_count == limit) { has_more = true; break; }
+                root_count++;
+
+                const char* root_path = reinterpret_cast<const char*>(sqlite3_column_text(roots_stmt, 0));
+                if (!root_path) continue;
+                yyjson_mut_arr_add_strcpy(doc.doc, dirs_arr, root_path);
+
+                auto* item = doc.new_obj();
+                yyjson_mut_obj_add_str(doc.doc, item, "type", "directory");
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "path", root_path);
+                yyjson_mut_arr_append(results, item);
             }
             sqlite3_finalize(roots_stmt);
         }
@@ -332,12 +555,139 @@ std::string dir_list(yyjson_val* params, Connection& conn,
 
     yyjson_mut_obj_add_val(doc.doc, root, "files", files_arr);
     yyjson_mut_obj_add_val(doc.doc, root, "subdirectories", dirs_arr);
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    return doc.to_string();
+}
+
+// T081b: dir_tree — return a directory subtree up to a given depth
+std::string dir_tree(yyjson_val* params, Connection& conn,
+                     QueryCache& cache, const std::string& repo_root) {
+    const char* requested_path = params ? json_get_str(params, "path") : nullptr;
+    if (!requested_path) requested_path = ".";
+
+    int64_t depth = params ? json_get_int(params, "depth", 3) : 3;
+    if (depth < 0) {
+        return McpError::invalid_input("Invalid 'depth': must be >= 0").to_json_rpc(0);
+    }
+    int64_t max_depth = (depth == 0) ? 20 : std::min<int64_t>(depth, 20);
+
+    bool all_paths = (strcmp(requested_path, ".") == 0 || strcmp(requested_path, "./") == 0);
+    if (!all_paths && std::filesystem::path(requested_path).is_absolute() &&
+        canonical_paths_equal(requested_path, repo_root)) {
+        all_paths = true;
+    }
+
+    std::string resolved_dir;
+    if (!all_paths) {
+        resolved_dir = resolve_db_dir_path(conn.raw(), requested_path, repo_root);
+        if (resolved_dir.empty()) {
+            if (!std::filesystem::path(requested_path).is_absolute()) {
+                auto validated = path_util::validate_mcp_path(requested_path, repo_root);
+                if (validated.empty()) {
+                    return McpError::invalid_input("Invalid path: rejected by traversal guard").to_json_rpc(0);
+                }
+            }
+            return McpError::not_found(std::string("Path not found: ") + requested_path).to_json_rpc(0);
+        }
+        if (!path_has_db_children(conn.raw(), resolved_dir)) {
+            return McpError::invalid_input(std::string("Path is not a directory: ") + requested_path).to_json_rpc(0);
+        }
+    }
+
+    std::string count_sql = "SELECT COUNT(*) FROM files";
+    std::string select_sql = "SELECT path, language, size_bytes FROM files";
+    std::string path_glob;
+    if (!all_paths) {
+        std::string prefix = resolved_dir;
+        if (!prefix.empty() && prefix.back() != '/') prefix += '/';
+        path_glob = prefix + "*";
+        count_sql += " WHERE path GLOB ?";
+        select_sql += " WHERE path GLOB ?";
+    }
+    select_sql += " ORDER BY path LIMIT ?";
+
+    std::string cache_key = all_paths ? "dir_tree_all" : "dir_tree_dir";
+    auto* count_stmt = cache.get(cache_key + "_count", count_sql);
+    auto* stmt = cache.get(cache_key, select_sql);
+    int bind_idx = 1;
+    if (!all_paths) {
+        sqlite3_bind_text(count_stmt, 1, path_glob.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, bind_idx++, path_glob.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int64(stmt, bind_idx, 2000);
+
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+    bool has_more = total > 2000;
+
+    std::string root_name;
+    if (all_paths) {
+        root_name = (std::filesystem::path(requested_path).is_absolute() &&
+                     canonical_paths_equal(requested_path, repo_root))
+            ? path_basename_or_default(repo_root, ".")
+            : ".";
+    } else {
+        root_name = path_basename_or_default(resolved_dir, resolved_dir);
+    }
+
+    DirTreeNode tree_root;
+    tree_root.name = root_name;
+
+    std::string relative_prefix;
+    if (!all_paths) {
+        relative_prefix = resolved_dir;
+        if (!relative_prefix.empty() && relative_prefix.back() != '/') relative_prefix += '/';
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* file_path = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        const char* language = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        if (!file_path || !language) continue;
+
+        std::string relative_path = all_paths ? std::string(file_path) : std::string(file_path).substr(relative_prefix.size());
+        auto parts = split_path_components(relative_path);
+        if (parts.empty()) continue;
+
+        DirTreeNode* current = &tree_root;
+        bool inserted = false;
+        for (size_t i = 0; i + 1 < parts.size(); ++i) {
+            int64_t dir_depth = static_cast<int64_t>(i) + 1;
+            auto* child = ensure_dir_child(*current, parts[i]);
+            if (dir_depth == max_depth) {
+                child->truncated = true;
+                child->truncated_file_count++;
+                inserted = true;
+                break;
+            }
+            current = child;
+        }
+        if (inserted) continue;
+
+        int64_t file_depth = static_cast<int64_t>(parts.size());
+        if (file_depth > max_depth) continue;
+
+        auto file_node = std::make_unique<DirTreeNode>();
+        file_node->name = parts.back();
+        file_node->is_file = true;
+        file_node->language = language;
+        file_node->size_bytes = sqlite3_column_int64(stmt, 2);
+        current->children[file_node->name] = std::move(file_node);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "path", requested_path);
+    yyjson_mut_obj_add_int(doc.doc, root, "depth", depth == 0 ? 0 : max_depth);
+    yyjson_mut_obj_add_val(doc.doc, root, "tree", serialize_dir_tree_node(doc, tree_root));
+    yyjson_mut_obj_add_int(doc.doc, root, "file_count", total);
+    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
     return doc.to_string();
 }
 
 // T062: symbol_search
 std::string symbol_search(yyjson_val* params, Connection& conn,
-                                  QueryCache& cache, const std::string& /*repo_root*/) {
+                                   QueryCache& cache, const std::string& /*repo_root*/) {
     const char* query = params ? json_get_str(params, "query") : nullptr;
     if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
 
@@ -345,6 +695,7 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     bool include_source = params ? json_get_bool(params, "include_source", false) : false;
+    (void)include_source;
 
     if (limit > 500) limit = 500;
 
@@ -352,71 +703,197 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     bool wildcard = (strcmp(query, "*") == 0 || strlen(query) == 0);
 
     sqlite3_stmt* stmt = nullptr;
+    sqlite3_stmt* count_stmt = nullptr;
     int bind_idx = 1;
+    int count_bind_idx = 1;
 
     if (wildcard) {
-        // Direct table scan — no FTS needed
         if (kind && strlen(kind) > 0) {
-            // "function" matches both function and method kinds
             bool fn_kind = (std::string(kind) == "function");
             stmt = fn_kind
                 ? cache.get("symbol_search_wildcard_fn",
                     "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                     "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
                     "WHERE n.kind IN ('function', 'method') "
-                    "ORDER BY f.path, n.start_line "
+                    "ORDER BY f.path, n.start_line, n.id "
                     "LIMIT ? OFFSET ?")
                 : cache.get("symbol_search_wildcard_kind",
                     "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                     "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
                     "WHERE n.kind = ? "
-                    "ORDER BY f.path, n.start_line "
+                    "ORDER BY f.path, n.start_line, n.id "
                     "LIMIT ? OFFSET ?");
-            if (!fn_kind) sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+            count_stmt = fn_kind
+                ? cache.get("symbol_search_wildcard_fn_count",
+                    "SELECT COUNT(*) FROM nodes n WHERE n.kind IN ('function', 'method')")
+                : cache.get("symbol_search_wildcard_kind_count",
+                    "SELECT COUNT(*) FROM nodes n WHERE n.kind = ?");
+            if (!fn_kind) {
+                sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
+            }
         } else {
             stmt = cache.get("symbol_search_wildcard",
                 "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                 "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                "ORDER BY f.path, n.start_line "
+                "ORDER BY f.path, n.start_line, n.id "
                 "LIMIT ? OFFSET ?");
+            count_stmt = cache.get("symbol_search_wildcard_count",
+                "SELECT COUNT(*) FROM nodes n");
         }
     } else {
-        // Build FTS5 query: quote the term for exact prefix match on name column
-        // Using name: prefix to target only the name column (fastest)
         std::string fts_query = "name: \"" + std::string(query) + "\"*";
+        std::string like_pattern = std::string("%") + query + "%";
 
         if (kind && strlen(kind) > 0) {
-            // "function" matches both function and method kinds
             bool fn_kind = (std::string(kind) == "function");
             stmt = fn_kind
                 ? cache.get("symbol_search_fn",
+                    "WITH primary_matches AS ("
                     "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                     "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
                     "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method') "
+                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')"
+                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                    "fallback_matches AS ("
+                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
+                    "AND n.kind IN ('function', 'method') "
+                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                    "), combined AS ("
+                    "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                    "FROM primary_matches "
+                    "UNION ALL "
+                    "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                    "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                    ") "
+                    "SELECT id, kind, name, qualname, path, start_line, end_line "
+                    "FROM combined "
+                    "ORDER BY match_bucket, length(name), name, path, start_line, id "
                     "LIMIT ? OFFSET ?")
                 : cache.get("symbol_search_kind",
+                    "WITH primary_matches AS ("
                     "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                     "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
                     "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind = ? "
+                    "WHERE nodes_fts MATCH ? AND n.kind = ?"
+                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                    "fallback_matches AS ("
+                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) AND n.kind = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                    "), combined AS ("
+                    "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                    "FROM primary_matches "
+                    "UNION ALL "
+                    "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                    "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                    ") "
+                    "SELECT id, kind, name, qualname, path, start_line, end_line "
+                    "FROM combined "
+                    "ORDER BY match_bucket, length(name), name, path, start_line, id "
                     "LIMIT ? OFFSET ?");
+            count_stmt = fn_kind
+                ? cache.get("symbol_search_fn_count",
+                    "WITH primary_matches AS ("
+                    "SELECT n.id "
+                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')"
+                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                    "fallback_matches AS ("
+                    "SELECT n.id "
+                    "FROM nodes n "
+                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
+                    "AND n.kind IN ('function', 'method') "
+                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                    "), combined AS ("
+                    "SELECT id FROM primary_matches "
+                    "UNION ALL "
+                    "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                    ") "
+                    "SELECT COUNT(*) FROM combined")
+                : cache.get("symbol_search_kind_count",
+                    "WITH primary_matches AS ("
+                    "SELECT n.id "
+                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                    "WHERE nodes_fts MATCH ? AND n.kind = ?"
+                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                    "fallback_matches AS ("
+                    "SELECT n.id "
+                    "FROM nodes n "
+                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) AND n.kind = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                    "), combined AS ("
+                    "SELECT id FROM primary_matches "
+                    "UNION ALL "
+                    "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                    ") "
+                    "SELECT COUNT(*) FROM combined");
         } else {
             stmt = cache.get("symbol_search",
+                "WITH primary_matches AS ("
                 "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
                 "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
                 "LEFT JOIN files f ON n.file_id = f.id "
-                "WHERE nodes_fts MATCH ? "
+                "WHERE nodes_fts MATCH ?"
+                "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                "fallback_matches AS ("
+                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+                "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
+                "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                "), combined AS ("
+                "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                "FROM primary_matches "
+                "UNION ALL "
+                "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
+                "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                ") "
+                "SELECT id, kind, name, qualname, path, start_line, end_line "
+                "FROM combined "
+                "ORDER BY match_bucket, length(name), name, path, start_line, id "
                 "LIMIT ? OFFSET ?");
+            count_stmt = cache.get("symbol_search_count",
+                "WITH primary_matches AS ("
+                "SELECT n.id "
+                "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "WHERE nodes_fts MATCH ?"
+                "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
+                "fallback_matches AS ("
+                "SELECT n.id "
+                "FROM nodes n "
+                "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
+                "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
+                "), combined AS ("
+                "SELECT id FROM primary_matches "
+                "UNION ALL "
+                "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
+                ") "
+                "SELECT COUNT(*) FROM combined");
         }
 
         sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
         if (kind && strlen(kind) > 0 && std::string(kind) != "function") {
             sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
+        }
+        sqlite3_bind_text(stmt, bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        if (kind && strlen(kind) > 0 && std::string(kind) != "function") {
+            sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
         }
     }
-    sqlite3_bind_int64(stmt, bind_idx++, limit + 1);  // +1 to detect has_more
+    sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
+
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -448,116 +925,66 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(results, item);
     }
 
-    // LIKE fallback: if FTS returned few results and this was an FTS query,
-    // try a substring match to catch mid-name hits (e.g., "numa" → ConfigureAutoSoftNuma)
-    if (!wildcard && count < 5) {
-        // Collect already-seen node_ids to avoid duplicates
-        std::unordered_set<int64_t> seen_ids;
-        // Re-iterate json array to extract IDs (parse from the mutable doc)
-        yyjson_mut_val* iter_item;
-        yyjson_mut_arr_iter iter;
-        yyjson_mut_arr_iter_init(results, &iter);
-        while ((iter_item = yyjson_mut_arr_iter_next(&iter)) != nullptr) {
-            auto* id_val = yyjson_mut_obj_get(iter_item, "node_id");
-            if (id_val) seen_ids.insert(yyjson_mut_get_sint(id_val));
-        }
-
-        int64_t like_limit = limit - count;
-        if (like_limit > 0) {
-            std::string like_pattern = std::string("%") + query + "%";
-
-            sqlite3_stmt* like_stmt = nullptr;
-            if (kind && strlen(kind) > 0) {
-                like_stmt = cache.get("symbol_search_like_kind",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) AND n.kind = ? "
-                    "ORDER BY length(n.name) LIMIT ?");
-                sqlite3_bind_text(like_stmt, 1, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(like_stmt, 2, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(like_stmt, 3, kind, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(like_stmt, 4, like_limit + count);  // fetch extra to skip dupes
-            } else {
-                like_stmt = cache.get("symbol_search_like",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
-                    "ORDER BY length(n.name) LIMIT ?");
-                sqlite3_bind_text(like_stmt, 1, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(like_stmt, 2, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(like_stmt, 3, like_limit + count);
-            }
-
-            while (sqlite3_step(like_stmt) == SQLITE_ROW && count < limit) {
-                int64_t nid = sqlite3_column_int64(like_stmt, 0);
-                if (seen_ids.count(nid)) continue;  // skip duplicates from FTS
-                seen_ids.insert(nid);
-                count++;
-
-                auto* item = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, item, "node_id", nid);
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
-                    reinterpret_cast<const char*>(sqlite3_column_text(like_stmt, 1)));
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-                    reinterpret_cast<const char*>(sqlite3_column_text(like_stmt, 2)));
-                auto* qn2 = sqlite3_column_text(like_stmt, 3);
-                if (qn2) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn2));
-                auto* fp2 = sqlite3_column_text(like_stmt, 4);
-                if (fp2) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp2));
-
-                auto* span2 = doc.new_obj();
-                yyjson_mut_obj_add_int(doc.doc, span2, "start_line", sqlite3_column_int(like_stmt, 5));
-                yyjson_mut_obj_add_int(doc.doc, span2, "end_line", sqlite3_column_int(like_stmt, 6));
-                yyjson_mut_obj_add_val(doc.doc, item, "span", span2);
-
-                yyjson_mut_arr_append(results, item);
-            }
-        }
-    }
-
-    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
-
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
     return doc.to_string();
 }
 
 // T062b: symbol_list — list/filter symbols without FTS, supports kind, file, and name-glob filters
 std::string symbol_list(yyjson_val* params, Connection& conn,
-                               QueryCache& cache, const std::string& /*repo_root*/) {
+                                QueryCache& cache, const std::string& /*repo_root*/) {
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
     const char* name_glob = params ? json_get_str(params, "name_glob") : nullptr;
+    int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
 
     if (limit > 2000) limit = 2000;
 
-    // Build SQL dynamically based on which filters are provided
+    std::string where_sql = " WHERE 1=1";
+    if (kind && strlen(kind) > 0) where_sql += " AND n.kind = ?";
+    if (file_path && strlen(file_path) > 0) where_sql += " AND f.path = ?";
+    if (name_glob && strlen(name_glob) > 0) where_sql += " AND n.name GLOB ?";
+    if (min_span_lines > 0) where_sql += " AND (n.end_line - n.start_line + 1) >= ?";
+
     std::string sql =
         "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE 1=1";
+        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
+        + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
+    std::string count_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
 
-    if (kind && strlen(kind) > 0)       sql += " AND n.kind = ?";
-    if (file_path && strlen(file_path) > 0) sql += " AND f.path = ?";
-    if (name_glob && strlen(name_glob) > 0) sql += " AND n.name GLOB ?";
-    sql += " ORDER BY f.path, n.start_line LIMIT ? OFFSET ?";
-
-    // Use a cache key that encodes which filters are active
     std::string cache_key = "symbol_list";
     if (kind && strlen(kind) > 0) cache_key += "_k";
     if (file_path && strlen(file_path) > 0) cache_key += "_f";
     if (name_glob && strlen(name_glob) > 0) cache_key += "_g";
+    if (min_span_lines > 0) cache_key += "_s";
 
     auto* stmt = cache.get(cache_key, sql);
+    auto* count_stmt = cache.get(cache_key + "_count", count_sql);
     int bind_idx = 1;
-    if (kind && strlen(kind) > 0)
+    int count_bind_idx = 1;
+    if (kind && strlen(kind) > 0) {
         sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-    if (file_path && strlen(file_path) > 0)
+        sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
+    }
+    if (file_path && strlen(file_path) > 0) {
         sqlite3_bind_text(stmt, bind_idx++, file_path, -1, SQLITE_TRANSIENT);
-    if (name_glob && strlen(name_glob) > 0)
+        sqlite3_bind_text(count_stmt, count_bind_idx++, file_path, -1, SQLITE_TRANSIENT);
+    }
+    if (name_glob && strlen(name_glob) > 0) {
         sqlite3_bind_text(stmt, bind_idx++, name_glob, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, name_glob, -1, SQLITE_TRANSIENT);
+    }
+    if (min_span_lines > 0) {
+        sqlite3_bind_int64(stmt, bind_idx++, min_span_lines);
+        sqlite3_bind_int64(count_stmt, count_bind_idx++, min_span_lines);
+    }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
+
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -589,9 +1016,145 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(results, item);
     }
 
-    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
-    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    return doc.to_string();
+}
 
+// T062c: symbols_in_path — list symbols under a directory subtree
+std::string symbols_in_path(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& repo_root) {
+    const char* path = params ? json_get_str(params, "path") : nullptr;
+    if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
+
+    bool recursive = params ? json_get_bool(params, "recursive", true) : true;
+    int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
+    int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
+    int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+    if (limit > 2000) limit = 2000;
+
+    std::vector<std::string> kinds;
+    if (params) {
+        if (auto* kind_arr = yyjson_obj_get(params, "kind"); kind_arr && yyjson_is_arr(kind_arr)) {
+            yyjson_val* kind_val;
+            size_t idx, max;
+            yyjson_arr_foreach(kind_arr, idx, max, kind_val) {
+                if (yyjson_is_str(kind_val)) {
+                    kinds.emplace_back(yyjson_get_str(kind_val));
+                }
+            }
+        } else if (auto* kind_str = yyjson_obj_get(params, "kind"); kind_str && yyjson_is_str(kind_str)) {
+            kinds.emplace_back(yyjson_get_str(kind_str));
+        }
+    }
+
+    bool all_paths = (strcmp(path, ".") == 0 || strcmp(path, "./") == 0);
+    std::string resolved_file = all_paths ? std::string() : resolve_db_path(conn.raw(), path, repo_root);
+    std::string resolved_dir = all_paths ? std::string() : resolve_db_dir_path(conn.raw(), path, repo_root);
+    if (!all_paths && resolved_file.empty() && resolved_dir.empty()) {
+        if (!std::filesystem::path(path).is_absolute()) {
+            auto validated = path_util::validate_mcp_path(path, repo_root);
+            if (validated.empty())
+                return McpError::invalid_input("Invalid path: rejected by traversal guard").to_json_rpc(0);
+        }
+        return McpError::not_found(std::string("Path not found: ") + path).to_json_rpc(0);
+    }
+
+    std::string where_sql = " WHERE 1=1";
+    std::vector<std::string> path_binds;
+    if (!resolved_file.empty()) {
+        where_sql += " AND f.path = ?";
+        path_binds.push_back(resolved_file);
+    } else if (!all_paths) {
+        std::string dir = resolved_dir;
+        if (!dir.empty() && dir.back() != '/') dir += '/';
+        if (recursive) {
+            where_sql += " AND f.path GLOB ?";
+            path_binds.push_back(dir + "*");
+        } else {
+            where_sql += " AND f.path GLOB ? AND f.path NOT GLOB ?";
+            path_binds.push_back(dir + "*");
+            path_binds.push_back(dir + "*/*");
+        }
+    }
+
+    if (!kinds.empty()) {
+        where_sql += " AND n.kind IN (";
+        for (size_t i = 0; i < kinds.size(); ++i) {
+            if (i) where_sql += ", ";
+            where_sql += "?";
+        }
+        where_sql += ")";
+    }
+    if (min_span_lines > 0) where_sql += " AND (n.end_line - n.start_line + 1) >= ?";
+
+    std::string sql =
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
+        + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
+    std::string count_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
+
+    std::string cache_key = "symbols_in_path";
+    if (all_paths) cache_key += "_all";
+    else if (!resolved_file.empty()) cache_key += "_file";
+    else cache_key += recursive ? "_dir_r" : "_dir_n";
+    if (!kinds.empty()) cache_key += "_k" + std::to_string(kinds.size());
+    if (min_span_lines > 0) cache_key += "_s";
+
+    auto* stmt = cache.get(cache_key, sql);
+    auto* count_stmt = cache.get(cache_key + "_count", count_sql);
+    int bind_idx = 1;
+    int count_bind_idx = 1;
+    for (const auto& bind : path_binds) {
+        sqlite3_bind_text(stmt, bind_idx++, bind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, bind.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    for (const auto& kind : kinds) {
+        sqlite3_bind_text(stmt, bind_idx++, kind.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(count_stmt, count_bind_idx++, kind.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (min_span_lines > 0) {
+        sqlite3_bind_int64(stmt, bind_idx++, min_span_lines);
+        sqlite3_bind_int64(count_stmt, count_bind_idx++, min_span_lines);
+    }
+    sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
+    sqlite3_bind_int64(stmt, bind_idx++, offset);
+
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "path", path);
+    yyjson_mut_obj_add_bool(doc.doc, root, "recursive", recursive);
+    auto* results = doc.new_arr();
+
+    int count = 0;
+    bool has_more = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
+        if (count == limit) { has_more = true; break; }
+        count++;
+
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+        auto* qn = sqlite3_column_text(stmt, 3);
+        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
+        auto* fp = sqlite3_column_text(stmt, 4);
+        if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
+
+        auto* span = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
+        yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 6));
+        yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+        yyjson_mut_arr_append(results, item);
+    }
+
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
     return doc.to_string();
 }
 
@@ -1018,7 +1581,12 @@ std::string references(yyjson_val* params, Connection& conn,
 std::string file_summary(yyjson_val* params, Connection& conn,
                                  QueryCache& cache, const std::string& repo_root) {
     const char* path = params ? json_get_str(params, "path") : nullptr;
+    if (!path && params) path = json_get_str(params, "file_path");
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
+
+    int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
+    int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+    if (limit > 2000) limit = 2000;
 
     // Resolve the path: handles relative input in workspace mode (absolute paths in DB)
     std::string resolved = resolve_db_path(conn.raw(), path, repo_root);
@@ -1051,11 +1619,18 @@ std::string file_summary(yyjson_val* params, Connection& conn,
         while (std::getline(f, line)) lines++;
     }
 
-    // Get symbols
+    auto* total_stmt = cache.get("file_symbols_count",
+        "SELECT COUNT(*) FROM nodes WHERE file_id = ? AND node_type = 'symbol'");
+    sqlite3_bind_int64(total_stmt, 1, file_id);
+    int64_t total = 0;
+    if (sqlite3_step(total_stmt) == SQLITE_ROW) total = sqlite3_column_int64(total_stmt, 0);
+
     auto* sym_stmt = cache.get("file_symbols",
         "SELECT id, kind, name, qualname, visibility, signature, start_line, end_line "
-        "FROM nodes WHERE file_id = ? AND node_type = 'symbol' ORDER BY start_line");
+        "FROM nodes WHERE file_id = ? AND node_type = 'symbol' ORDER BY start_line, id LIMIT ? OFFSET ?");
     sqlite3_bind_int64(sym_stmt, 1, file_id);
+    sqlite3_bind_int64(sym_stmt, 2, limit + 1);
+    sqlite3_bind_int64(sym_stmt, 3, offset);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -1064,8 +1639,9 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "lines", lines);
     yyjson_mut_obj_add_strcpy(doc.doc, root, "language", language.c_str());
 
+    auto* results = doc.new_arr();
     auto* symbols = doc.new_arr();
-    while (sqlite3_step(sym_stmt) == SQLITE_ROW) {
+    auto append_symbol = [&](yyjson_mut_val* arr) {
         auto* sym = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, sym, "node_id", sqlite3_column_int64(sym_stmt, 0));
         yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind",
@@ -1076,16 +1652,190 @@ std::string file_summary(yyjson_val* params, Connection& conn,
         if (qn) yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", reinterpret_cast<const char*>(qn));
         auto* vis = sqlite3_column_text(sym_stmt, 4);
         if (vis) yyjson_mut_obj_add_strcpy(doc.doc, sym, "visibility", reinterpret_cast<const char*>(vis));
+        auto* sig = sqlite3_column_text(sym_stmt, 5);
+        if (sig) yyjson_mut_obj_add_strcpy(doc.doc, sym, "signature", reinterpret_cast<const char*>(sig));
 
         auto* span = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(sym_stmt, 6));
         yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(sym_stmt, 7));
         yyjson_mut_obj_add_val(doc.doc, sym, "span", span);
 
-        yyjson_mut_arr_append(symbols, sym);
-    }
-    yyjson_mut_obj_add_val(doc.doc, root, "symbols", symbols);
+        yyjson_mut_arr_append(arr, sym);
+    };
 
+    int count = 0;
+    bool has_more = false;
+    while (sqlite3_step(sym_stmt) == SQLITE_ROW && count <= limit) {
+        if (count == limit) { has_more = true; break; }
+        count++;
+        append_symbol(results);
+        append_symbol(symbols);
+    }
+
+    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    yyjson_mut_obj_add_val(doc.doc, root, "symbols", symbols);
+    return doc.to_string();
+}
+
+// T069b: file_overview
+std::string file_overview(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root) {
+    const char* path = params ? json_get_str(params, "path") : nullptr;
+    if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
+
+    std::string resolved = resolve_db_path(conn.raw(), path, repo_root);
+    if (resolved.empty()) {
+        if (!std::filesystem::path(path).is_absolute()) {
+            auto validated = path_util::validate_mcp_path(path, repo_root);
+            if (validated.empty())
+                return McpError::invalid_input("Invalid path: rejected by traversal guard").to_json_rpc(0);
+        }
+        return McpError::not_found(std::string("File not found: ") + path).to_json_rpc(0);
+    }
+
+    auto* file_stmt = cache.get("file_overview_by_path",
+        "SELECT f.id FROM files f WHERE f.path = ?");
+    sqlite3_bind_text(file_stmt, 1, resolved.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(file_stmt) != SQLITE_ROW) {
+        return McpError::not_found(std::string("File not found: ") + path).to_json_rpc(0);
+    }
+
+    int64_t file_id = sqlite3_column_int64(file_stmt, 0);
+
+    auto* sym_stmt = cache.get("file_overview_symbols",
+        "SELECT name, qualname, kind, start_line, end_line, signature, visibility, doc "
+        "FROM nodes "
+        "WHERE file_id = ? AND node_type = 'symbol' "
+        "AND kind IN ('function', 'class', 'struct', 'interface', 'enum', 'type', 'macro', 'method', 'typedef', 'type_alias') "
+        "ORDER BY start_line, id");
+    sqlite3_bind_int64(sym_stmt, 1, file_id);
+
+    auto first_doc_line = [](const unsigned char* raw) -> std::string {
+        if (!raw) return {};
+        std::string doc = reinterpret_cast<const char*>(raw);
+        auto newline = doc.find('\n');
+        if (newline != std::string::npos) doc.resize(newline);
+        auto first = doc.find_first_not_of(" \t\r");
+        if (first == std::string::npos) return {};
+        auto last = doc.find_last_not_of(" \t\r");
+        return doc.substr(first, last - first + 1);
+    };
+
+    struct OverviewSymbol {
+        std::string name;
+        std::string qualname;
+        std::string kind;
+        int start_line = 0;
+        int end_line = 0;
+        std::string signature;
+        std::string visibility;
+        std::string doc;
+    };
+
+    std::vector<OverviewSymbol> raw_symbols;
+    while (sqlite3_step(sym_stmt) == SQLITE_ROW) {
+        OverviewSymbol sym;
+        sym.name = reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 0));
+        if (const auto* qn = sqlite3_column_text(sym_stmt, 1)) {
+            sym.qualname = reinterpret_cast<const char*>(qn);
+        }
+        sym.kind = reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 2));
+        if (sym.kind == "typedef" || sym.kind == "type_alias") sym.kind = "type";
+        sym.start_line = sqlite3_column_int(sym_stmt, 3);
+        sym.end_line = sqlite3_column_int(sym_stmt, 4);
+        if (const auto* sig = sqlite3_column_text(sym_stmt, 5); sig && sig[0] != '\0') {
+            sym.signature = reinterpret_cast<const char*>(sig);
+        }
+        if (const auto* vis = sqlite3_column_text(sym_stmt, 6); vis && vis[0] != '\0') {
+            sym.visibility = reinterpret_cast<const char*>(vis);
+        }
+        sym.doc = first_doc_line(sqlite3_column_text(sym_stmt, 7));
+        raw_symbols.push_back(std::move(sym));
+    }
+
+    std::vector<OverviewSymbol> symbols_filtered;
+    for (const auto& sym : raw_symbols) {
+        bool merged = false;
+        for (auto& kept : symbols_filtered) {
+            if (kept.name == sym.name && kept.qualname == sym.qualname && kept.kind == sym.kind
+                && kept.start_line == sym.start_line) {
+                if (sym.end_line > kept.end_line) {
+                    kept.end_line = sym.end_line;
+                    if (kept.signature.empty()) kept.signature = sym.signature;
+                    if (kept.visibility.empty()) kept.visibility = sym.visibility;
+                    if (kept.doc.empty()) kept.doc = sym.doc;
+                }
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) symbols_filtered.push_back(sym);
+    }
+
+    std::vector<OverviewSymbol> final_symbols;
+    for (const auto& sym : symbols_filtered) {
+        bool nested_in_callable = false;
+        for (const auto& kept : final_symbols) {
+            if ((kept.kind == "function" || kept.kind == "method")
+                && kept.start_line <= sym.start_line && kept.end_line >= sym.end_line
+                && !(kept.name == sym.name && kept.qualname == sym.qualname
+                     && kept.kind == sym.kind && kept.start_line == sym.start_line)) {
+                nested_in_callable = true;
+                break;
+            }
+        }
+        if (!nested_in_callable) final_symbols.push_back(sym);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* symbols = doc.new_arr();
+    doc.set_root(root);
+
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "file", resolved.c_str());
+
+    int64_t symbol_count = 0;
+    bool any_signature = false;
+    bool any_visibility = false;
+
+    for (const auto& sym_row : final_symbols) {
+        auto* sym = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, sym, "name", sym_row.name.c_str());
+        if (!sym_row.qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", sym_row.qualname.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind", sym_row.kind.c_str());
+
+        int start_line = sym_row.start_line;
+        int end_line = sym_row.end_line;
+        yyjson_mut_obj_add_int(doc.doc, sym, "start_line", start_line);
+        yyjson_mut_obj_add_int(doc.doc, sym, "end_line", end_line);
+        yyjson_mut_obj_add_int(doc.doc, sym, "span_lines",
+            (start_line > 0 && end_line >= start_line) ? (end_line - start_line + 1) : 0);
+
+        if (!sym_row.signature.empty()) {
+            any_signature = true;
+            yyjson_mut_obj_add_strcpy(doc.doc, sym, "signature", sym_row.signature.c_str());
+        }
+
+        if (!sym_row.visibility.empty()) {
+            any_visibility = true;
+            yyjson_mut_obj_add_strcpy(doc.doc, sym, "visibility", sym_row.visibility.c_str());
+        }
+
+        if (!sym_row.doc.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, sym, "doc", sym_row.doc.c_str());
+        }
+
+        yyjson_mut_arr_append(symbols, sym);
+        symbol_count++;
+    }
+
+    yyjson_mut_obj_add_int(doc.doc, root, "symbol_count", symbol_count);
+    yyjson_mut_obj_add_val(doc.doc, root, "symbols", symbols);
+    if (symbol_count > 0 && !any_signature && !any_visibility) {
+        yyjson_mut_obj_add_str(doc.doc, root, "_note",
+            "signature/visibility fields are not yet populated by the extractor");
+    }
     return doc.to_string();
 }
 
@@ -1258,6 +2008,92 @@ std::string context_for(yyjson_val* params, Connection& conn,
         }
     }
 
+    return doc.to_string();
+}
+
+// T068b: context_by_name — resolve by symbol name, then return context
+std::string context_by_name(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& repo_root) {
+    const char* name = params ? json_get_str(params, "name") : nullptr;
+    if (!name || std::strlen(name) == 0)
+        return McpError::invalid_input("Missing 'name' parameter").to_json_rpc(0);
+
+    const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+
+    auto run_match_query = [&](bool prefix) -> std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>> {
+        std::string sql =
+            "SELECT n.id, n.name, n.qualname, n.kind, f.path, n.start_line "
+            "FROM nodes n "
+            "LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE n.node_type = 'symbol' AND ";
+        sql += prefix ? "n.name GLOB ?" : "n.name = ?";
+        if (file_pattern && std::strlen(file_pattern) > 0) sql += " AND f.path GLOB ?";
+        sql += " ORDER BY length(n.name), length(COALESCE(n.qualname, n.name)), f.path, n.start_line LIMIT 25";
+
+        sqlite3_stmt* stmt = nullptr;
+        std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>> rows;
+        if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            return rows;
+        }
+
+        int bind_idx = 1;
+        std::string prefix_pat;
+        if (prefix) prefix_pat = std::string(name) + "*";
+        sqlite3_bind_text(stmt, bind_idx++, prefix ? prefix_pat.c_str() : name, -1, SQLITE_TRANSIENT);
+        if (file_pattern && std::strlen(file_pattern) > 0)
+            sqlite3_bind_text(stmt, bind_idx++, file_pattern, -1, SQLITE_TRANSIENT);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            auto* name_txt = sqlite3_column_text(stmt, 1);
+            auto* qual_txt = sqlite3_column_text(stmt, 2);
+            auto* kind_txt = sqlite3_column_text(stmt, 3);
+            auto* file_txt = sqlite3_column_text(stmt, 4);
+            rows.emplace_back(
+                sqlite3_column_int64(stmt, 0),
+                name_txt ? reinterpret_cast<const char*>(name_txt) : "",
+                qual_txt ? reinterpret_cast<const char*>(qual_txt) : "",
+                kind_txt ? reinterpret_cast<const char*>(kind_txt) : "",
+                file_txt ? reinterpret_cast<const char*>(file_txt) : "",
+                sqlite3_column_int(stmt, 5));
+        }
+        sqlite3_finalize(stmt);
+        return rows;
+    };
+
+    auto exact_matches = run_match_query(false);
+    auto prefix_matches = exact_matches.empty() ? run_match_query(true) : std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>>();
+    const auto& matches = exact_matches.empty() ? prefix_matches : exact_matches;
+
+    if (matches.size() == 1) {
+        JsonMutDoc param_doc;
+        auto* root = param_doc.new_obj();
+        param_doc.set_root(root);
+        yyjson_mut_obj_add_int(param_doc.doc, root, "node_id", std::get<0>(matches[0]));
+
+        auto parsed = json_parse(param_doc.to_string());
+        return context_for(parsed.root(), conn, cache, repo_root);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_bool(doc.doc, root, "ambiguous", !matches.empty());
+    auto* candidates = doc.new_arr();
+
+    for (const auto& match : matches) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", std::get<0>(match));
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", std::get<1>(match).c_str());
+        if (!std::get<2>(match).empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", std::get<2>(match).c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", std::get<3>(match).c_str());
+        if (!std::get<4>(match).empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", std::get<4>(match).c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "start_line", std::get<5>(match));
+        yyjson_mut_arr_append(candidates, item);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "candidates", candidates);
     return doc.to_string();
 }
 
