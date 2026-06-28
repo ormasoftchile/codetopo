@@ -3497,7 +3497,8 @@ std::string code_search(yyjson_val* params, Connection& conn,
     int total_matches = 0;
 
     for (auto& fh : file_hits) {
-        auto full_path = std::filesystem::path(repo_root) / fh.path;
+        auto fh_path = std::filesystem::path(fh.path);
+        auto full_path = fh_path.is_absolute() ? fh_path : std::filesystem::path(repo_root) / fh.path;
         std::ifstream f(full_path);
         if (!f) continue;
 
