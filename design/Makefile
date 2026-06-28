@@ -8,8 +8,12 @@
 
 all: pdf
 
-pdf:
-	tectonic codetopo.tex
+pdf: triton.sty
+	tectonic -Z shell-escape -Z shell-escape-cwd=. codetopo.tex
+
+triton.sty: /Volumes/Projects/triton/latex/triton.sty
+	cp $< $@
 
 clean:
-	rm -f *.aux *.bbl *.blg *.out *.toc *.log *.xdv
+	rm -f *.aux *.bbl *.blg *.out *.toc *.log *.xdv triton.sty
+	rm -rf *.triton-cache *.triton-src.triton

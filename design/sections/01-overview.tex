@@ -24,7 +24,28 @@ field access), and where they live (\emph{location}: file, line, column). Given
 a symbol graph an LLM can answer questions that text search cannot:
 ``what calls \texttt{parse\_expr}?'', ``what does \texttt{Widget} inherit from?'',
 ``what symbols does \texttt{server.cpp} export?'' --- in milliseconds, without
-reading source files.
+reading source files. Figure~\ref{fig:symbol-graph} shows the scale of graph
+that codetopo treats as its fundamental unit of navigation.
+
+\begin{figure}[htbp]
+  \centering
+  \tritonnext{width=0.78\textwidth}
+\begin{triton}
+nodegraph
+  directed
+  title Tiny codetopo symbol graph
+  node IDX : index_file()
+  node PAR : parse_file()
+  node INS : insert_batch()
+  node SRV : mcp_server()
+  IDX -> PAR : calls
+  IDX -> INS : writes
+  SRV -> IDX : imports
+\end{triton}
+  \caption{A small codetopo symbol graph with symbol nodes and labeled call,
+           import, and write edges.}
+  \label{fig:symbol-graph}
+\end{figure}
 
 \subsection{The problem it solves}
 

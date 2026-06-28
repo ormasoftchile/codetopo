@@ -7,3 +7,5 @@
 *.xdv
 *.pdf
 *-cache/
+*.triton-cache
+*.triton-src.triton
