@@ -6,6 +6,7 @@
 #include "db/connection.h"
 #include "db/schema.h"
 #include "db/queries.h"
+#include "util/log.h"
 #include <string>
 #include <functional>
 #include <unordered_map>
@@ -62,7 +63,7 @@ public:
             if (idle_timeout_s_ > 0) {
                 auto idle = std::chrono::steady_clock::now() - last_activity;
                 if (std::chrono::duration_cast<std::chrono::seconds>(idle).count() > idle_timeout_s_) {
-                    std::cerr << "MCP server idle timeout (" << idle_timeout_s_ << "s). Exiting.\n";
+                    mcp_log("shutdown: idle timeout (" + std::to_string(idle_timeout_s_) + "s)");
                     return 0;
                 }
             }
@@ -70,6 +71,7 @@ public:
             std::string line = json_read_line();
             if (line.empty()) {
                 if (std::cin.eof()) {
+                    mcp_log("shutdown: stdin closed");
                     return 0;
                 }
                 continue;
@@ -146,17 +148,31 @@ public:
                     continue;
                 }
 
+                auto started = std::chrono::steady_clock::now();
+                mcp_log("tool: " + std::string(tool_name) + " " + json_for_log(tool_params));
+
                 try {
                     std::string result = it->second(tool_params, conn_, cache_, repo_root_);
+                    auto elapsed = std::chrono::steady_clock::now() - started;
+                    auto result_count = json_result_count(result);
 
                     // T070: Response size cap (512 KB)
                     if (result.size() > 512 * 1024) {
                         result = truncate_response(result);
                     }
 
+                    std::string done = "done: " + std::string(tool_name) + " (" + format_duration_ms(elapsed);
+                    if (result_count) {
+                        done += ", " + std::to_string(*result_count) + " results";
+                    }
+                    done += ")";
+                    mcp_log(done);
                     write_result(id, result, staleness_.stale ? &staleness_ : nullptr);
                 } catch (const std::exception& e) {
-                    write_error(id, -32603, "db_error", e.what());
+                    auto elapsed = std::chrono::steady_clock::now() - started;
+                    mcp_log("error: " + std::string(tool_name) + " (" + format_duration_ms(elapsed) + "): "
+                            + truncate_for_log(e.what()));
+                    write_error(id, -32603, "db_error", e.what(), false);
                 }
                 continue;
             }
@@ -175,6 +191,10 @@ public:
         auto now = std::chrono::steady_clock::now();
         return static_cast<int>(
             std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count());
+    }
+
+    size_t tool_count() const {
+        return tools_.size();
     }
 
 private:
@@ -339,7 +359,11 @@ private:
     }
 
     void write_error(int64_t id, int code, const std::string& error_code,
-                     const std::string& message) {
+                     const std::string& message, bool log_error = true) {
+        if (log_error) {
+            mcp_log("error: " + error_code + " (" + std::to_string(code) + "): "
+                    + truncate_for_log(message));
+        }
         McpError err;
         err.json_rpc_code = code;
         err.error_code = error_code;

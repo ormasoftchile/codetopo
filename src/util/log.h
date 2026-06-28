@@ -1,5 +1,7 @@
 #pragma once
 
+#include "util/json.h"
+
 #include <string>
 #include <filesystem>
 #include <fstream>
@@ -8,8 +10,68 @@
 #include <iomanip>
 #include <mutex>
 #include <cstdint>
+#include <ctime>
+#include <sstream>
+#include <optional>
+#include <cstdlib>
 
 namespace codetopo {
+
+inline void mcp_log(const std::string& msg) {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_buf{};
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buf[10];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm_buf);
+    std::cerr << "[" << buf << "] " << msg << "\n";
+}
+
+inline std::string truncate_for_log(std::string text, size_t max_len = 120) {
+    if (text.size() <= max_len) return text;
+    if (max_len <= 3) return text.substr(0, max_len);
+    return text.substr(0, max_len - 3) + "...";
+}
+
+template <typename Duration>
+inline std::string format_duration_ms(Duration duration) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+    return std::to_string(ms) + "ms";
+}
+
+template <typename Duration>
+inline std::string format_duration_seconds(Duration duration) {
+    double seconds = std::chrono::duration<double>(duration).count();
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1) << seconds << "s";
+    return oss.str();
+}
+
+inline std::string json_for_log(yyjson_val* val, size_t max_len = 120) {
+    if (!val) return "{}";
+    size_t len = 0;
+    char* json = yyjson_val_write(val, 0, &len);
+    if (!json) return "{}";
+    std::string out(json, len);
+    free(json);
+    return truncate_for_log(out, max_len);
+}
+
+inline std::optional<size_t> json_result_count(const std::string& json) {
+    auto doc = json_parse(json);
+    if (!doc) return std::nullopt;
+    auto* root = doc.root();
+    if (!root) return std::nullopt;
+    if (yyjson_is_arr(root)) return yyjson_arr_size(root);
+    if (!yyjson_is_obj(root)) return std::nullopt;
+    auto* results = yyjson_obj_get(root, "results");
+    if (results && yyjson_is_arr(results)) return yyjson_arr_size(results);
+    return std::nullopt;
+}
 
 // T015: Structured logging with rotation (50 MB threshold, 3 retained files).
 class Logger {
