@@ -28,7 +28,7 @@ inline void mcp_log(const std::string& msg) {
 #endif
     char buf[10];
     std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm_buf);
-    std::cerr << "[" << buf << "] " << msg << "\n";
+    std::cerr << "[" << buf << "] " << msg << "\n" << std::flush;
 }
 
 inline std::string truncate_for_log(std::string text, size_t max_len = 120) {
