@@ -28,6 +28,7 @@ struct Config {
     bool profile = false;  // Enable per-phase profiling output
     bool no_gitignore = false;
     bool turbo = false;  // Aggressive perf: synchronous=OFF, batch=1000, larger cache
+    bool force_reindex = false;  // Skip hash check, re-extract all files
     std::vector<std::string> exclude_patterns;  // Glob patterns to exclude (e.g. **/GlobalSuppressions.cs)
     bool supervised = false;   // True when running as a supervised child process
     bool safe_mode = false;    // True = commit after every file (for crash isolation)

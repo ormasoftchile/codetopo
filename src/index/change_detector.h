@@ -23,7 +23,8 @@ struct FileRecord {
 
 class ChangeDetector {
 public:
-    explicit ChangeDetector(Connection& conn) : conn_(conn) {
+    explicit ChangeDetector(Connection& conn, bool force_reindex = false)
+        : conn_(conn), force_reindex_(force_reindex) {
         load_existing();
     }
 
@@ -43,6 +44,11 @@ public:
             auto it = existing_.find(file.relative_path);
             if (it == existing_.end()) {
                 result.new_files.push_back(file);
+                continue;
+            }
+
+            if (force_reindex_) {
+                result.changed_files.push_back(file);
                 continue;
             }
 
@@ -73,6 +79,7 @@ public:
 
 private:
     Connection& conn_;
+    bool force_reindex_ = false;
     std::unordered_map<std::string, FileRecord> existing_;
 
     void load_existing() {

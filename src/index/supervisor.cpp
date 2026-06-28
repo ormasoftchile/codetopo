@@ -110,6 +110,7 @@ int run_index_supervisor(const Config& config,
         }
         if (config.no_gitignore) args.push_back("--no-gitignore");
         if (config.turbo) args.push_back("--turbo");
+        if (config.force_reindex) args.push_back("--force");
         if (config.profile) args.push_back("--profile");
         if (config.max_files > 0) {
             args.push_back("--max-files");

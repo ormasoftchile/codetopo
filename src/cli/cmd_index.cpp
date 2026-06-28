@@ -214,7 +214,7 @@ int run_index(const Config& config) {
         auto scanned_files = scanner.scan();
         std::cerr << "Found " << scanned_files.size() << " source files\n";
 
-        ChangeDetector detector(conn);
+        ChangeDetector detector(conn, config.force_reindex);
         auto changes = detector.detect(scanned_files);
 
         std::cerr << "New: " << changes.new_files.size()
