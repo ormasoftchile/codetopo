@@ -39,6 +39,12 @@ bool starts_with_uppercase_ascii(const std::string& name) {
     return !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) != 0;
 }
 
+bool is_js_export_assignment_target(TSNode node, const std::string& source) {
+    if (ts_node_is_null(node) || std::string(ts_node_type(node)) != "member_expression") return false;
+    std::string text = source_text(node, source);
+    return text == "module.exports" || text.rfind("exports.", 0) == 0;
+}
+
 std::string js_member_property_name(TSNode node, const std::string& source) {
     TSNode property = ts_node_child_by_field_name(node, "property", 8);
     if (!ts_node_is_null(property)) return source_text(property, source);
@@ -571,6 +577,30 @@ void Extractor::extract_csharp(TSNode node, const std::string& type, const std::
 }
 
 void Extractor::extract_typescript(TSNode node, const std::string& type, const std::string& parent_qn) {
+    auto maybe_add_constructor = [&](const std::string& name, TSNode symbol_node, TSNode function_node) -> bool {
+        if (name.empty() || !starts_with_uppercase_ascii(name)) return false;
+
+        auto this_assignments = collect_this_assignments(function_node, *source_);
+        if (this_assignments.empty()) return false;
+
+        std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
+        int constructor_idx = static_cast<int>(result_->symbols.size());
+        add_symbol("constructor_fn", name, symbol_node, constructor_qn);
+        if (static_cast<int>(result_->symbols.size()) <= constructor_idx) return true;
+
+        for (const auto& assignment : this_assignments) {
+            int field_idx = static_cast<int>(result_->symbols.size());
+            add_symbol("field", assignment.field_name, assignment.assignment_node,
+                       constructor_qn + "._fields." + assignment.field_name);
+            if (static_cast<int>(result_->symbols.size()) > field_idx) {
+                result_->edges.push_back({
+                    constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
+                });
+            }
+        }
+        return true;
+    };
+
     if (type == "function_declaration") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node, parent_qn.empty() ? name : parent_qn + "." + name);
@@ -599,26 +629,13 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
         auto name = get_name_from_child(node, "name");
         TSNode value = ts_node_child_by_field_name(node, "value", 5);
         std::string value_type = ts_node_is_null(value) ? "" : ts_node_type(value);
-        if (!name.empty() && is_js_function_like(value_type)) {
-            auto this_assignments = collect_this_assignments(value, *source_);
-            // Conservative heuristic: require both an UpperCamelCase binding
-            // and at least one direct this.X assignment in the function body.
-            if (starts_with_uppercase_ascii(name) && !this_assignments.empty()) {
-                std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
-                int constructor_idx = static_cast<int>(result_->symbols.size());
-                add_symbol("constructor_fn", name, node, constructor_qn);
-                if (static_cast<int>(result_->symbols.size()) > constructor_idx) {
-                    for (const auto& assignment : this_assignments) {
-                        int field_idx = static_cast<int>(result_->symbols.size());
-                        add_symbol("field", assignment.field_name, assignment.assignment_node,
-                                   constructor_qn + "._fields." + assignment.field_name);
-                        if (static_cast<int>(result_->symbols.size()) > field_idx) {
-                            result_->edges.push_back({
-                                constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
-                            });
-                        }
-                    }
-                }
+        if (!name.empty() && is_js_function_like(value_type) && maybe_add_constructor(name, node, value)) {
+            return;
+        }
+        if (!name.empty() && value_type == "assignment_expression") {
+            TSNode right = ts_node_child_by_field_name(value, "right", 5);
+            std::string right_type = ts_node_is_null(right) ? "" : ts_node_type(right);
+            if (is_js_function_like(right_type) && maybe_add_constructor(name, node, right)) {
                 return;
             }
         }
@@ -633,30 +650,15 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
         std::string name;
         if (!ts_node_is_null(left) && std::string(ts_node_type(left)) == "identifier") {
             name = node_text(left);
+        } else if (!ts_node_is_null(left) && is_js_export_assignment_target(left, *source_) &&
+                   right_type == "function_expression") {
+            name = get_name_from_child(right, "name");
         } else if (right_type == "function_expression") {
             name = get_name_from_child(right, "name");
         }
 
         if (name.empty()) return;
-
-        auto this_assignments = collect_this_assignments(right, *source_);
-        if (!starts_with_uppercase_ascii(name) || this_assignments.empty()) return;
-
-        std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
-        int constructor_idx = static_cast<int>(result_->symbols.size());
-        add_symbol("constructor_fn", name, node, constructor_qn);
-        if (static_cast<int>(result_->symbols.size()) > constructor_idx) {
-            for (const auto& assignment : this_assignments) {
-                int field_idx = static_cast<int>(result_->symbols.size());
-                add_symbol("field", assignment.field_name, assignment.assignment_node,
-                           constructor_qn + "._fields." + assignment.field_name);
-                if (static_cast<int>(result_->symbols.size()) > field_idx) {
-                    result_->edges.push_back({
-                        constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
-                    });
-                }
-            }
-        }
+        if (maybe_add_constructor(name, node, right)) return;
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);

@@ -150,7 +150,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("dir_tree", tools::dir_tree,
         "Return full directory subtree up to depth N with file sizes and language. Use instead of repeated dir_list calls.",
-        R"J({"type":"object","properties":{"path":{"type":"string","description":"Root path to traverse (default: '.')"},"depth":{"type":"integer","description":"Max depth (default: 3, 0=unlimited)"}}})J");
+        R"J({"type":"object","properties":{"path":{"type":"string","description":"Root path to traverse (default: '.')"},"depth":{"type":"integer","description":"Max depth (default: 2, 0=unlimited)"},"max_files":{"type":"integer","description":"Cap visible file entries by truncating deepest directories first (default: 500)"}}})J");
 
     server.register_tool("symbol_search", tools::symbol_search,
         "Search for symbols (functions, classes, macros, variables) by name. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns kind, name, file_path, span, and an internal node_id handle for chaining into other tools (context_for, callers_approx, impact_of). Never mention node_id values to the user — refer to symbols by name and file location instead.",

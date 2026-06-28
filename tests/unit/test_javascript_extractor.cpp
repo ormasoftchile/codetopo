@@ -111,7 +111,7 @@ let helper = function(x) {
     REQUIRE(contains_edge(name_index));
 }
 
-TEST_CASE("JavaScript assignment-based constructors become constructor_fn",
+TEST_CASE("JavaScript assignment-based and export-aliased constructors become constructor_fn",
           "[unit][javascript][extractor]") {
     std::string source = R"(Foo = function() {
   this.value = 1;
@@ -119,6 +119,10 @@ TEST_CASE("JavaScript assignment-based constructors become constructor_fn",
 
 module.exports = function ExportedThing() {
   this.ready = true;
+};
+
+var Collection = module.exports = function(cy, elements) {
+  this._private = { cy: cy, length: 0 };
 };)";
 
     auto result = extract_javascript(source);
@@ -135,4 +139,14 @@ module.exports = function ExportedThing() {
     REQUIRE(ready->qualname == "ExportedThing._fields.ready");
     REQUIRE(ready->start_line == 6);
     REQUIRE(ready->end_line == 6);
+
+    auto* collection = find_symbol(result, "constructor_fn", "Collection");
+    REQUIRE(collection != nullptr);
+    REQUIRE(collection->qualname == "Collection");
+
+    auto* private_field = find_symbol(result, "field", "_private");
+    REQUIRE(private_field != nullptr);
+    REQUIRE(private_field->qualname == "Collection._fields._private");
+    REQUIRE(private_field->start_line == 10);
+    REQUIRE(private_field->end_line == 10);
 }
