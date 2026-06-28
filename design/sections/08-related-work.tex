@@ -182,6 +182,11 @@ nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight,
         (\texttt{impact\_of}, \texttt{shortest\_path}) are not offered by any
         LSP server. Kythe could support it in theory but offers no out-of-box
         query.
+  \item[Callee extraction via \texttt{method\_fields}.] Even when the call graph
+        index is empty (e.g.\ HOF patterns), \texttt{method\_fields} extracts
+        direct outgoing call names and field accesses from a method body at
+        query time. This provides single-hop callee information without
+        requiring a pre-built call graph edge.
   \item[Incremental re-indexing via content hashing.] Combined with a file
         watcher, codetopo re-indexes only changed files in real time. clangd
         does incremental parsing but only within one LSP session; rust-analyzer
@@ -209,6 +214,25 @@ nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight,
         \emph{Value:} It would materially improve ``go to real callee'',
         polymorphic impact analysis, and agent workflows that must distinguish
         same-named methods, constructors, or generic instantiations.
+  \item[Higher-order function call graph gaps.] codetopo's call edge extraction
+        matches call expressions to symbol names syntactically. This approach
+        fails silently for three common JavaScript/TypeScript patterns:
+        (1)~higher-order function wrappers
+        (\texttt{time("label",\,() => fn(g))}), where the actual call is an
+        argument rather than a top-level expression; (2)~prototype assignment
+        (\texttt{Obj.method\,=\,function()\{\}}), where the callee name is not a
+        simple identifier; and (3)~dynamic dispatch via \texttt{forEach} or
+        similar iteration, where the called function is a variable. In codebases
+        that rely heavily on these patterns (dagre, cytoscape.js, d3-force), the
+        call graph index is effectively empty.
+
+        \emph{Tradeoff:} Resolving these patterns requires either full type
+        inference or heuristic name matching across assignment chains --- both
+        add significant complexity. \emph{Cost:} M--L per pattern family; all
+        three together are XL. \emph{Value:} Unlocks transitive blast-radius
+        analysis for the largest class of open-source JavaScript libraries.
+        Without it, \texttt{impact\_of} and \texttt{callers\_approx} are
+        unreliable for HOF-heavy codebases.
   \item[No taint/dataflow analysis.] Security and refactoring use cases
         benefit from tracking whether data flows between two symbols. Semgrep
         Pro and Kythe provide this; codetopo does not.
