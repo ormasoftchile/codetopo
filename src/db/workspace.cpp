@@ -17,6 +17,8 @@
 #include <iostream>
 #include <fstream>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <chrono>
 #include <iomanip>
@@ -31,7 +33,6 @@ namespace {
 
 static constexpr int kContentFtsBatchFiles = 1000;
 static constexpr int kWorkspaceResolveBatchSize = 1000;
-static constexpr int kWorkspaceResolveRefCap = 50000;
 
 using WorkspaceClock = std::chrono::steady_clock;
 
@@ -51,6 +52,13 @@ struct WorkspaceCandidate {
     bool receiver_match = false;
     double confidence = 0.0;
     bool valid = false;
+};
+
+struct WorkspaceCandidateRow {
+    int64_t node_id = 0;
+    bool is_definition = false;
+    std::string language;
+    std::string qualname;
 };
 
 std::string format_seconds(WorkspaceClock::time_point start) {
@@ -224,6 +232,45 @@ bool workspace_candidate_better(const WorkspaceCandidate& candidate,
         return candidate.receiver_match && !best.receiver_match;
     }
     return candidate.node_id < best.node_id;
+}
+
+std::string workspace_lookup_bare_name(std::string_view ref_name) {
+    static const std::unordered_set<std::string> skip_names = {
+        "", "new", "this", "self", "super", "null", "nil", "true", "false"
+    };
+
+    std::string bare_name(ref_name);
+    size_t best_pos = std::string::npos;
+    size_t best_len = 0;
+
+    const size_t dot = ref_name.rfind('.');
+    if (dot != std::string::npos && dot + 1 < ref_name.size()) {
+        best_pos = dot;
+        best_len = 1;
+    }
+
+    const size_t cc = ref_name.rfind("::");
+    if (cc != std::string::npos && cc + 2 < ref_name.size() &&
+        (best_pos == std::string::npos || cc > best_pos)) {
+        best_pos = cc;
+        best_len = 2;
+    }
+
+    const size_t arrow = ref_name.rfind("->");
+    if (arrow != std::string::npos && arrow + 2 < ref_name.size() &&
+        (best_pos == std::string::npos || arrow > best_pos)) {
+        best_pos = arrow;
+        best_len = 2;
+    }
+
+    if (best_pos != std::string::npos) {
+        bare_name = std::string(ref_name.substr(best_pos + best_len));
+    }
+
+    if (skip_names.find(bare_name) != skip_names.end()) {
+        return {};
+    }
+    return bare_name;
 }
 
 } // namespace
@@ -743,47 +790,51 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
 }
 
 std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_root_id) {
+    const bool color_output = stderr_is_tty();
+    std::unordered_map<std::string, std::vector<WorkspaceCandidateRow>> candidates_by_name;
+    candidates_by_name.reserve(65536);
+
     auto process_batch = [&](const std::vector<WorkspaceUnresolvedRef>& refs,
-                             sqlite3_stmt* candidate_stmt,
                              sqlite3_stmt* insert_edge_stmt,
                              sqlite3_stmt* update_ref_stmt,
                              int64_t& resolved_refs,
                              int64_t& edges_created) {
         for (const auto& ref : refs) {
-            sqlite3_reset(candidate_stmt);
-            sqlite3_clear_bindings(candidate_stmt);
-            sqlite3_bind_text(candidate_stmt, 1, ref.ref_name.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(candidate_stmt, 2, ref.caller_root);
+            std::string bare_name = workspace_lookup_bare_name(ref.ref_name);
+            if (bare_name.empty()) {
+                continue;
+            }
+            const std::string& lookup_bare_name =
+                bare_name.size() >= 4 ? bare_name : ref.ref_name;
 
             WorkspaceCandidate best;
-            int rc = SQLITE_OK;
-            while ((rc = sqlite3_step(candidate_stmt)) == SQLITE_ROW) {
-                const auto* language_text = sqlite3_column_text(candidate_stmt, 3);
-                const auto* qualname_text = sqlite3_column_text(candidate_stmt, 5);
-                std::string_view candidate_language =
-                    language_text ? reinterpret_cast<const char*>(language_text) : "";
-                std::string_view candidate_qualname =
-                    qualname_text ? reinterpret_cast<const char*>(qualname_text) : "";
-
-                WorkspaceCandidate candidate;
-                candidate.node_id = sqlite3_column_int64(candidate_stmt, 0);
-                candidate.is_definition = sqlite3_column_int(candidate_stmt, 4) != 0;
-                candidate.same_language = (!ref.caller_language.empty() &&
-                                           std::string_view(ref.caller_language) == candidate_language);
-                candidate.receiver_match =
-                    !ref.receiver_type_hint.empty() &&
-                    contains_case_insensitive(candidate_qualname, ref.receiver_type_hint);
-                candidate.confidence = workspace_ref_confidence(candidate.is_definition,
-                                                                candidate.same_language,
-                                                                candidate.receiver_match);
-                candidate.valid = true;
-
-                if (workspace_candidate_better(candidate, best)) {
-                    best = candidate;
+            auto consider_candidates = [&](const std::string& name) {
+                auto it = candidates_by_name.find(name);
+                if (it == candidates_by_name.end()) {
+                    return;
                 }
-            }
-            if (rc != SQLITE_DONE) {
-                throw std::runtime_error(sqlite_error(conn_.raw(), "Scan workspace ref candidates failed"));
+                for (const auto& row : it->second) {
+                    WorkspaceCandidate candidate;
+                    candidate.node_id = row.node_id;
+                    candidate.is_definition = row.is_definition;
+                    candidate.same_language = (!ref.caller_language.empty() &&
+                                               std::string_view(ref.caller_language) == row.language);
+                    candidate.receiver_match =
+                        !ref.receiver_type_hint.empty() &&
+                        contains_case_insensitive(row.qualname, ref.receiver_type_hint);
+                    candidate.confidence = workspace_ref_confidence(candidate.is_definition,
+                                                                    candidate.same_language,
+                                                                    candidate.receiver_match);
+                    candidate.valid = true;
+
+                    if (workspace_candidate_better(candidate, best)) {
+                        best = candidate;
+                    }
+                }
+            };
+            consider_candidates(ref.ref_name);
+            if (lookup_bare_name != ref.ref_name) {
+                consider_candidates(lookup_bare_name);
             }
 
             if (!best.valid || best.confidence < 0.4) {
@@ -795,7 +846,7 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
             sqlite3_bind_int64(insert_edge_stmt, 1, ref.containing_node_id);
             sqlite3_bind_int64(insert_edge_stmt, 2, best.node_id);
             sqlite3_bind_double(insert_edge_stmt, 3, best.confidence);
-            rc = sqlite3_step(insert_edge_stmt);
+            int rc = sqlite3_step(insert_edge_stmt);
             if (rc != SQLITE_DONE) {
                 throw std::runtime_error(sqlite_error(conn_.raw(), "Insert workspace cross-root edge failed"));
             }
@@ -814,64 +865,59 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
     };
 
     sqlite3_stmt* select_refs_stmt = nullptr;
-    sqlite3_stmt* candidate_stmt = nullptr;
+    sqlite3_stmt* preload_candidates_stmt = nullptr;
     sqlite3_stmt* insert_edge_stmt = nullptr;
     sqlite3_stmt* update_ref_stmt = nullptr;
 
     try {
-        prepare_or_throw(conn_.raw(), &select_refs_stmt,
-            "SELECT ref_id, ref_name, containing_node_id, caller_root, caller_language, receiver_type_hint "
-            "FROM ("
-            "  SELECT r.id AS ref_id, "
-            "         r.name AS ref_name, "
-            "         r.containing_node_id AS containing_node_id, "
-            "         COALESCE(cf.root_id, 0) AS caller_root, "
-            "         cf.language AS caller_language, "
-            "         COALESCE(r.receiver_type_hint, '') AS receiver_type_hint "
-            "  FROM refs r "
-            "  JOIN files cf ON cf.id = r.file_id "
-            "  WHERE r.kind = 'call' "
-            "    AND r.resolved_node_id IS NULL "
-            "    AND r.containing_node_id IS NOT NULL "
-            "    AND COALESCE(cf.root_id, 0) = ?1 "
-            "  UNION ALL "
-            "  SELECT r.id, "
-            "         r.name, "
-            "         r.containing_node_id, "
-            "         COALESCE(cf.root_id, 0), "
-            "         cf.language, "
-            "         COALESCE(r.receiver_type_hint, '') "
-            "  FROM refs r "
-            "  JOIN files cf ON cf.id = r.file_id "
-            "  WHERE r.kind = 'call' "
-            "    AND r.resolved_node_id IS NULL "
-            "    AND r.containing_node_id IS NOT NULL "
-            "    AND COALESCE(cf.root_id, 0) <> ?1 "
-            "    AND EXISTS ("
-            "      SELECT 1 "
-            "      FROM nodes n "
-            "      JOIN files nf ON nf.id = n.file_id "
-            "      WHERE n.node_type = 'symbol' "
-            "        AND n.kind IN ('function', 'method', 'constructor_fn') "
-            "        AND n.name = r.name "
-            "        AND COALESCE(nf.root_id, 0) = ?1"
-            "    )"
-            ") "
-            "ORDER BY ref_id "
-            "LIMIT ?2");
-        sqlite3_bind_int64(select_refs_stmt, 1, added_root_id);
-        sqlite3_bind_int(select_refs_stmt, 2, kWorkspaceResolveRefCap + 1);
-
-        prepare_or_throw(conn_.raw(), &candidate_stmt,
-            "SELECT n.id, n.kind, COALESCE(f.root_id, 0), f.language, "
-            "       n.is_definition, COALESCE(n.qualname, '') "
+        prepare_or_throw(conn_.raw(), &preload_candidates_stmt,
+            "SELECT n.name, n.id, f.language, n.is_definition, COALESCE(n.qualname, '') "
             "FROM nodes n "
             "JOIN files f ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' "
-            "  AND n.name = ?1 "
             "  AND n.kind IN ('function', 'method', 'constructor_fn') "
-            "  AND COALESCE(f.root_id, 0) != ?2 "
-            "ORDER BY n.id");
+            "  AND COALESCE(f.root_id, 0) != ?1 "
+            "ORDER BY n.name, n.is_definition DESC, n.id");
+        sqlite3_bind_int64(preload_candidates_stmt, 1, added_root_id);
+
+        int rc = SQLITE_OK;
+        int64_t candidate_rows = 0;
+        while ((rc = sqlite3_step(preload_candidates_stmt)) == SQLITE_ROW) {
+            const auto* name_text = sqlite3_column_text(preload_candidates_stmt, 0);
+            if (!name_text) {
+                continue;
+            }
+            WorkspaceCandidateRow row;
+            row.node_id = sqlite3_column_int64(preload_candidates_stmt, 1);
+            const auto* language_text = sqlite3_column_text(preload_candidates_stmt, 2);
+            row.language = language_text ? reinterpret_cast<const char*>(language_text) : "";
+            row.is_definition = sqlite3_column_int(preload_candidates_stmt, 3) != 0;
+            const auto* qualname_text = sqlite3_column_text(preload_candidates_stmt, 4);
+            row.qualname = qualname_text ? reinterpret_cast<const char*>(qualname_text) : "";
+            candidates_by_name[reinterpret_cast<const char*>(name_text)].push_back(std::move(row));
+            ++candidate_rows;
+        }
+        if (rc != SQLITE_DONE) {
+            throw std::runtime_error(sqlite_error(conn_.raw(), "Preload workspace ref candidates failed"));
+        }
+        mcp_log("cross-root candidate index: " + std::to_string(candidate_rows) +
+                " symbols across " + std::to_string(candidates_by_name.size()) + " names");
+
+        prepare_or_throw(conn_.raw(), &select_refs_stmt,
+            "SELECT r.id AS ref_id, "
+            "       r.name AS ref_name, "
+            "       r.containing_node_id AS containing_node_id, "
+            "       COALESCE(cf.root_id, 0) AS caller_root, "
+            "       cf.language AS caller_language, "
+            "       COALESCE(r.receiver_type_hint, '') AS receiver_type_hint "
+            "FROM refs r "
+            "JOIN files cf ON cf.id = r.file_id "
+            "WHERE r.kind = 'call' "
+            "  AND r.resolved_node_id IS NULL "
+            "  AND r.containing_node_id IS NOT NULL "
+            "  AND COALESCE(cf.root_id, 0) = ?1 "
+            "ORDER BY r.id");
+        sqlite3_bind_int64(select_refs_stmt, 1, added_root_id);
 
         prepare_or_throw(conn_.raw(), &insert_edge_stmt,
             "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, confidence, evidence) "
@@ -885,15 +931,9 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
         int64_t processed_refs = 0;
         int64_t resolved_refs = 0;
         int64_t edges_created = 0;
-        bool capped = false;
 
-        int rc = SQLITE_OK;
-        while ((rc = sqlite3_step(select_refs_stmt)) == SQLITE_ROW) {
-            if (processed_refs >= kWorkspaceResolveRefCap) {
-                capped = true;
-                break;
-            }
-
+        int select_rc = SQLITE_OK;
+        while ((select_rc = sqlite3_step(select_refs_stmt)) == SQLITE_ROW) {
             WorkspaceUnresolvedRef ref;
             ref.ref_id = sqlite3_column_int64(select_refs_stmt, 0);
             ref.containing_node_id = sqlite3_column_int64(select_refs_stmt, 2);
@@ -908,36 +948,40 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
 
             batch.push_back(std::move(ref));
             ++processed_refs;
+            if (processed_refs % 50000 == 0) {
+                std::cerr << "  " << stderr_dim("[cross-root]", color_output) << " "
+                          << stderr_cyan(format_with_commas(processed_refs), color_output)
+                          << " refs processed...\n" << std::flush;
+            }
 
             if (batch.size() >= kWorkspaceResolveBatchSize) {
-                process_batch(batch, candidate_stmt, insert_edge_stmt, update_ref_stmt,
+                process_batch(batch, insert_edge_stmt, update_ref_stmt,
                               resolved_refs, edges_created);
                 batch.clear();
             }
         }
-        if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+        if (select_rc != SQLITE_DONE && select_rc != SQLITE_ROW) {
             throw std::runtime_error(sqlite_error(conn_.raw(), "Collect workspace unresolved refs failed"));
         }
         if (!batch.empty()) {
-            process_batch(batch, candidate_stmt, insert_edge_stmt, update_ref_stmt,
+            process_batch(batch, insert_edge_stmt, update_ref_stmt,
                           resolved_refs, edges_created);
         }
 
-        if (capped) {
-            mcp_log("warning: cross-root resolution hit 50000-ref cap; remaining refs deferred");
-        }
+        mcp_log("cross-root forward pass: " + std::to_string(processed_refs) +
+                " unresolved call refs scanned from added root");
         mcp_log("cross-root resolution: " + std::to_string(resolved_refs) +
                 " refs resolved, " + std::to_string(edges_created) + " edges created");
 
         sqlite3_finalize(update_ref_stmt);
         sqlite3_finalize(insert_edge_stmt);
-        sqlite3_finalize(candidate_stmt);
+        sqlite3_finalize(preload_candidates_stmt);
         sqlite3_finalize(select_refs_stmt);
         return {resolved_refs, edges_created};
     } catch (...) {
         if (update_ref_stmt) sqlite3_finalize(update_ref_stmt);
         if (insert_edge_stmt) sqlite3_finalize(insert_edge_stmt);
-        if (candidate_stmt) sqlite3_finalize(candidate_stmt);
+        if (preload_candidates_stmt) sqlite3_finalize(preload_candidates_stmt);
         if (select_refs_stmt) sqlite3_finalize(select_refs_stmt);
         throw;
     }
