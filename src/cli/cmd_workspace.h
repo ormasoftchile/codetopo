@@ -36,9 +36,9 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
         auto result = ws.add_root(target_path, cfg);
         std::cout << "Added root: " << fs::canonical(target_path).string() << "\n"
                   << "  root_id: " << result.root_id << "\n"
-                  << "  files:   " << result.files << "\n"
-                  << "  symbols: " << result.symbols << "\n"
-                  << "  edges:   " << result.edges << "\n";
+                  << "  files:   " << format_with_commas(result.files) << "\n"
+                  << "  symbols: " << format_with_commas(result.symbols) << "\n"
+                  << "  edges:   " << format_with_commas(result.edges) << "\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << stderr_bold_red(std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";
