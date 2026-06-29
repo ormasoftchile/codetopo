@@ -13,7 +13,8 @@ namespace codetopo {
 // Schema version 1 = initial schema.
 // Schema version 5 = roots table + root_id on files (unified workspace).
 // Schema version 6 = call-ref metadata for approximate callgraph narrowing.
-static constexpr int CURRENT_SCHEMA_VERSION = 6;
+// Schema version 7 = composite dst/kind/confidence edge index for callers_approx.
+static constexpr int CURRENT_SCHEMA_VERSION = 7;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
@@ -104,6 +105,7 @@ inline void create_tables(Connection& conn) {
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind);
+        CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence);
     )SQL");
 
     conn.exec(R"SQL(
@@ -247,6 +249,7 @@ inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_refs_containing");
     conn.exec("DROP INDEX IF EXISTS idx_edges_src");
     conn.exec("DROP INDEX IF EXISTS idx_edges_dst");
+    conn.exec("DROP INDEX IF EXISTS idx_edges_dst_conf");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_stable_key");
 }
 
@@ -264,6 +267,7 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence)");
     conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key)");
 }
 
@@ -340,6 +344,16 @@ inline int ensure_schema(Connection& conn) {
     // Additive migration — existing rows keep NULL metadata and are still usable.
     if (version == 5) {
         ensure_refs_call_metadata_schema(conn);
+        version = 6;
+    }
+
+    // v6→v7: add composite dst/kind/confidence edge index for callers_approx.
+    if (version == 6) {
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence)");
+        version = 7;
+    }
+
+    if (version == CURRENT_SCHEMA_VERSION) {
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         return 0;
     }
