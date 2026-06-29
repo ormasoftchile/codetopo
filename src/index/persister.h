@@ -114,6 +114,93 @@ public:
     // Returns the file_id assigned by the last persist_file() call.
     int64_t last_file_id() const { return last_file_id_; }
 
+    // Clear the main-project index in bulk for --force reindex.
+    // Keeps schema, kv, quarantine, and workspace-root rows intact.  If the
+    // database only contains main-project files, this takes the fast truncate-
+    // style path; otherwise it deletes only rows reachable from root_id IS NULL.
+    int64_t clear_main_project_index_for_force() {
+        finalize_cached_stmts();
+
+        int64_t main_files = scalar_int64(
+            "SELECT COUNT(*) FROM files WHERE root_id IS NULL");
+        if (main_files == 0) {
+            cold_index_ = true;
+            return 0;
+        }
+
+        bool has_workspace_files = scalar_int64(
+            "SELECT COUNT(*) FROM files WHERE root_id IS NOT NULL") > 0;
+
+        conn_.exec("PRAGMA foreign_keys = OFF");
+        try {
+            conn_.exec("BEGIN TRANSACTION");
+
+            if (!has_workspace_files) {
+                conn_.exec("INSERT INTO content_fts(content_fts) VALUES('delete-all')");
+                conn_.exec("DELETE FROM content_fts_tracker");
+                conn_.exec("DELETE FROM edges");
+                conn_.exec("DELETE FROM refs");
+                conn_.exec("DELETE FROM nodes");
+                conn_.exec("DELETE FROM files");
+            } else {
+                conn_.exec("DROP TABLE IF EXISTS __codetopo_force_file_ids");
+                conn_.exec("DROP TABLE IF EXISTS __codetopo_force_node_ids");
+                conn_.exec("CREATE TABLE __codetopo_force_file_ids(id INTEGER PRIMARY KEY)");
+                conn_.exec("CREATE TABLE __codetopo_force_node_ids(id INTEGER PRIMARY KEY)");
+                conn_.exec(
+                    "INSERT INTO __codetopo_force_file_ids(id) "
+                    "SELECT id FROM files WHERE root_id IS NULL");
+                conn_.exec(
+                    "INSERT OR IGNORE INTO __codetopo_force_node_ids(id) "
+                    "SELECT id FROM nodes "
+                    "WHERE file_id IN (SELECT id FROM __codetopo_force_file_ids)");
+                conn_.exec(
+                    "INSERT OR IGNORE INTO __codetopo_force_node_ids(id) "
+                    "SELECT n.id FROM nodes n "
+                    "JOIN files f ON n.node_type = 'file' AND n.name = f.path "
+                    "WHERE f.id IN (SELECT id FROM __codetopo_force_file_ids)");
+
+                conn_.exec(
+                    "DELETE FROM content_fts "
+                    "WHERE file_id IN (SELECT id FROM __codetopo_force_file_ids)");
+                conn_.exec(
+                    "DELETE FROM content_fts_tracker "
+                    "WHERE file_id IN (SELECT id FROM __codetopo_force_file_ids)");
+                conn_.exec(
+                    "DELETE FROM edges "
+                    "WHERE src_id IN (SELECT id FROM __codetopo_force_node_ids) "
+                    "   OR dst_id IN (SELECT id FROM __codetopo_force_node_ids)");
+                conn_.exec(
+                    "DELETE FROM refs "
+                    "WHERE file_id IN (SELECT id FROM __codetopo_force_file_ids)");
+                conn_.exec(
+                    "UPDATE refs SET resolved_node_id = NULL "
+                    "WHERE resolved_node_id IN (SELECT id FROM __codetopo_force_node_ids)");
+                conn_.exec(
+                    "UPDATE refs SET containing_node_id = NULL "
+                    "WHERE containing_node_id IN (SELECT id FROM __codetopo_force_node_ids)");
+                conn_.exec(
+                    "DELETE FROM nodes "
+                    "WHERE id IN (SELECT id FROM __codetopo_force_node_ids)");
+                conn_.exec(
+                    "DELETE FROM files "
+                    "WHERE id IN (SELECT id FROM __codetopo_force_file_ids)");
+                conn_.exec("DROP TABLE __codetopo_force_node_ids");
+                conn_.exec("DROP TABLE __codetopo_force_file_ids");
+            }
+
+            conn_.exec("COMMIT");
+        } catch (...) {
+            try { conn_.exec("ROLLBACK"); } catch (...) {}
+            conn_.exec("PRAGMA foreign_keys = ON");
+            throw;
+        }
+        conn_.exec("PRAGMA foreign_keys = ON");
+
+        cold_index_ = true;
+        return main_files;
+    }
+
     // T040: Persist a single file's extraction results.
     // When used with begin_batch/commit_batch, caller manages the transaction.
     // When used standalone, wraps in its own transaction.
@@ -131,6 +218,11 @@ public:
             // Delete existing file record (cascades to nodes → edges, refs)
             // R4: Skip on cold index — DELETE is a guaranteed no-op on empty tables
             if (!cold_index_) {
+                auto file_key = make_file_stable_key(file.relative_path);
+                sqlite3_reset(stmt_delete_file_node_);
+                sqlite3_bind_text(stmt_delete_file_node_, 1, file_key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(stmt_delete_file_node_);
+
                 sqlite3_reset(stmt_delete_file_);
                 sqlite3_bind_text(stmt_delete_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
                 sqlite3_step(stmt_delete_file_);
@@ -700,6 +792,7 @@ private:
 
     // Cached prepared statements for persist_file() — prepared once, reused via reset/clear_bindings
     sqlite3_stmt* stmt_delete_file_ = nullptr;
+    sqlite3_stmt* stmt_delete_file_node_ = nullptr;
     sqlite3_stmt* stmt_insert_file_ = nullptr;
     sqlite3_stmt* stmt_insert_file_node_ = nullptr;
     sqlite3_stmt* stmt_insert_symbol_ = nullptr;
@@ -721,6 +814,10 @@ private:
 
         sqlite3_prepare_v2(conn_.raw(),
             "DELETE FROM files WHERE path = ? AND root_id IS NULL", -1, &stmt_delete_file_, nullptr);
+
+        sqlite3_prepare_v2(conn_.raw(),
+            "DELETE FROM nodes WHERE node_type = 'file' AND stable_key = ?",
+            -1, &stmt_delete_file_node_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
             "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
@@ -788,6 +885,7 @@ private:
 
     void finalize_cached_stmts() {
         if (stmt_delete_file_)     { sqlite3_finalize(stmt_delete_file_);     stmt_delete_file_ = nullptr; }
+        if (stmt_delete_file_node_){ sqlite3_finalize(stmt_delete_file_node_);stmt_delete_file_node_ = nullptr; }
         if (stmt_insert_file_)     { sqlite3_finalize(stmt_insert_file_);     stmt_insert_file_ = nullptr; }
         if (stmt_insert_file_node_){ sqlite3_finalize(stmt_insert_file_node_);stmt_insert_file_node_ = nullptr; }
         if (stmt_insert_symbol_)   { sqlite3_finalize(stmt_insert_symbol_);   stmt_insert_symbol_ = nullptr; }
@@ -797,6 +895,18 @@ private:
         if (stmt_batch_insert_edge_){ sqlite3_finalize(stmt_batch_insert_edge_);stmt_batch_insert_edge_ = nullptr; }
         if (stmt_batch_insert_symbol_){ sqlite3_finalize(stmt_batch_insert_symbol_);stmt_batch_insert_symbol_ = nullptr; }
         stmts_cached_ = false;
+    }
+
+    int64_t scalar_int64(const char* sql) {
+        sqlite3_stmt* stmt = nullptr;
+        int64_t value = 0;
+        if (sqlite3_prepare_v2(conn_.raw(), sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                value = sqlite3_column_int64(stmt, 0);
+            }
+        }
+        sqlite3_finalize(stmt);
+        return value;
     }
 };
 

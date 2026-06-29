@@ -13,7 +13,7 @@ namespace codetopo {
 // Schema version 1 = initial schema.
 // Schema version 5 = roots table + root_id on files (unified workspace).
 static constexpr int CURRENT_SCHEMA_VERSION = 5;
-static constexpr const char* INDEXER_VERSION = "1.0.0";
+static constexpr const char* INDEXER_VERSION = "1.1.0";
 
 namespace schema {
 
