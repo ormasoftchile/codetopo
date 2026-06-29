@@ -37,6 +37,9 @@ struct ExtractedRef {
     int end_col = 0;
     std::string evidence;
     int containing_symbol_index = -1;  // Index into symbols array of enclosing method/function
+    int arg_count = -1;                 // Call-site argument count when known
+    std::string arg_pattern;            // Coarse call-site argument shapes
+    std::string receiver_type_hint;      // Same-file local declaration type hint
 };
 
 struct ExtractedEdge {
@@ -99,7 +102,11 @@ private:
                     const std::string& signature = "",
                     const std::string& visibility = "");
     void add_ref(const std::string& kind, const std::string& name, TSNode node,
-                 const std::string& evidence = "");
+                 const std::string& evidence = "", int arg_count = -1,
+                 const std::string& arg_pattern = "",
+                 const std::string& receiver_type_hint = "");
+    void add_call_ref(const std::string& name, TSNode node,
+                      const std::string& evidence = "");
     void add_call_edge(int caller_idx, const std::string& callee_name, double confidence = 0.7);
 
     void visit_node(TSNode node, const std::string& parent_qualname, int depth);

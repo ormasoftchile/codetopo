@@ -38,6 +38,21 @@ static ExtractionResult extract_javascript(const std::string& source) {
     return extractor.extract(tree.tree, source, "javascript", "test.js");
 }
 
+static ExtractionResult extract_typescript_for_test(const std::string& source) {
+    setup_arena();
+    ArenaPool pool(1, 32 * 1024 * 1024);
+    auto lease = ArenaLease(pool);
+    set_thread_arena(lease.get());
+
+    Parser parser;
+    REQUIRE(parser.set_language("typescript"));
+    auto tree = TreeGuard(parser.parse(source));
+    REQUIRE(tree.tree);
+
+    Extractor extractor(5000, 100, 0);
+    return extractor.extract(tree.tree, source, "typescript", "test.ts");
+}
+
 static const ExtractedSymbol* find_symbol(const ExtractionResult& result,
                                           const std::string& kind,
                                           const std::string& name) {
@@ -149,4 +164,26 @@ var Collection = module.exports = function(cy, elements) {
     REQUIRE(private_field->qualname == "Collection._fields._private");
     REQUIRE(private_field->start_line == 10);
     REQUIRE(private_field->end_line == 10);
+}
+
+TEST_CASE("TypeScript call refs capture arity, argument pattern, and local receiver type",
+          "[unit][typescript][extractor]") {
+    std::string source = R"(class LinkedMap {
+  set(key: string, value: number) {}
+}
+
+function use() {
+  const linked: LinkedMap = new LinkedMap();
+  linked.set("a", 1);
+})";
+
+    auto result = extract_typescript_for_test(source);
+    auto it = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "linked.set";
+        });
+    REQUIRE(it != result.refs.end());
+    CHECK(it->arg_count == 2);
+    CHECK(it->arg_pattern == "string,number");
+    CHECK(it->receiver_type_hint == "LinkedMap");
 }

@@ -74,11 +74,12 @@ static int64_t insert_file(Connection& conn, const char* path) {
 
 static int64_t insert_symbol(Connection& conn, int64_t file_id, const char* kind,
                              const char* name, const char* qualname,
-                             int start_line, int end_line) {
+                             int start_line, int end_line,
+                             const char* signature = nullptr) {
     sqlite3_stmt* stmt = nullptr;
     REQUIRE(sqlite3_prepare_v2(conn.raw(),
-        "INSERT INTO nodes(node_type, file_id, kind, name, qualname, start_line, end_line, stable_key) "
-        "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO nodes(node_type, file_id, kind, name, qualname, start_line, end_line, stable_key, signature) "
+        "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?)",
         -1, &stmt, nullptr) == SQLITE_OK);
     sqlite3_bind_int64(stmt, 1, file_id);
     sqlite3_bind_text(stmt, 2, kind, -1, SQLITE_TRANSIENT);
@@ -89,6 +90,10 @@ static int64_t insert_symbol(Connection& conn, int64_t file_id, const char* kind
     std::string stable_key = std::string(qualname) + "::" + kind + "::" + name +
                              "::" + std::to_string(start_line);
     sqlite3_bind_text(stmt, 7, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+    if (signature)
+        sqlite3_bind_text(stmt, 8, signature, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 8);
     step_done(conn, stmt);
     return sqlite3_last_insert_rowid(conn.raw());
 }
@@ -108,11 +113,14 @@ static void insert_edge(Connection& conn, int64_t src, int64_t dst,
 
 static void insert_call_ref(Connection& conn, int64_t file_id, const char* name,
                             int start_line, int start_col, int end_col,
-                            int64_t containing_node_id) {
+                            int64_t containing_node_id, int arg_count = -1,
+                            const char* arg_pattern = nullptr,
+                            const char* receiver_type_hint = nullptr) {
     sqlite3_stmt* stmt = nullptr;
     REQUIRE(sqlite3_prepare_v2(conn.raw(),
         "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, "
-        "evidence, containing_node_id) VALUES(?, 'call', ?, ?, ?, ?, ?, 'call_expression', ?)",
+        "evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint) "
+        "VALUES(?, 'call', ?, ?, ?, ?, ?, 'call_expression', ?, ?, ?, ?)",
         -1, &stmt, nullptr) == SQLITE_OK);
     sqlite3_bind_int64(stmt, 1, file_id);
     sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
@@ -121,6 +129,12 @@ static void insert_call_ref(Connection& conn, int64_t file_id, const char* name,
     sqlite3_bind_int(stmt, 5, start_line);
     sqlite3_bind_int(stmt, 6, end_col);
     sqlite3_bind_int64(stmt, 7, containing_node_id);
+    if (arg_count >= 0) sqlite3_bind_int(stmt, 8, arg_count);
+    else sqlite3_bind_null(stmt, 8);
+    if (arg_pattern) sqlite3_bind_text(stmt, 9, arg_pattern, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 9);
+    if (receiver_type_hint) sqlite3_bind_text(stmt, 10, receiver_type_hint, -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 10);
     step_done(conn, stmt);
 }
 
@@ -480,4 +494,56 @@ TEST_CASE("callers_approx candidate handles are opt-in",
                            has_field(handles_item, "caller_node_id");
     CHECK(has_node_handle);
     CHECK(has_field(handles_item, "span"));
+}
+
+TEST_CASE("callers_approx filters arity mismatches and ranks same-arity patterns",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-arity");
+    Connection conn(db.db_path);
+    conn.exec(std::string("UPDATE nodes SET signature = 'set(key: string, value: number): void' WHERE id = ") +
+              std::to_string(db.ids.linked_set));
+    conn.exec("UPDATE refs SET arg_count = 2, arg_pattern = 'string,number' WHERE name = 'linked.set'");
+    conn.exec("UPDATE refs SET arg_count = 1, arg_pattern = 'string' WHERE name = 'this.set'");
+    conn.exec("UPDATE refs SET arg_count = 3, arg_pattern = 'string,number,number' WHERE name = 'LinkedMap.set'");
+    conn.exec("UPDATE refs SET arg_count = 1, arg_pattern = 'string' WHERE name = 'unrelated.set'");
+    conn.exec("UPDATE refs SET arg_count = 2, arg_pattern = 'string,number' WHERE name = 'OtherMap.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+
+    REQUIRE(find_item_with_string(candidates, "callee_text", "linked.set") != nullptr);
+    CHECK(find_item_with_string(candidates, "callee_text", "this.set") == nullptr);
+    CHECK(find_item_with_string(candidates, "callee_text", "unrelated.set") == nullptr);
+    CHECK(json_get_int(doc.root(), "arity_filtered", 0) >= 2);
+}
+
+TEST_CASE("callers_approx prefers same-file local receiver type hints",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-local-receiver-type");
+    Connection conn(db.db_path);
+    conn.exec("UPDATE refs SET receiver_type_hint = 'LinkedMap' WHERE name = 'linked.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* typed_receiver = find_item_with_string(candidates, "callee_text", "linked.set");
+    auto* unrelated_receiver = find_item_with_string(candidates, "callee_text", "unrelated.set");
+    REQUIRE(typed_receiver != nullptr);
+    REQUIRE(unrelated_receiver != nullptr);
+    REQUIRE(json_get_str(typed_receiver, "receiver_type_hint") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "receiver_type_hint")) == "LinkedMap");
+    CHECK(require_confidence(typed_receiver) > require_confidence(unrelated_receiver));
+    REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("local_receiver_type") != std::string::npos);
 }

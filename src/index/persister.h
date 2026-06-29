@@ -350,7 +350,7 @@ public:
                         for (int r = 0; r < REF_BATCH_SIZE; ++r) {
                             int idx = c * REF_BATCH_SIZE + r;
                             const auto& ref = extraction.refs[idx];
-                            int base_param = r * 9 + 1;  // 9 params per ref
+                            int base_param = r * 12 + 1;  // 12 params per ref
                             
                             sqlite3_bind_int64(stmt_batch_insert_ref_, base_param + 0, file_id);
                             sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 1, ref.kind.c_str(), -1, SQLITE_STATIC);
@@ -368,6 +368,18 @@ public:
                                 sqlite3_bind_int64(stmt_batch_insert_ref_, base_param + 8, symbol_ids[ref.containing_symbol_index]);
                             else
                                 sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 8);
+                            if (ref.arg_count >= 0)
+                                sqlite3_bind_int(stmt_batch_insert_ref_, base_param + 9, ref.arg_count);
+                            else
+                                sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 9);
+                            if (ref.arg_pattern.empty())
+                                sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 10);
+                            else
+                                sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 10, ref.arg_pattern.c_str(), -1, SQLITE_STATIC);
+                            if (ref.receiver_type_hint.empty())
+                                sqlite3_bind_null(stmt_batch_insert_ref_, base_param + 11);
+                            else
+                                sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 11, ref.receiver_type_hint.c_str(), -1, SQLITE_STATIC);
                         }
                         sqlite3_step(stmt_batch_insert_ref_);
                     }
@@ -393,6 +405,12 @@ public:
                         sqlite3_bind_int64(stmt_insert_ref_, 9, symbol_ids[ref.containing_symbol_index]);
                     else
                         sqlite3_bind_null(stmt_insert_ref_, 9);
+                    if (ref.arg_count >= 0) sqlite3_bind_int(stmt_insert_ref_, 10, ref.arg_count);
+                    else sqlite3_bind_null(stmt_insert_ref_, 10);
+                    if (ref.arg_pattern.empty()) sqlite3_bind_null(stmt_insert_ref_, 11);
+                    else sqlite3_bind_text(stmt_insert_ref_, 11, ref.arg_pattern.c_str(), -1, SQLITE_STATIC);
+                    if (ref.receiver_type_hint.empty()) sqlite3_bind_null(stmt_insert_ref_, 12);
+                    else sqlite3_bind_text(stmt_insert_ref_, 12, ref.receiver_type_hint.c_str(), -1, SQLITE_STATIC);
                     sqlite3_step(stmt_insert_ref_);
                 }
             }
@@ -833,8 +851,9 @@ private:
             "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_symbol_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
-            "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_ref_, nullptr);
+            "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id, "
+            "arg_count, arg_pattern, receiver_type_hint) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_ref_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
             "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
@@ -847,11 +866,11 @@ private:
     void ensure_batch_ref_stmt() {
         if (stmt_batch_insert_ref_) return;
         
-        // 80-row batch: 9 params/row * 80 = 720 params (< 999 limit)
-        std::string sql = "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id) VALUES ";
+        // 80-row batch: 12 params/row * 80 = 960 params (< 999 limit)
+        std::string sql = "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint) VALUES ";
         for (int i = 0; i < 80; ++i) {
             if (i > 0) sql += ",";
-            sql += "(?,?,?,?,?,?,?,?,?)";
+            sql += "(?,?,?,?,?,?,?,?,?,?,?,?)";
         }
         sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_ref_, nullptr);
     }

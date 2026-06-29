@@ -1,10 +1,12 @@
 #include "index/extractor.h"
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -37,6 +39,197 @@ bool is_nested_function_boundary(const std::string& type) {
 
 bool starts_with_uppercase_ascii(const std::string& name) {
     return !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) != 0;
+}
+
+std::string trim_copy(std::string s) {
+    size_t first = 0;
+    while (first < s.size() && std::isspace(static_cast<unsigned char>(s[first]))) ++first;
+    size_t last = s.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(s[last - 1]))) --last;
+    return s.substr(first, last - first);
+}
+
+bool is_identifier_char(char c) {
+    unsigned char u = static_cast<unsigned char>(c);
+    return std::isalnum(u) || c == '_' || c == '$';
+}
+
+bool is_simple_identifier(const std::string& text) {
+    if (text.empty()) return false;
+    unsigned char first = static_cast<unsigned char>(text[0]);
+    if (!(std::isalpha(first) || text[0] == '_' || text[0] == '$')) return false;
+    for (char c : text) {
+        if (!is_identifier_char(c)) return false;
+    }
+    return true;
+}
+
+std::string normalize_type_hint(std::string type) {
+    type = trim_copy(type);
+    while (!type.empty() && (type.back() == ';' || type.back() == ',' || type.back() == '=' ||
+                             type.back() == ')' || std::isspace(static_cast<unsigned char>(type.back())))) {
+        type.pop_back();
+    }
+    while (!type.empty() && (type.front() == '*' || type.front() == '&' ||
+                             std::isspace(static_cast<unsigned char>(type.front())))) {
+        type.erase(type.begin());
+    }
+    size_t generic = type.find_first_of("<[");
+    if (generic != std::string::npos) type = type.substr(0, generic);
+    size_t qualifier = type.find_last_of(".:");
+    if (qualifier != std::string::npos && qualifier + 1 < type.size()) {
+        if (type[qualifier] == ':' && qualifier > 0 && type[qualifier - 1] == ':')
+            type = type.substr(qualifier + 1);
+        else if (type[qualifier] == '.')
+            type = type.substr(qualifier + 1);
+    }
+    return trim_copy(type);
+}
+
+std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
+    size_t pos = colon_pos + 1;
+    while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+    size_t start = pos;
+    int generic_depth = 0;
+    while (pos < line.size()) {
+        char c = line[pos];
+        if (c == '<' || c == '[') ++generic_depth;
+        else if ((c == '>' || c == ']') && generic_depth > 0) --generic_depth;
+        if (generic_depth == 0 && (c == '=' || c == ';' || c == ',' || c == ')' || c == '{')) break;
+        ++pos;
+    }
+    return normalize_type_hint(line.substr(start, pos - start));
+}
+
+std::string infer_type_from_declaration_line(const std::string& line, const std::string& receiver) {
+    size_t pos = line.find(receiver);
+    while (pos != std::string::npos) {
+        bool left_ok = (pos == 0) || !is_identifier_char(line[pos - 1]);
+        size_t end = pos + receiver.size();
+        bool right_ok = (end >= line.size()) || !is_identifier_char(line[end]);
+        if (left_ok && right_ok) {
+            size_t next = end;
+            while (next < line.size() && std::isspace(static_cast<unsigned char>(line[next]))) ++next;
+            if (next < line.size() && line[next] == ':') {
+                auto type = read_type_after_colon(line, next);
+                if (!type.empty()) return type;
+            }
+
+            if (next >= line.size() || line[next] == '=' || line[next] == ';' ||
+                line[next] == ',' || line[next] == '(' || line[next] == ')') {
+                size_t before = pos;
+                while (before > 0 && std::isspace(static_cast<unsigned char>(line[before - 1]))) --before;
+                while (before > 0 && (line[before - 1] == '*' || line[before - 1] == '&' ||
+                                      std::isspace(static_cast<unsigned char>(line[before - 1])))) {
+                    --before;
+                }
+                size_t start = before;
+                while (start > 0) {
+                    char c = line[start - 1];
+                    if (!(is_identifier_char(c) || c == ':' || c == '.' || c == '<' || c == '>' || c == ',')) break;
+                    --start;
+                }
+                auto type = normalize_type_hint(line.substr(start, before - start));
+                static const std::unordered_set<std::string> keywords = {
+                    "const", "let", "var", "auto", "return", "new", "this", "public",
+                    "private", "protected", "static", "final"
+                };
+                if (!type.empty() && !keywords.count(type)) return type;
+            }
+        }
+        pos = line.find(receiver, end);
+    }
+    return "";
+}
+
+std::string receiver_from_callee_text(const std::string& callee_text) {
+    size_t pos = std::string::npos;
+    size_t sep_len = 0;
+    for (const auto& sep : {std::string("->"), std::string("::"), std::string(".")}) {
+        size_t p = callee_text.rfind(sep);
+        if (p != std::string::npos && (pos == std::string::npos || p > pos)) {
+            pos = p;
+            sep_len = sep.size();
+        }
+    }
+    (void)sep_len;
+    if (pos == std::string::npos) return "";
+    return trim_copy(callee_text.substr(0, pos));
+}
+
+TSNode find_argument_list_node(TSNode call_node) {
+    for (const char* field : {"arguments", "argument", "parameters"}) {
+        TSNode child = ts_node_child_by_field_name(call_node, field, static_cast<uint32_t>(std::strlen(field)));
+        if (!ts_node_is_null(child)) {
+            std::string type = ts_node_type(child);
+            if (type.find("argument") != std::string::npos || type == "arguments") return child;
+        }
+    }
+
+    uint32_t count = ts_node_named_child_count(call_node);
+    for (uint32_t i = 0; i < count; ++i) {
+        TSNode child = ts_node_named_child(call_node, i);
+        const char* type = ts_node_type(child);
+        if (!type) continue;
+        std::string t(type);
+        if (t == "argument_list" || t == "arguments" || t == "call_arguments") return child;
+    }
+    return {};
+}
+
+std::string lower_ascii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string classify_argument(TSNode arg, const std::string& source) {
+    const char* type = ts_node_type(arg);
+    std::string t = type ? type : "";
+    std::string text = trim_copy(source_text(arg, source));
+    std::string lower_type = lower_ascii(t);
+    std::string lower_text = lower_ascii(text);
+
+    if (lower_type.find("string") != std::string::npos || (!text.empty() && (text[0] == '"' || text[0] == '\'' || text[0] == '`')))
+        return "string";
+    if (lower_type.find("number") != std::string::npos || lower_type.find("integer") != std::string::npos ||
+        lower_type.find("float") != std::string::npos)
+        return "number";
+    if (lower_text == "true" || lower_text == "false" || lower_type.find("boolean") != std::string::npos)
+        return "bool";
+    if (lower_text == "null" || lower_text == "undefined" || lower_text == "nil" || lower_text == "none")
+        return "null";
+    if (lower_type.find("object") != std::string::npos || lower_type.find("dictionary") != std::string::npos)
+        return "object";
+    if (lower_type.find("array") != std::string::npos || lower_type.find("list") != std::string::npos ||
+        (!text.empty() && text[0] == '['))
+        return "array";
+    if (lower_type.find("lambda") != std::string::npos || lower_type.find("function") != std::string::npos ||
+        lower_type.find("arrow_function") != std::string::npos || lower_text.find("=>") != std::string::npos)
+        return "callback";
+    if (lower_type.find("new_expression") != std::string::npos || lower_text.rfind("new ", 0) == 0) {
+        std::string rest = trim_copy(text.size() >= 4 ? text.substr(4) : "");
+        size_t end = 0;
+        while (end < rest.size() && (is_identifier_char(rest[end]) || rest[end] == '.' || rest[end] == ':')) ++end;
+        std::string type_name = normalize_type_hint(rest.substr(0, end));
+        return type_name.empty() ? "new" : "new:" + type_name;
+    }
+    if (lower_type.find("call") != std::string::npos || lower_text.find('(') != std::string::npos)
+        return "call";
+    if (lower_type.find("member") != std::string::npos || lower_type.find("field") != std::string::npos ||
+        lower_text.find('.') != std::string::npos || lower_text.find("->") != std::string::npos)
+        return "member";
+    if (is_simple_identifier(text)) return "identifier";
+    return "expr";
+}
+
+std::string join_patterns(const std::vector<std::string>& patterns) {
+    std::string out;
+    for (const auto& p : patterns) {
+        if (!out.empty()) out += ",";
+        out += p;
+    }
+    if (out.size() > 128) out = out.substr(0, 128);
+    return out;
 }
 
 bool is_js_export_assignment_target(TSNode node, const std::string& source) {
@@ -267,10 +460,28 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
     TSPoint end = ts_node_end_point(node);
 
     std::string doc_comment = extract_leading_comment(node);
+    std::string sig = signature;
+    if (sig.empty() && (kind == "function" || kind == "method" || kind == "constructor_fn")) {
+        sig = node_text(node);
+        size_t body = sig.find('{');
+        if (body != std::string::npos) sig = sig.substr(0, body);
+        std::istringstream in(sig);
+        std::string collapsed;
+        std::string word;
+        while (in >> word) {
+            if (!collapsed.empty()) collapsed += ' ';
+            collapsed += word;
+            if (collapsed.size() > 512) {
+                collapsed.resize(512);
+                break;
+            }
+        }
+        sig = collapsed;
+    }
 
     result_->symbols.push_back({
         kind, name, qualname.empty() ? name : qualname,
-        signature,
+        sig,
         static_cast<int>(start.row + 1), static_cast<int>(start.column),
         static_cast<int>(end.row + 1), static_cast<int>(end.column),
         true, visibility, doc_comment, ""
@@ -278,7 +489,9 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
 }
 
 void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode node,
-                         const std::string& evidence) {
+                         const std::string& evidence, int arg_count,
+                         const std::string& arg_pattern,
+                         const std::string& receiver_type_hint) {
     TSPoint start = ts_node_start_point(node);
     TSPoint end = ts_node_end_point(node);
     int containing = symbol_stack_.empty() ? -1 : symbol_stack_.back();
@@ -287,8 +500,40 @@ void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode
         kind, name,
         static_cast<int>(start.row + 1), static_cast<int>(start.column),
         static_cast<int>(end.row + 1), static_cast<int>(end.column),
-        evidence, containing
+        evidence, containing, arg_count, arg_pattern, receiver_type_hint
     });
+}
+
+void Extractor::add_call_ref(const std::string& name, TSNode node,
+                             const std::string& evidence) {
+    int arg_count = -1;
+    std::string arg_pattern;
+    TSNode args = find_argument_list_node(node);
+    if (!ts_node_is_null(args)) {
+        arg_count = static_cast<int>(ts_node_named_child_count(args));
+        std::vector<std::string> patterns;
+        patterns.reserve(static_cast<size_t>(std::max(arg_count, 0)));
+        for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
+            patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+        }
+        arg_pattern = join_patterns(patterns);
+    }
+
+    std::string receiver_type_hint;
+    std::string receiver = receiver_from_callee_text(name);
+    if (is_simple_identifier(receiver) && receiver != "this" && receiver != "self") {
+        uint32_t call_start = ts_node_start_byte(node);
+        size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
+        std::string prefix = source_->substr(window_start, call_start - window_start);
+        std::istringstream lines(prefix);
+        std::string line;
+        while (std::getline(lines, line)) {
+            auto type_hint = infer_type_from_declaration_line(line, receiver);
+            if (!type_hint.empty()) receiver_type_hint = type_hint;
+        }
+    }
+
+    add_ref("call", name, node, evidence, arg_count, arg_pattern, receiver_type_hint);
 }
 
 void Extractor::add_call_edge(int caller_idx, const std::string& callee_name, double confidence) {
@@ -446,7 +691,7 @@ void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::s
         auto func = ts_node_child(node, 0);
         if (!ts_node_is_null(func)) {
             std::string callee = get_callee_name(func);
-            add_ref("call", callee, node, "call_expression");
+            add_call_ref(callee, node, "call_expression");
         }
     }
     else if (type == "type_identifier") {
@@ -537,7 +782,7 @@ void Extractor::extract_csharp(TSNode node, const std::string& type, const std::
     }
     else if (type == "invocation_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "invocation");
+        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "invocation");
     }
     else if (type == "using_directive") {
         auto name_node = ts_node_child_by_field_name(node, "name", 4);
@@ -571,7 +816,7 @@ void Extractor::extract_csharp(TSNode node, const std::string& type, const std::
     else if (type == "object_creation_expression") {
         auto type_node = ts_node_child(node, 1);
         if (!ts_node_is_null(type_node)) {
-            add_ref("call", node_text(type_node), node, "object_creation");
+            add_call_ref(node_text(type_node), node, "object_creation");
         }
     }
 }
@@ -662,7 +907,7 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call_expression");
+        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call_expression");
     }
     else if (type == "member_expression") {
         // Check if object is `this`
@@ -732,7 +977,7 @@ void Extractor::extract_go(TSNode node, const std::string& type, const std::stri
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call");
+        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call");
     }
     else if (type == "import_declaration") {
         add_ref("include", node_text(node), node, "import");
@@ -786,7 +1031,7 @@ void Extractor::extract_python(TSNode node, const std::string& type, const std::
     }
     else if (type == "call") {
         auto func = ts_node_child_by_field_name(node, "function", 8);
-        if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call");
+        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call");
     }
     else if (type == "import_statement" || type == "import_from_statement") {
         add_ref("include", node_text(node), node, "import");
@@ -832,7 +1077,7 @@ void Extractor::extract_rust(TSNode node, const std::string& type, const std::st
     }
     else if (type == "call_expression") {
         auto func = ts_node_child_by_field_name(node, "function", 8);
-        if (!ts_node_is_null(func)) add_ref("call", node_text(func), node, "call");
+        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call");
     }
     else if (type == "use_declaration") {
         add_ref("include", node_text(node), node, "use");
@@ -876,7 +1121,7 @@ void Extractor::extract_java(TSNode node, const std::string& type, const std::st
     }
     else if (type == "method_invocation") {
         auto name = get_name_from_child(node, "name");
-        if (!name.empty()) add_ref("call", name, node, "call");
+        if (!name.empty()) add_call_ref(name, node, "call");
     }
     else if (type == "import_declaration") {
         add_ref("include", node_text(node), node, "import");
@@ -936,7 +1181,7 @@ void Extractor::extract_sql(TSNode node, const std::string& type, const std::str
     }
     else if (type == "function_call") {
         auto name = get_name_from_child(node, "name");
-        if (!name.empty()) add_ref("call", name, node, "call");
+        if (!name.empty()) add_call_ref(name, node, "call");
     }
 }
 

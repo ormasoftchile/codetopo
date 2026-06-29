@@ -12,8 +12,9 @@ namespace codetopo {
 // T011: Schema DDL creation and version check logic per data-model.md.
 // Schema version 1 = initial schema.
 // Schema version 5 = roots table + root_id on files (unified workspace).
-static constexpr int CURRENT_SCHEMA_VERSION = 5;
-static constexpr const char* INDEXER_VERSION = "1.1.0";
+// Schema version 6 = call-ref metadata for approximate callgraph narrowing.
+static constexpr int CURRENT_SCHEMA_VERSION = 6;
+static constexpr const char* INDEXER_VERSION = "1.2.0";
 
 namespace schema {
 
@@ -81,7 +82,10 @@ inline void create_tables(Connection& conn) {
             end_col INTEGER,
             resolved_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
             evidence TEXT,
-            containing_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL
+            containing_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            arg_count INTEGER,
+            arg_pattern TEXT,
+            receiver_type_hint TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id);
         CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name);
@@ -195,6 +199,40 @@ inline std::string get_kv(Connection& conn, const std::string& key, const std::s
     return result;
 }
 
+inline bool table_has_column(Connection& conn, const char* table, const char* column) {
+    sqlite3_stmt* probe = nullptr;
+    std::string sql = std::string("PRAGMA table_info(") + table + ")";
+    bool found = false;
+    sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &probe, nullptr);
+    while (sqlite3_step(probe) == SQLITE_ROW) {
+        const char* col = reinterpret_cast<const char*>(sqlite3_column_text(probe, 1));
+        if (col && std::string(col) == column) { found = true; break; }
+    }
+    sqlite3_finalize(probe);
+    return found;
+}
+
+inline bool table_exists(Connection& conn, const char* table) {
+    sqlite3_stmt* stmt = nullptr;
+    bool exists = false;
+    sqlite3_prepare_v2(conn.raw(),
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, table, -1, SQLITE_TRANSIENT);
+    exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+inline void ensure_refs_call_metadata_schema(Connection& conn) {
+    if (!table_exists(conn, "refs")) return;
+    if (!table_has_column(conn, "refs", "arg_count"))
+        conn.exec("ALTER TABLE refs ADD COLUMN arg_count INTEGER");
+    if (!table_has_column(conn, "refs", "arg_pattern"))
+        conn.exec("ALTER TABLE refs ADD COLUMN arg_pattern TEXT");
+    if (!table_has_column(conn, "refs", "receiver_type_hint"))
+        conn.exec("ALTER TABLE refs ADD COLUMN receiver_type_hint TEXT");
+}
+
 // Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
 inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
@@ -295,6 +333,13 @@ inline int ensure_schema(Connection& conn) {
         }
         conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
 
+        version = 5;
+    }
+
+    // v5→v6: add lightweight call-site metadata to refs.
+    // Additive migration — existing rows keep NULL metadata and are still usable.
+    if (version == 5) {
+        ensure_refs_call_metadata_schema(conn);
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         return 0;
     }
@@ -453,6 +498,7 @@ inline void ensure_roots_schema(Connection& conn) {
         conn.exec("ALTER TABLE files ADD COLUMN root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE");
     }
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
+    ensure_refs_call_metadata_schema(conn);
 }
 
 } // namespace schema

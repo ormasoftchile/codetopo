@@ -19,6 +19,20 @@ namespace codetopo {
 // ID re-keying constant: each root gets a 10^9 ID space.
 static constexpr int64_t ID_SPACE = 1000000000LL;
 
+static bool attached_table_has_column(sqlite3* db, const char* schema,
+                                      const char* table, const char* column) {
+    sqlite3_stmt* stmt = nullptr;
+    std::string sql = std::string("PRAGMA ") + schema + ".table_info(" + table + ")";
+    bool found = false;
+    sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* col = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        if (col && std::string(col) == column) { found = true; break; }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
 WorkspaceDB::WorkspaceDB(const std::string& main_db_path)
     : conn_(main_db_path) {
     ensure_schema();
@@ -340,15 +354,22 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     sqlite3_finalize(stmt);
 
     // 4. Refs — re-key file_id, resolved_node_id, containing_node_id
-    stmt = nullptr;
-    sqlite3_prepare_v2(conn_.raw(),
+    bool src_has_arg_count = attached_table_has_column(conn_.raw(), "src", "refs", "arg_count");
+    bool src_has_arg_pattern = attached_table_has_column(conn_.raw(), "src", "refs", "arg_pattern");
+    bool src_has_receiver_type = attached_table_has_column(conn_.raw(), "src", "refs", "receiver_type_hint");
+    std::string ref_sql =
         "INSERT INTO refs (id, file_id, kind, name, start_line, start_col, end_line, end_col, "
-        "resolved_node_id, evidence, containing_node_id) "
+        "resolved_node_id, evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint) "
         "SELECT (? + id), (? + file_id), kind, name, start_line, start_col, end_line, end_col, "
         "CASE WHEN resolved_node_id IS NOT NULL THEN (? + resolved_node_id) ELSE NULL END, "
         "evidence, "
-        "CASE WHEN containing_node_id IS NOT NULL THEN (? + containing_node_id) ELSE NULL END "
-        "FROM src.refs", -1, &stmt, nullptr);
+        "CASE WHEN containing_node_id IS NOT NULL THEN (? + containing_node_id) ELSE NULL END, " +
+        std::string(src_has_arg_count ? "arg_count" : "NULL") + ", " +
+        std::string(src_has_arg_pattern ? "arg_pattern" : "NULL") + ", " +
+        std::string(src_has_receiver_type ? "receiver_type_hint" : "NULL") +
+        " FROM src.refs";
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(), ref_sql.c_str(), -1, &stmt, nullptr);
     sqlite3_bind_int64(stmt, 1, offset);
     sqlite3_bind_int64(stmt, 2, offset);
     sqlite3_bind_int64(stmt, 3, offset);
