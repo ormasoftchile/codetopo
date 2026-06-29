@@ -148,6 +148,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_dec039_optimizations.cpp
     tests/unit/test_watchdog_timeout.cpp
     tests/unit/test_arena_lifetime.cpp
+    tests/unit/test_lean_listing.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests

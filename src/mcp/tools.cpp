@@ -44,6 +44,15 @@ static bool include_field(const std::unordered_set<std::string>& fields_set,
     return fields_set.empty() || fields_set.count(field);
 }
 
+static size_t cstr_len(const char* s) {
+    return s ? std::strlen(s) : 0;
+}
+
+static constexpr const char* kPublicSymbolSql =
+    "(n.visibility = 'public' OR "
+    "(n.visibility IS NULL AND (n.qualname IS NULL OR n.qualname = n.name) "
+    "AND n.kind IN ('class','struct','interface','type_alias','type','enum','function')))";
+
 static bool parse_symbol_fields(yyjson_val* params,
                                 std::unordered_set<std::string>& fields_set,
                                 bool& fields_provided,
@@ -61,7 +70,7 @@ static bool parse_symbol_fields(yyjson_val* params,
     }
 
     static const std::unordered_set<std::string> valid_fields = {
-        "node_id", "name", "qualname", "kind",
+        "node_id", "name", "qualname", "kind", "signature",
         "start_line", "end_line", "span", "file_path", "file"
     };
 
@@ -155,6 +164,91 @@ static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
     if (compact_include_file && file_path)
         yyjson_mut_obj_add_strcpy(doc.doc, item, compact_file_key, file_path);
     add_symbol_span_array(doc, item, start_line, end_line);
+}
+
+static void add_symbol_listing_result(JsonMutDoc& doc, yyjson_mut_val* item,
+                                      int64_t node_id, const char* kind,
+                                      const char* name, const char* qualname,
+                                      const char* file_path, int start_line,
+                                      int end_line, const char* signature,
+                                      bool include_handles, bool compact,
+                                      bool compact_include_file,
+                                      const char* compact_file_key,
+                                      const std::unordered_set<std::string>& fields_set,
+                                      bool fields_provided) {
+    if (fields_provided) {
+        if (fields_set.empty()) {
+            yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+            if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+            if (signature) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
+            if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
+            add_symbol_span_object(doc, item, start_line, end_line);
+            return;
+        }
+
+        if (include_field(fields_set, "node_id"))
+            yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
+        if (include_field(fields_set, "kind"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+        if (include_field(fields_set, "name"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+        if (qualname && include_field(fields_set, "qualname"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+        if (signature && include_field(fields_set, "signature"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
+        if (file_path && include_field(fields_set, "file_path"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
+        if (file_path && include_field(fields_set, "file"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", file_path);
+        if (include_field(fields_set, "start_line"))
+            yyjson_mut_obj_add_int(doc.doc, item, "start_line", start_line);
+        if (include_field(fields_set, "end_line"))
+            yyjson_mut_obj_add_int(doc.doc, item, "end_line", end_line);
+        if (include_field(fields_set, "span"))
+            add_symbol_span_array(doc, item, start_line, end_line);
+        return;
+    }
+
+    if (include_handles) {
+        add_symbol_result(doc, item, node_id, kind, name, qualname, file_path,
+                          start_line, end_line, compact, compact_include_file,
+                          compact_file_key, fields_set, false);
+        if (signature) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
+        return;
+    }
+
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+    if (signature) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
+    if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", file_path);
+    yyjson_mut_obj_add_int(doc.doc, item, "start_line", start_line);
+}
+
+static size_t estimate_symbol_listing_bytes(const char* kind, const char* name,
+                                            const char* qualname,
+                                            const char* file_path,
+                                            const char* signature,
+                                            bool include_handles,
+                                            bool fields_provided,
+                                            const std::unordered_set<std::string>& fields_set) {
+    size_t bytes = 48 + cstr_len(kind) + cstr_len(name);
+    bool include_file = !fields_provided || fields_set.empty()
+        || fields_set.count("file") || fields_set.count("file_path");
+    bool include_signature = signature && (!fields_provided || fields_set.empty()
+        || fields_set.count("signature"));
+    bool include_qualname = qualname && (include_handles || fields_set.count("qualname")
+        || (fields_provided && fields_set.empty()));
+
+    if (include_file) bytes += 16 + cstr_len(file_path);
+    if (include_signature) bytes += 16 + cstr_len(signature);
+    if (include_qualname) bytes += 16 + cstr_len(qualname);
+    if (include_handles || fields_set.count("node_id")) bytes += 24;
+    if (include_handles || fields_set.count("span")) bytes += 36;
+    if (fields_set.count("start_line")) bytes += 18;
+    if (fields_set.count("end_line")) bytes += 18;
+    return bytes;
 }
 
 // Resolve a node by node_id, or by symbol+file name lookup.
@@ -1109,9 +1203,11 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
     const char* name_glob = params ? json_get_str(params, "name_glob") : nullptr;
     bool compact = params ? json_get_bool(params, "compact", false) : false;
+    bool include_handles = params ? json_get_bool(params, "include_handles", false) : false;
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
 
     std::unordered_set<std::string> fields_set;
     bool fields_provided = false;
@@ -1121,19 +1217,42 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     }
 
     if (limit > 2000) limit = 2000;
+    if (limit < 1) limit = 1;
+    if (offset < 0) offset = 0;
+    if (max_bytes < 0) max_bytes = 0;
+    if (max_bytes > 100000) max_bytes = 100000;
 
-    std::string where_sql = " WHERE 1=1";
-    if (kind && strlen(kind) > 0) where_sql += " AND n.kind = ?";
-    if (file_path && strlen(file_path) > 0) where_sql += " AND f.path = ?";
-    if (name_glob && strlen(name_glob) > 0) where_sql += " AND n.name GLOB ?";
-    if (min_span_lines > 0) where_sql += " AND (n.end_line - n.start_line + 1) >= ?";
+    std::string base_where_sql = " WHERE 1=1";
+    if (file_path && strlen(file_path) > 0) base_where_sql += " AND f.path = ?";
+    if (name_glob && strlen(name_glob) > 0) base_where_sql += " AND n.name GLOB ?";
+
+    std::string semantic_sql = "1=1";
+    bool semantic_filters = false;
+    if (kind && strlen(kind) > 0) {
+        semantic_sql += " AND n.kind = ?";
+        semantic_filters = true;
+    }
+    if (min_span_lines > 0) {
+        semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
+        semantic_sql += kPublicSymbolSql;
+        semantic_sql += ")";
+        semantic_filters = true;
+    }
+
+    std::string where_sql = base_where_sql;
+    if (semantic_filters) where_sql += " AND " + semantic_sql;
 
     std::string sql =
-        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
         "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
+    std::string candidate_count_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql;
+    std::string hidden_public_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql
+        + " AND " + kPublicSymbolSql + " AND NOT (" + semantic_sql + ")";
 
     std::string cache_key = "symbol_list";
     if (kind && strlen(kind) > 0) cache_key += "_k";
@@ -1141,31 +1260,42 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     if (name_glob && strlen(name_glob) > 0) cache_key += "_g";
     if (min_span_lines > 0) cache_key += "_s";
 
+    auto bind_base = [&](sqlite3_stmt* s, int idx) {
+        if (file_path && strlen(file_path) > 0)
+            sqlite3_bind_text(s, idx++, file_path, -1, SQLITE_TRANSIENT);
+        if (name_glob && strlen(name_glob) > 0)
+            sqlite3_bind_text(s, idx++, name_glob, -1, SQLITE_TRANSIENT);
+        return idx;
+    };
+    auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
+        if (kind && strlen(kind) > 0)
+            sqlite3_bind_text(s, idx++, kind, -1, SQLITE_TRANSIENT);
+        if (min_span_lines > 0)
+            sqlite3_bind_int64(s, idx++, min_span_lines);
+        return idx;
+    };
+
     auto* stmt = cache.get(cache_key, sql);
     auto* count_stmt = cache.get(cache_key + "_count", count_sql);
-    int bind_idx = 1;
-    int count_bind_idx = 1;
-    if (kind && strlen(kind) > 0) {
-        sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
-    }
-    if (file_path && strlen(file_path) > 0) {
-        sqlite3_bind_text(stmt, bind_idx++, file_path, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, file_path, -1, SQLITE_TRANSIENT);
-    }
-    if (name_glob && strlen(name_glob) > 0) {
-        sqlite3_bind_text(stmt, bind_idx++, name_glob, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, name_glob, -1, SQLITE_TRANSIENT);
-    }
-    if (min_span_lines > 0) {
-        sqlite3_bind_int64(stmt, bind_idx++, min_span_lines);
-        sqlite3_bind_int64(count_stmt, count_bind_idx++, min_span_lines);
-    }
+    auto* candidate_count_stmt = cache.get(cache_key + "_candidate_count", candidate_count_sql);
+    int bind_idx = bind_semantic(stmt, bind_base(stmt, 1));
+    bind_semantic(count_stmt, bind_base(count_stmt, 1));
+    bind_base(candidate_count_stmt, 1);
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
     int64_t total = 0;
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+    int64_t total_candidates = total;
+    if (sqlite3_step(candidate_count_stmt) == SQLITE_ROW)
+        total_candidates = sqlite3_column_int64(candidate_count_stmt, 0);
+    int64_t hidden_public_count = 0;
+    if (semantic_filters) {
+        auto* hidden_public_stmt = cache.get(cache_key + "_hidden_public_count", hidden_public_sql);
+        bind_semantic(hidden_public_stmt, bind_base(hidden_public_stmt, 1));
+        if (sqlite3_step(hidden_public_stmt) == SQLITE_ROW)
+            hidden_public_count = sqlite3_column_int64(hidden_public_stmt, 0);
+    }
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -1174,25 +1304,56 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
 
     int count = 0;
     bool has_more = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
-        if (count == limit) { has_more = true; break; }
-        count++;
+    bool budget_exceeded = false;
+    size_t approx_bytes = 384;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= limit) { has_more = true; break; }
+
+        auto* qn_txt = sqlite3_column_text(stmt, 3);
+        auto* fp_txt = sqlite3_column_text(stmt, 4);
+        auto* sig_txt = sqlite3_column_text(stmt, 7);
+        const char* row_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        const char* row_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        const char* row_qn = qn_txt ? reinterpret_cast<const char*>(qn_txt) : nullptr;
+        const char* row_file = fp_txt ? reinterpret_cast<const char*>(fp_txt) : nullptr;
+        const char* row_sig = sig_txt ? reinterpret_cast<const char*>(sig_txt) : nullptr;
+        size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
+            row_sig, include_handles, fields_provided, fields_set);
+        if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
+            has_more = true;
+            budget_exceeded = true;
+            break;
+        }
 
         auto* item = doc.new_obj();
-        add_symbol_result(doc, item,
-            sqlite3_column_int64(stmt, 0),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)),
-            sqlite3_column_int(stmt, 5),
-            sqlite3_column_int(stmt, 6),
-            compact, true, "file", fields_set, fields_provided);
+        add_symbol_listing_result(doc, item,
+            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_file,
+            sqlite3_column_int(stmt, 5), sqlite3_column_int(stmt, 6), row_sig,
+            include_handles, compact, true, "file", fields_set, fields_provided);
 
         yyjson_mut_arr_append(results, item);
+        count++;
+        approx_bytes += item_bytes + 1;
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
+    yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
+    yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
+    if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
+    if (min_span_lines > 0 || hidden_public_count > 0) {
+        auto* warnings = doc.new_arr();
+        if (min_span_lines > 0)
+            yyjson_mut_arr_add_str(doc.doc, warnings,
+                "min_span_lines is lossy; public/API-like symbols bypass span pruning");
+        if (hidden_public_count > 0)
+            yyjson_mut_arr_add_str(doc.doc, warnings,
+                "kind filters hide public/API-like symbols; inspect total_candidates/hidden_public_count");
+        yyjson_mut_obj_add_val(doc.doc, root, "warnings", warnings);
+    }
     return doc.to_string();
 }
 
@@ -1204,10 +1365,16 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
     bool recursive = params ? json_get_bool(params, "recursive", true) : true;
     bool compact = params ? json_get_bool(params, "compact", true) : true;
+    bool include_handles = params ? json_get_bool(params, "include_handles", false) : false;
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
+    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
     if (limit > 2000) limit = 2000;
+    if (limit < 1) limit = 1;
+    if (offset < 0) offset = 0;
+    if (max_bytes < 0) max_bytes = 0;
+    if (max_bytes > 100000) max_bytes = 100000;
 
     std::unordered_set<std::string> fields_set;
     bool fields_provided = false;
@@ -1243,40 +1410,56 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         return McpError::not_found(std::string("Path not found: ") + path).to_json_rpc(0);
     }
 
-    std::string where_sql = " WHERE 1=1";
+    std::string base_where_sql = " WHERE 1=1";
     std::vector<std::string> path_binds;
     if (!resolved_file.empty()) {
-        where_sql += " AND f.path = ?";
+        base_where_sql += " AND f.path = ?";
         path_binds.push_back(resolved_file);
     } else if (!all_paths) {
         std::string dir = resolved_dir;
         if (!dir.empty() && dir.back() != '/') dir += '/';
         if (recursive) {
-            where_sql += " AND f.path GLOB ?";
+            base_where_sql += " AND f.path GLOB ?";
             path_binds.push_back(dir + "*");
         } else {
-            where_sql += " AND f.path GLOB ? AND f.path NOT GLOB ?";
+            base_where_sql += " AND f.path GLOB ? AND f.path NOT GLOB ?";
             path_binds.push_back(dir + "*");
             path_binds.push_back(dir + "*/*");
         }
     }
 
+    std::string semantic_sql = "1=1";
+    bool semantic_filters = false;
     if (!kinds.empty()) {
-        where_sql += " AND n.kind IN (";
+        semantic_sql += " AND n.kind IN (";
         for (size_t i = 0; i < kinds.size(); ++i) {
-            if (i) where_sql += ", ";
-            where_sql += "?";
+            if (i) semantic_sql += ", ";
+            semantic_sql += "?";
         }
-        where_sql += ")";
+        semantic_sql += ")";
+        semantic_filters = true;
     }
-    if (min_span_lines > 0) where_sql += " AND (n.end_line - n.start_line + 1) >= ?";
+    if (min_span_lines > 0) {
+        semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
+        semantic_sql += kPublicSymbolSql;
+        semantic_sql += ")";
+        semantic_filters = true;
+    }
+
+    std::string where_sql = base_where_sql;
+    if (semantic_filters) where_sql += " AND " + semantic_sql;
 
     std::string sql =
-        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
         "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
+    std::string candidate_count_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql;
+    std::string hidden_public_sql =
+        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql
+        + " AND " + kPublicSymbolSql + " AND NOT (" + semantic_sql + ")";
 
     std::string cache_key = "symbols_in_path";
     if (all_paths) cache_key += "_all";
@@ -1285,27 +1468,40 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     if (!kinds.empty()) cache_key += "_k" + std::to_string(kinds.size());
     if (min_span_lines > 0) cache_key += "_s";
 
+    auto bind_base = [&](sqlite3_stmt* s, int idx) {
+        for (const auto& bind : path_binds)
+            sqlite3_bind_text(s, idx++, bind.c_str(), -1, SQLITE_TRANSIENT);
+        return idx;
+    };
+    auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
+        for (const auto& k : kinds)
+            sqlite3_bind_text(s, idx++, k.c_str(), -1, SQLITE_TRANSIENT);
+        if (min_span_lines > 0)
+            sqlite3_bind_int64(s, idx++, min_span_lines);
+        return idx;
+    };
+
     auto* stmt = cache.get(cache_key, sql);
     auto* count_stmt = cache.get(cache_key + "_count", count_sql);
-    int bind_idx = 1;
-    int count_bind_idx = 1;
-    for (const auto& bind : path_binds) {
-        sqlite3_bind_text(stmt, bind_idx++, bind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, bind.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    for (const auto& kind : kinds) {
-        sqlite3_bind_text(stmt, bind_idx++, kind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, kind.c_str(), -1, SQLITE_TRANSIENT);
-    }
-    if (min_span_lines > 0) {
-        sqlite3_bind_int64(stmt, bind_idx++, min_span_lines);
-        sqlite3_bind_int64(count_stmt, count_bind_idx++, min_span_lines);
-    }
+    auto* candidate_count_stmt = cache.get(cache_key + "_candidate_count", candidate_count_sql);
+    int bind_idx = bind_semantic(stmt, bind_base(stmt, 1));
+    bind_semantic(count_stmt, bind_base(count_stmt, 1));
+    bind_base(candidate_count_stmt, 1);
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
     int64_t total = 0;
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+    int64_t total_candidates = total;
+    if (sqlite3_step(candidate_count_stmt) == SQLITE_ROW)
+        total_candidates = sqlite3_column_int64(candidate_count_stmt, 0);
+    int64_t hidden_public_count = 0;
+    if (semantic_filters) {
+        auto* hidden_public_stmt = cache.get(cache_key + "_hidden_public_count", hidden_public_sql);
+        bind_semantic(hidden_public_stmt, bind_base(hidden_public_stmt, 1));
+        if (sqlite3_step(hidden_public_stmt) == SQLITE_ROW)
+            hidden_public_count = sqlite3_column_int64(hidden_public_stmt, 0);
+    }
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -1316,24 +1512,55 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
     int count = 0;
     bool has_more = false;
-    while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
-        if (count == limit) { has_more = true; break; }
-        count++;
+    bool budget_exceeded = false;
+    size_t approx_bytes = 384 + std::strlen(path);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= limit) { has_more = true; break; }
+
+        auto* qn_txt = sqlite3_column_text(stmt, 3);
+        auto* fp_txt = sqlite3_column_text(stmt, 4);
+        auto* sig_txt = sqlite3_column_text(stmt, 7);
+        const char* row_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        const char* row_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        const char* row_qn = qn_txt ? reinterpret_cast<const char*>(qn_txt) : nullptr;
+        const char* row_file = fp_txt ? reinterpret_cast<const char*>(fp_txt) : nullptr;
+        const char* row_sig = sig_txt ? reinterpret_cast<const char*>(sig_txt) : nullptr;
+        size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
+            row_sig, include_handles, fields_provided, fields_set);
+        if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
+            has_more = true;
+            budget_exceeded = true;
+            break;
+        }
 
         auto* item = doc.new_obj();
-        add_symbol_result(doc, item,
-            sqlite3_column_int64(stmt, 0),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)),
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4)),
-            sqlite3_column_int(stmt, 5),
-            sqlite3_column_int(stmt, 6),
-            compact, false, "file_path", fields_set, fields_provided);
+        add_symbol_listing_result(doc, item,
+            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_file,
+            sqlite3_column_int(stmt, 5), sqlite3_column_int(stmt, 6), row_sig,
+            include_handles, compact, false, "file_path", fields_set, fields_provided);
         yyjson_mut_arr_append(results, item);
+        count++;
+        approx_bytes += item_bytes + 1;
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
+    yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
+    yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
+    if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
+    if (min_span_lines > 0 || hidden_public_count > 0) {
+        auto* warnings = doc.new_arr();
+        if (min_span_lines > 0)
+            yyjson_mut_arr_add_str(doc.doc, warnings,
+                "min_span_lines is lossy; public/API-like symbols bypass span pruning");
+        if (hidden_public_count > 0)
+            yyjson_mut_arr_add_str(doc.doc, warnings,
+                "kind filters hide public/API-like symbols; inspect total_candidates/hidden_public_count");
+        yyjson_mut_obj_add_val(doc.doc, root, "warnings", warnings);
+    }
     return doc.to_string();
 }
 
@@ -3383,8 +3610,10 @@ std::string source_at(yyjson_val* params, Connection& conn,
         if (!std::filesystem::path(path).is_absolute()) {
             auto validated = path_util::validate_mcp_path(path, repo_root);
             if (validated.empty()) return McpError::invalid_input("Invalid path: rejected by traversal guard").to_json_rpc(0);
+            resolved_path = validated;
+        } else {
+            return McpError::not_found(std::string("File not found: ") + path).to_json_rpc(0);
         }
-        return McpError::not_found(std::string("File not found: ") + path).to_json_rpc(0);
     }
 
     auto source = read_source_snippet(repo_root, resolved_path, static_cast<int>(start_line), static_cast<int>(end_line));
@@ -3422,9 +3651,13 @@ std::string code_search(yyjson_val* params, Connection& conn,
     if (limit > 100) limit = 100;
     if (limit < 1) limit = 1;
 
-    int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 1)) : 1;
+    int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 0)) : 0;
     if (context_lines > 5) context_lines = 5;
     if (context_lines < 0) context_lines = 0;
+
+    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
+    if (max_bytes < 0) max_bytes = 0;
+    if (max_bytes > 100000) max_bytes = 100000;
 
     bool case_sensitive = params ? json_get_bool(params, "case_sensitive", false) : false;
 
@@ -3495,8 +3728,12 @@ std::string code_search(yyjson_val* params, Connection& conn,
     doc.set_root(root);
     auto* results_arr = doc.new_arr();
     int total_matches = 0;
+    int files_returned = 0;
+    bool budget_exceeded = false;
+    size_t approx_bytes = 384;
 
     for (auto& fh : file_hits) {
+        if (budget_exceeded) break;
         auto fh_path = std::filesystem::path(fh.path);
         auto full_path = fh_path.is_absolute() ? fh_path : std::filesystem::path(repo_root) / fh.path;
         std::ifstream f(full_path);
@@ -3566,14 +3803,9 @@ std::string code_search(yyjson_val* params, Connection& conn,
         int shown = 0;
         for (const auto& lm : verified) {
             if (shown >= max_per_file) break;
-            shown++;
 
-            auto* match_obj = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, match_obj, "line", lm.line_num);
-            yyjson_mut_obj_add_strcpy(doc.doc, match_obj, "text", lm.line_text.c_str());
-
+            std::string ctx;
             if (context_lines > 0) {
-                std::string ctx;
                 int ctx_start = std::max(1, lm.line_num - context_lines);
                 int ctx_end = lm.line_num + context_lines;
                 for (int i = ctx_start; i <= ctx_end; i++) {
@@ -3582,23 +3814,46 @@ std::string code_search(yyjson_val* params, Connection& conn,
                     if (!ctx.empty()) ctx += "\n";
                     ctx += std::to_string(i) + ": " + it->second;
                 }
+            }
+
+            size_t match_bytes = 48 + lm.line_text.size() + ctx.size();
+            if (max_bytes > 0 && (files_returned > 0 || shown > 0) &&
+                approx_bytes + match_bytes > static_cast<size_t>(max_bytes)) {
+                budget_exceeded = true;
+                break;
+            }
+
+            shown++;
+            approx_bytes += match_bytes + 1;
+
+            auto* match_obj = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, match_obj, "line", lm.line_num);
+            if (context_lines > 0) {
                 yyjson_mut_obj_add_strcpy(doc.doc, match_obj, "context", ctx.c_str());
+            } else {
+                yyjson_mut_obj_add_strcpy(doc.doc, match_obj, "text", lm.line_text.c_str());
             }
 
             yyjson_mut_arr_append(matches_arr, match_obj);
         }
 
+        if (shown == 0 && budget_exceeded) break;
         yyjson_mut_obj_add_val(doc.doc, file_obj, "matches", matches_arr);
-        if (static_cast<int>(verified.size()) > max_per_file) {
+        if (static_cast<int>(verified.size()) > max_per_file || budget_exceeded) {
             yyjson_mut_obj_add_bool(doc.doc, file_obj, "truncated", true);
         }
         yyjson_mut_arr_append(results_arr, file_obj);
+        files_returned++;
+        approx_bytes += 48 + fh.path.size();
         total_matches += static_cast<int>(verified.size());
     }
 
     yyjson_mut_obj_add_val(doc.doc, root, "results", results_arr);
     yyjson_mut_obj_add_int(doc.doc, root, "total_files", static_cast<int>(file_hits.size()));
+    yyjson_mut_obj_add_int(doc.doc, root, "files_returned", files_returned);
     yyjson_mut_obj_add_int(doc.doc, root, "total_matches", total_matches);
+    yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
+    if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "truncated", true);
 
     return doc.to_string();
 }
