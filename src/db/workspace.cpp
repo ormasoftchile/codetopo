@@ -793,8 +793,11 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
     const bool color_output = stderr_is_tty();
     std::unordered_map<std::string, std::vector<WorkspaceCandidateRow>> candidates_by_name;
     candidates_by_name.reserve(65536);
+    std::unordered_map<std::string, std::vector<WorkspaceCandidateRow>> new_root_candidates_by_name;
+    new_root_candidates_by_name.reserve(32768);
 
     auto process_batch = [&](const std::vector<WorkspaceUnresolvedRef>& refs,
+                             const std::unordered_map<std::string, std::vector<WorkspaceCandidateRow>>& candidate_map,
                              sqlite3_stmt* insert_edge_stmt,
                              sqlite3_stmt* update_ref_stmt,
                              int64_t& resolved_refs,
@@ -809,8 +812,8 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
 
             WorkspaceCandidate best;
             auto consider_candidates = [&](const std::string& name) {
-                auto it = candidates_by_name.find(name);
-                if (it == candidates_by_name.end()) {
+                auto it = candidate_map.find(name);
+                if (it == candidate_map.end()) {
                     return;
                 }
                 for (const auto& row : it->second) {
@@ -866,6 +869,8 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
 
     sqlite3_stmt* select_refs_stmt = nullptr;
     sqlite3_stmt* preload_candidates_stmt = nullptr;
+    sqlite3_stmt* preload_new_root_candidates_stmt = nullptr;
+    sqlite3_stmt* select_reverse_refs_stmt = nullptr;
     sqlite3_stmt* insert_edge_stmt = nullptr;
     sqlite3_stmt* update_ref_stmt = nullptr;
 
@@ -902,6 +907,39 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
         }
         mcp_log("cross-root candidate index: " + std::to_string(candidate_rows) +
                 " symbols across " + std::to_string(candidates_by_name.size()) + " names");
+
+        prepare_or_throw(conn_.raw(), &preload_new_root_candidates_stmt,
+            "SELECT n.name, n.id, f.language, n.is_definition, COALESCE(n.qualname, '') "
+            "FROM nodes n "
+            "JOIN files f ON n.file_id = f.id "
+            "WHERE n.node_type = 'symbol' "
+            "  AND n.kind IN ('function', 'method', 'constructor_fn') "
+            "  AND COALESCE(f.root_id, 0) = ?1 "
+            "ORDER BY n.name, n.is_definition DESC, n.id");
+        sqlite3_bind_int64(preload_new_root_candidates_stmt, 1, added_root_id);
+
+        rc = SQLITE_OK;
+        int64_t new_root_candidate_rows = 0;
+        while ((rc = sqlite3_step(preload_new_root_candidates_stmt)) == SQLITE_ROW) {
+            const auto* name_text = sqlite3_column_text(preload_new_root_candidates_stmt, 0);
+            if (!name_text) {
+                continue;
+            }
+            WorkspaceCandidateRow row;
+            row.node_id = sqlite3_column_int64(preload_new_root_candidates_stmt, 1);
+            const auto* language_text = sqlite3_column_text(preload_new_root_candidates_stmt, 2);
+            row.language = language_text ? reinterpret_cast<const char*>(language_text) : "";
+            row.is_definition = sqlite3_column_int(preload_new_root_candidates_stmt, 3) != 0;
+            const auto* qualname_text = sqlite3_column_text(preload_new_root_candidates_stmt, 4);
+            row.qualname = qualname_text ? reinterpret_cast<const char*>(qualname_text) : "";
+            new_root_candidates_by_name[reinterpret_cast<const char*>(name_text)].push_back(std::move(row));
+            ++new_root_candidate_rows;
+        }
+        if (rc != SQLITE_DONE) {
+            throw std::runtime_error(sqlite_error(conn_.raw(), "Preload workspace new-root ref candidates failed"));
+        }
+        mcp_log("cross-root new-root index: " + std::to_string(new_root_candidate_rows) +
+                " symbols across " + std::to_string(new_root_candidates_by_name.size()) + " names");
 
         prepare_or_throw(conn_.raw(), &select_refs_stmt,
             "SELECT r.id AS ref_id, "
@@ -955,7 +993,7 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
             }
 
             if (batch.size() >= kWorkspaceResolveBatchSize) {
-                process_batch(batch, insert_edge_stmt, update_ref_stmt,
+                process_batch(batch, candidates_by_name, insert_edge_stmt, update_ref_stmt,
                               resolved_refs, edges_created);
                 batch.clear();
             }
@@ -964,23 +1002,88 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
             throw std::runtime_error(sqlite_error(conn_.raw(), "Collect workspace unresolved refs failed"));
         }
         if (!batch.empty()) {
-            process_batch(batch, insert_edge_stmt, update_ref_stmt,
+            process_batch(batch, candidates_by_name, insert_edge_stmt, update_ref_stmt,
                           resolved_refs, edges_created);
         }
 
         mcp_log("cross-root forward pass: " + std::to_string(processed_refs) +
                 " unresolved call refs scanned from added root");
-        mcp_log("cross-root resolution: " + std::to_string(resolved_refs) +
-                " refs resolved, " + std::to_string(edges_created) + " edges created");
+
+        int64_t processed_reverse = 0;
+        int64_t reverse_resolved_refs = 0;
+        int64_t reverse_edges_created = 0;
+        if (!new_root_candidates_by_name.empty()) {
+            prepare_or_throw(conn_.raw(), &select_reverse_refs_stmt,
+                "SELECT r.id, r.name, r.containing_node_id, "
+                "       COALESCE(cf.root_id, 0), cf.language, "
+                "       COALESCE(r.receiver_type_hint, '') "
+                "FROM refs r "
+                "JOIN files cf ON cf.id = r.file_id "
+                "WHERE r.kind = 'call' "
+                "  AND r.resolved_node_id IS NULL "
+                "  AND r.containing_node_id IS NOT NULL "
+                "  AND COALESCE(cf.root_id, 0) != ?1 "
+                "ORDER BY r.id");
+            sqlite3_bind_int64(select_reverse_refs_stmt, 1, added_root_id);
+
+            batch.clear();
+            int reverse_select_rc = SQLITE_OK;
+            while ((reverse_select_rc = sqlite3_step(select_reverse_refs_stmt)) == SQLITE_ROW) {
+                WorkspaceUnresolvedRef ref;
+                ref.ref_id = sqlite3_column_int64(select_reverse_refs_stmt, 0);
+                ref.containing_node_id = sqlite3_column_int64(select_reverse_refs_stmt, 2);
+                ref.caller_root = sqlite3_column_int64(select_reverse_refs_stmt, 3);
+
+                const auto* name_text = sqlite3_column_text(select_reverse_refs_stmt, 1);
+                const auto* language_text = sqlite3_column_text(select_reverse_refs_stmt, 4);
+                const auto* hint_text = sqlite3_column_text(select_reverse_refs_stmt, 5);
+                ref.ref_name = name_text ? reinterpret_cast<const char*>(name_text) : "";
+                ref.caller_language = language_text ? reinterpret_cast<const char*>(language_text) : "";
+                ref.receiver_type_hint = hint_text ? reinterpret_cast<const char*>(hint_text) : "";
+
+                batch.push_back(std::move(ref));
+                ++processed_reverse;
+                if (processed_reverse % 50000 == 0) {
+                    std::cerr << "  [cross-root reverse] "
+                              << format_with_commas(processed_reverse)
+                              << " refs processed...\n" << std::flush;
+                }
+
+                if (batch.size() >= kWorkspaceResolveBatchSize) {
+                    process_batch(batch, new_root_candidates_by_name, insert_edge_stmt, update_ref_stmt,
+                                  reverse_resolved_refs, reverse_edges_created);
+                    batch.clear();
+                }
+            }
+            if (reverse_select_rc != SQLITE_DONE && reverse_select_rc != SQLITE_ROW) {
+                throw std::runtime_error(sqlite_error(conn_.raw(), "Collect reverse workspace unresolved refs failed"));
+            }
+            if (!batch.empty()) {
+                process_batch(batch, new_root_candidates_by_name, insert_edge_stmt, update_ref_stmt,
+                              reverse_resolved_refs, reverse_edges_created);
+                batch.clear();
+            }
+        }
+
+        mcp_log("cross-root reverse pass: " + std::to_string(processed_reverse) +
+                " refs scanned from other roots");
+        mcp_log("cross-root resolution: " + std::to_string(resolved_refs) + "+" +
+                std::to_string(reverse_resolved_refs) + " refs resolved, " +
+                std::to_string(edges_created) + "+" + std::to_string(reverse_edges_created) +
+                " edges created");
 
         sqlite3_finalize(update_ref_stmt);
         sqlite3_finalize(insert_edge_stmt);
+        sqlite3_finalize(select_reverse_refs_stmt);
+        sqlite3_finalize(preload_new_root_candidates_stmt);
         sqlite3_finalize(preload_candidates_stmt);
         sqlite3_finalize(select_refs_stmt);
-        return {resolved_refs, edges_created};
+        return {resolved_refs + reverse_resolved_refs, edges_created + reverse_edges_created};
     } catch (...) {
         if (update_ref_stmt) sqlite3_finalize(update_ref_stmt);
         if (insert_edge_stmt) sqlite3_finalize(insert_edge_stmt);
+        if (select_reverse_refs_stmt) sqlite3_finalize(select_reverse_refs_stmt);
+        if (preload_new_root_candidates_stmt) sqlite3_finalize(preload_new_root_candidates_stmt);
         if (preload_candidates_stmt) sqlite3_finalize(preload_candidates_stmt);
         if (select_refs_stmt) sqlite3_finalize(select_refs_stmt);
         throw;
