@@ -121,12 +121,15 @@ int main(int argc, char** argv) {
     std::string mcp_freshness = "normal";
     int mcp_debounce = 1000;
     bool mcp_watch = false;
+    std::string mcp_trajectory_log;
     sub_mcp->add_option("--freshness", mcp_freshness,
         "Index freshness policy: eager|normal|lazy|off")->default_val("normal");
     sub_mcp->add_option("--debounce", mcp_debounce,
         "Watcher debounce in ms")->default_val(1000);
     sub_mcp->add_flag("--watch", mcp_watch,
         "Enable filesystem watcher for auto-reindex");
+    sub_mcp->add_option("--log-trajectory", mcp_trajectory_log,
+        "Append each tool call + result as JSONL to this file (for benchmarking)");
 
     // --- watch subcommand ---
     auto* sub_watch = app.add_subcommand("watch", "Watch for file changes and re-index");
@@ -300,7 +303,7 @@ int main(int argc, char** argv) {
         try {
             return codetopo::run_mcp(mcp_db, mcp_root, mcp_tool_timeout,
                                      mcp_idle_timeout, freshness, mcp_debounce,
-                                     mcp_watch);
+                                     mcp_watch, mcp_trajectory_log);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
