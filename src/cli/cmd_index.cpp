@@ -353,7 +353,7 @@ int run_index(const Config& config) {
         large_pool = std::make_unique<ArenaPool>(large_arena_count, config.large_arena_size_bytes());
     }
 
-    std::atomic<int> errors{0};
+    std::atomic<int> file_errors{0};
     int total = static_cast<int>(work_list.size());
     int display_offset = config.progress_offset;
     int display_total = config.progress_total > 0 ? config.progress_total : total;
@@ -774,10 +774,6 @@ int run_index(const Config& config) {
             
             auto& result = item.parsed;
             
-            if (result.has_error) {
-                persist_state.persist_errors.fetch_add(1, std::memory_order_relaxed);
-            }
-            
             {
                 ScopedPhase _ps(profiler.persist);
                 if (!persister.persist_file(result.file, result.extraction,
@@ -895,7 +891,7 @@ int run_index(const Config& config) {
         auto& result = item.parsed;
 
         if (result.has_error) {
-            errors.fetch_add(1, std::memory_order_relaxed);
+            file_errors.fetch_add(1, std::memory_order_relaxed);
         }
 
         // DEC-038 OPT-3: Push to persist queue (may block if queue is full)
@@ -934,9 +930,7 @@ int run_index(const Config& config) {
     persist_queue.close();
     if (persist_thread.joinable()) persist_thread.join();
 
-    // Accumulate persist thread errors
-    errors.fetch_add(persist_state.persist_errors.load(std::memory_order_relaxed), 
-                     std::memory_order_relaxed);
+    int persist_errors = persist_state.persist_errors.load(std::memory_order_relaxed);
 
     // Stop watchdog thread
     watchdog_stop.store(true, std::memory_order_relaxed);
@@ -948,7 +942,8 @@ int run_index(const Config& config) {
 
     std::cerr << "Done: " << total << " files in " << elapsed_s << "s"
               << " (" << static_cast<int>(rate) << " files/s)";
-    if (errors > 0) std::cerr << " [" << errors << " errors]";
+    if (file_errors > 0) std::cerr << " [" << file_errors << " file errors]";
+    if (persist_errors > 0) std::cerr << " [" << persist_errors << " persist errors]";
     std::cerr << "\n";
 
     // Checkpoint WAL to main DB before read-heavy post-processing
@@ -1056,7 +1051,7 @@ int run_index(const Config& config) {
     auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(total_elapsed).count();
     profiler.print_report(total_us, total, thread_count);
 
-    return errors > 0 ? 1 : 0;
+    return persist_errors > 0 ? 1 : 0;
 }
 
 } // namespace codetopo
