@@ -38,7 +38,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 
-project(codetopo VERSION 1.4.0 LANGUAGES C CXX)
+project(codetopo VERSION 1.5.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -150,6 +150,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_arena_lifetime.cpp
     tests/unit/test_lean_listing.cpp
     tests/unit/test_approx_callgraph.cpp
+    tests/unit/test_workspace_merge.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
