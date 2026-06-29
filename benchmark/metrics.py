@@ -33,10 +33,10 @@ class ToolCall:
 class ToolMetrics:
     tool_call_count: int
     tool_counts: dict[str, int]
-    structural_ratio: float | None
+    structural_ratio: float
     source_lines_read: int
-    reread_rate: float | None
-    node_reuse_rate: float | None
+    reread_rate: float
+    node_reuse_rate: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -81,9 +81,9 @@ def compute_tool_metrics(tool_calls: list[ToolCall]) -> ToolMetrics:
 
         prior_node_ids.update(_collect_node_ids(tool_call.result))
 
-    structural_ratio = (structural_calls / classified_calls) if classified_calls else None
-    reread_rate = (reread_count / source_call_count) if source_call_count else None
-    node_reuse_rate = (reused_node_calls / reuse_denominator) if reuse_denominator else None
+    structural_ratio = (structural_calls / classified_calls) if classified_calls else 0.0
+    reread_rate = (reread_count / source_call_count) if source_call_count else 0.0
+    node_reuse_rate = (reused_node_calls / reuse_denominator) if reuse_denominator else 0.0
 
     return ToolMetrics(
         tool_call_count=len(tool_calls),
