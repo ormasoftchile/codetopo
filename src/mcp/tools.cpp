@@ -1753,6 +1753,47 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
     yyjson_mut_obj_add_strcpy(doc.doc, root, "last_index_time", last_index.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "indexer_version", idx_version.c_str());
 
+    // Per-root breakdown (workspace roots)
+    auto* roots_arr = doc.new_arr();
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT r.id, r.path, "
+            "  (SELECT COUNT(*) FROM files f WHERE f.root_id = r.id) AS file_count, "
+            "  (SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = r.id) AS symbol_count, "
+            "  (SELECT COUNT(*) FROM edges e "
+            "     JOIN nodes ns ON e.src_id = ns.id "
+            "     JOIN files f ON ns.file_id = f.id "
+            "     WHERE f.root_id = r.id) AS edge_count "
+            "FROM roots r "
+            "UNION ALL "
+            "SELECT 0, '(main)', "
+            "  (SELECT COUNT(*) FROM files WHERE root_id = 0), "
+            "  (SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = 0), "
+            "  (SELECT COUNT(*) FROM edges e JOIN nodes ns ON e.src_id = ns.id JOIN files f ON ns.file_id = f.id WHERE f.root_id = 0) "
+            "WHERE EXISTS (SELECT 1 FROM files WHERE root_id = 0) "
+            "ORDER BY 1";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                auto* entry = doc.new_obj();
+                int64_t rid = sqlite3_column_int64(stmt, 0);
+                auto* p = sqlite3_column_text(stmt, 1);
+                int64_t fc = sqlite3_column_int64(stmt, 2);
+                int64_t sc = sqlite3_column_int64(stmt, 3);
+                int64_t ec = sqlite3_column_int64(stmt, 4);
+                yyjson_mut_obj_add_int(doc.doc, entry, "root_id", rid);
+                yyjson_mut_obj_add_strcpy(doc.doc, entry, "path",
+                    p ? reinterpret_cast<const char*>(p) : "");
+                yyjson_mut_obj_add_int(doc.doc, entry, "files", fc);
+                yyjson_mut_obj_add_int(doc.doc, entry, "symbols", sc);
+                yyjson_mut_obj_add_int(doc.doc, entry, "edges", ec);
+                yyjson_mut_arr_append(roots_arr, entry);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "roots", roots_arr);
+
     return doc.to_string();
 }
 
@@ -2041,6 +2082,23 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     DirTreeNode tree_root;
     tree_root.name = root_name;
 
+    // For workspace mode (all_paths), collect root paths so absolute file paths
+    // can be relativized to their workspace root (e.g. /Volumes/Projects/kibana/src/foo.ts
+    // → kibana/src/foo.ts at depth 1). Without this, absolute paths decompose into
+    // ["Volumes","Projects","kibana",...] and depth=1 shows only "Volumes/".
+    std::vector<std::string> workspace_roots; // sorted longest-first for prefix matching
+    if (all_paths) {
+        sqlite3_stmt* roots_stmt = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(),
+            "SELECT path FROM roots ORDER BY LENGTH(path) DESC", -1, &roots_stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(roots_stmt) == SQLITE_ROW) {
+                auto* p = sqlite3_column_text(roots_stmt, 0);
+                if (p) workspace_roots.emplace_back(reinterpret_cast<const char*>(p));
+            }
+            sqlite3_finalize(roots_stmt);
+        }
+    }
+
     std::string relative_prefix;
     if (!all_paths) {
         relative_prefix = resolved_dir;
@@ -2052,7 +2110,30 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
         const char* language = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         if (!file_path || !language) continue;
 
-        std::string relative_path = all_paths ? std::string(file_path) : std::string(file_path).substr(relative_prefix.size());
+        std::string relative_path;
+        if (all_paths) {
+            std::string fp(file_path);
+            if (fp[0] == '/') {
+                // Try to relativize against a workspace root
+                bool matched = false;
+                for (const auto& wr : workspace_roots) {
+                    std::string prefix = wr;
+                    if (!prefix.empty() && prefix.back() != '/') prefix += '/';
+                    if (fp.size() > prefix.size() && fp.substr(0, prefix.size()) == prefix) {
+                        // Use root basename + rest of path
+                        auto root_base = std::filesystem::path(wr).filename().string();
+                        relative_path = root_base + "/" + fp.substr(prefix.size());
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) relative_path = fp; // main root file, use as-is
+            } else {
+                relative_path = fp;
+            }
+        } else {
+            relative_path = std::string(file_path).substr(relative_prefix.size());
+        }
         auto parts = split_path_components(relative_path);
         if (parts.empty()) continue;
 
@@ -2106,6 +2187,7 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
 
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
+    const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     bool include_source = params ? json_get_bool(params, "include_source", false) : false;
@@ -2318,6 +2400,12 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     bool has_more = false;
     while (sqlite3_step(stmt) == SQLITE_ROW && count <= limit) {
         if (count == limit) { has_more = true; break; }
+
+        auto* fp = sqlite3_column_text(stmt, 4);
+        // Apply file_pattern post-filter if provided
+        if (file_pattern && strlen(file_pattern) > 0 && fp) {
+            if (sqlite3_strglob(file_pattern, reinterpret_cast<const char*>(fp)) != 0) continue;
+        }
         count++;
 
         auto* item = doc.new_obj();
@@ -2328,7 +2416,6 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
             reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
         auto* qn = sqlite3_column_text(stmt, 3);
         if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
-        auto* fp = sqlite3_column_text(stmt, 4);
         if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
 
         auto* span = doc.new_obj();
