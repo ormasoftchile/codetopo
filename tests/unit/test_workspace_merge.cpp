@@ -104,7 +104,7 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(offset + 1)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM refs WHERE id = " + std::to_string(offset + 1)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
-        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts WHERE content_fts MATCH 'uniqueContentNeedle'") >= 1);
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts WHERE content_fts MATCH 'uniqueContentNeedle'") == 0);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM kv WHERE key LIKE 'workspace_content_fts_pending:%'") == 0);
         REQUIRE(conn.foreign_key_check() == 0);
     }
@@ -117,7 +117,22 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
     {
         Connection conn(default_db(main_root));
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts_tracker") == 0);
+        REQUIRE(conn.foreign_key_check() == 0);
+    }
+
+    cfg.workspace_content_fts = true;
+    auto third = ws.add_root(src_root, cfg);
+    REQUIRE(third.root_id == result.root_id);
+    REQUIRE(third.files == 1);
+    REQUIRE(third.symbols == 1);
+    REQUIRE(third.edges == 2);
+    {
+        Connection conn(default_db(main_root));
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts WHERE content_fts MATCH 'uniqueContentNeedle'") >= 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts_tracker") == 1);
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM kv WHERE key LIKE 'workspace_content_fts_pending:%'") == 0);
         REQUIRE(conn.foreign_key_check() == 0);
     }
 

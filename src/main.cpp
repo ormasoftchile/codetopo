@@ -197,6 +197,7 @@ int main(int argc, char** argv) {
     int ws_max_file_size = 10240;
     int ws_parse_timeout = 5;
     bool ws_turbo = false;
+    bool ws_with_content_fts = false;
 
     ws_add->add_option("target", ws_add_target, "Path to add as workspace root")->required();
     auto* ws_add_root_pos_opt = ws_add->add_option("workspace-root", ws_add_root_pos,
@@ -207,6 +208,8 @@ int main(int argc, char** argv) {
     ws_add->add_option("--max-file-size", ws_max_file_size, "Max file size in KB")->default_val(10240);
     ws_add->add_option("--parse-timeout", ws_parse_timeout, "Per-file parse timeout in seconds")->default_val(5);
     ws_add->add_flag("--turbo", ws_turbo, "Aggressive perf mode");
+    ws_add->add_flag("--with-content-fts", ws_with_content_fts,
+        "Opt in to line-level content FTS for this added root (default: off)");
 
     auto* ws_remove = sub_workspace->add_subcommand("remove", "Remove a root from the workspace");
     std::string ws_remove_target;
@@ -361,6 +364,7 @@ int main(int argc, char** argv) {
                 cfg.max_file_size_kb = ws_max_file_size;
                 cfg.parse_timeout_s = ws_parse_timeout;
                 cfg.turbo = ws_turbo;
+                cfg.workspace_content_fts = ws_with_content_fts;
                 return codetopo::run_workspace_add(ws_root, ws_add_target, cfg);
             }
             if (ws_remove->parsed()) {

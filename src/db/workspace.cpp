@@ -14,6 +14,9 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 namespace codetopo {
 
@@ -23,6 +26,22 @@ static constexpr int64_t ID_SPACE = 1000000000LL;
 namespace {
 
 static constexpr int kContentFtsBatchFiles = 1000;
+
+using WorkspaceClock = std::chrono::steady_clock;
+
+std::string format_seconds(WorkspaceClock::time_point start) {
+    double seconds = std::chrono::duration<double>(WorkspaceClock::now() - start).count();
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3) << seconds;
+    return oss.str();
+}
+
+void log_workspace_phase(const std::string& phase, WorkspaceClock::time_point start,
+                         const std::string& suffix = {}) {
+    std::cerr << "[workspace] " << phase << " in " << format_seconds(start) << "s";
+    if (!suffix.empty()) std::cerr << " " << suffix;
+    std::cerr << "\n";
+}
 
 std::string sqlite_error(sqlite3* db, const std::string& context) {
     return context + ": " + sqlite3_errmsg(db);
@@ -70,7 +89,7 @@ public:
           temp_store_(pragma_text(conn, "temp_store")),
           cache_size_(pragma_text(conn, "cache_size")),
           mmap_size_(pragma_text(conn, "mmap_size")) {
-        if (unsafe_sync_off) conn_.exec("PRAGMA synchronous=OFF");
+        conn_.exec(unsafe_sync_off ? "PRAGMA synchronous=OFF" : "PRAGMA synchronous=NORMAL");
         conn_.exec("PRAGMA wal_autocheckpoint=0");
         conn_.exec("PRAGMA temp_store=MEMORY");
         conn_.exec("PRAGMA cache_size=-524288");
@@ -287,15 +306,23 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
         // Maintaining secondary indexes per copied row is expensive for large roots.
         // Drop/rebuild them inside this transaction so crash rollback restores them.
+        auto index_phase = WorkspaceClock::now();
         schema::drop_bulk_indexes(conn_);
+        log_workspace_phase("indexes dropped", index_phase);
 
         // Merge from the already-attached src DB
         merge_root_attached(root_id, abs_root);
 
+        index_phase = WorkspaceClock::now();
         schema::rebuild_indexes(conn_);
+        log_workspace_phase("indexes rebuilt", index_phase);
         fts::create_sync_triggers(conn_);
-        schema::set_kv(conn_, "workspace_content_fts_pending:" + std::to_string(root_id),
-                       std::to_string(root_id));
+        auto content_pending_key = "workspace_content_fts_pending:" + std::to_string(root_id);
+        if (cfg.workspace_content_fts) {
+            schema::set_kv(conn_, content_pending_key, std::to_string(root_id));
+        } else {
+            conn_.exec("DELETE FROM kv WHERE key = " + sql_quote(content_pending_key));
+        }
 
         int fk_violations = conn_.foreign_key_check();
         if (fk_violations != 0) {
@@ -317,8 +344,13 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     // Content FTS is intentionally populated after the structural merge in
     // bounded transactions. This keeps node/file/ref/edge merge atomic while
     // preventing line-level trigram indexing from creating a multi-GB WAL.
-    populate_content_fts_for_root(root_id);
-    conn_.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    if (cfg.workspace_content_fts) {
+        populate_content_fts_for_root(root_id);
+        conn_.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } else {
+        auto content_phase = WorkspaceClock::now();
+        log_workspace_phase("content_fts", content_phase, "(disabled; 0 files)");
+    }
 
     // Query stats
     AddResult result;
@@ -501,6 +533,7 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     int64_t offset = root_id * ID_SPACE;
 
     // 1. Files — map id → offset+id, path → absolute, with root_id
+    auto phase = WorkspaceClock::now();
     sqlite3_stmt* stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
         "INSERT INTO files (id, root_id, path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
@@ -510,9 +543,12 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     sqlite3_bind_int64(stmt, 2, root_id);
     sqlite3_bind_text(stmt, 3, root_prefix.c_str(), -1, SQLITE_TRANSIENT);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace files failed");
+    sqlite3_int64 copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
+    log_workspace_phase("files copied", phase, "(" + std::to_string(copied) + " rows)");
 
     // 2. Nodes — map id → offset+id, file_id → offset+file_id
+    phase = WorkspaceClock::now();
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
         "INSERT INTO nodes (id, node_type, file_id, kind, name, qualname, signature, "
@@ -527,9 +563,12 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     std::string root_id_prefix = std::to_string(root_id);
     sqlite3_bind_text(stmt, 3, root_id_prefix.c_str(), -1, SQLITE_TRANSIENT);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace nodes failed");
+    copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
+    log_workspace_phase("nodes copied", phase, "(" + std::to_string(copied) + " rows)");
 
     // 3. Edges — re-key src_id and dst_id
+    phase = WorkspaceClock::now();
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
         "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, confidence, evidence) "
@@ -538,9 +577,12 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     sqlite3_bind_int64(stmt, 1, offset);
     sqlite3_bind_int64(stmt, 2, offset);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace edges failed");
+    copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
+    log_workspace_phase("edges copied", phase, "(" + std::to_string(copied) + " rows)");
 
     // 4. Refs — re-key file_id, resolved_node_id, containing_node_id
+    phase = WorkspaceClock::now();
     bool src_has_arg_count = attached_table_has_column(conn_.raw(), "src", "refs", "arg_count");
     bool src_has_arg_pattern = attached_table_has_column(conn_.raw(), "src", "refs", "arg_pattern");
     bool src_has_receiver_type = attached_table_has_column(conn_.raw(), "src", "refs", "receiver_type_hint");
@@ -562,17 +604,23 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     sqlite3_bind_int64(stmt, 3, offset);
     sqlite3_bind_int64(stmt, 4, offset);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace refs failed");
+    copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
+    log_workspace_phase("refs copied", phase, "(" + std::to_string(copied) + " rows)");
 
     // 5. Populate symbol FTS in one bulk pass. Triggers are disabled by caller.
+    phase = WorkspaceClock::now();
     std::string fts_sql =
         "INSERT INTO nodes_fts(rowid, name, qualname, signature, doc) "
         "SELECT id, name, qualname, signature, doc FROM nodes WHERE id >= " +
         std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
     conn_.exec(fts_sql);
+    log_workspace_phase("nodes_fts", phase);
 }
 
 void WorkspaceDB::populate_content_fts_for_root(int64_t root_id) {
+    auto phase = WorkspaceClock::now();
+    int64_t indexed_files = 0;
     int64_t offset = root_id * ID_SPACE;
     int64_t end = offset + ID_SPACE;
     int64_t last_id = offset - 1;
@@ -604,6 +652,7 @@ void WorkspaceDB::populate_content_fts_for_root(int64_t root_id) {
                 conn_.exec("COMMIT");
                 break;
             }
+            indexed_files += static_cast<int64_t>(files.size());
 
             sqlite3_stmt* ins = nullptr;
             prepare_or_throw(conn_.raw(), &ins,
@@ -636,6 +685,7 @@ void WorkspaceDB::populate_content_fts_for_root(int64_t root_id) {
 
     conn_.exec("DELETE FROM kv WHERE key = " +
         sql_quote("workspace_content_fts_pending:" + std::to_string(root_id)));
+    log_workspace_phase("content_fts", phase, "(" + std::to_string(indexed_files) + " files)");
 }
 
 void WorkspaceDB::resume_pending_content_fts() {
