@@ -60,10 +60,17 @@ std::string format_seconds(WorkspaceClock::time_point start) {
     return oss.str();
 }
 
+void log_workspace_line(const std::string& message, bool color_output) {
+    std::cerr << stderr_dim("[workspace]", color_output) << " "
+              << stderr_bold(message, color_output) << "\n";
+}
+
 void log_workspace_phase(const std::string& phase, WorkspaceClock::time_point start,
-                         const std::string& suffix = {}) {
-    std::cerr << "[workspace] " << phase << " in " << format_seconds(start) << "s";
-    if (!suffix.empty()) std::cerr << " " << suffix;
+                         bool color_output, const std::string& suffix = {}) {
+    std::cerr << stderr_dim("[workspace]", color_output) << " "
+              << stderr_bold(phase, color_output) << " in "
+              << stderr_cyan(format_seconds(start) + "s", color_output);
+    if (!suffix.empty()) std::cerr << " " << stderr_dim(suffix, color_output);
     std::cerr << "\n";
 }
 
@@ -251,6 +258,8 @@ void WorkspaceDB::ensure_schema() {
 
 WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const Config& cfg) {
     namespace fs = std::filesystem;
+    const auto overall_phase = WorkspaceClock::now();
+    const bool color_output = stderr_is_tty();
 
     auto abs_root = fs::canonical(root_path).string();
 
@@ -367,19 +376,20 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
         // Maintaining secondary indexes per copied row is expensive for large roots.
         // Drop/rebuild them inside this transaction so crash rollback restores them.
-        auto index_phase = WorkspaceClock::now();
         schema::drop_bulk_indexes(conn_);
-        log_workspace_phase("indexes dropped", index_phase);
 
         // Merge from the already-attached src DB
-        merge_root_attached(root_id, abs_root);
+        log_workspace_line("merging from src...", color_output);
+        merge_root_attached(root_id, abs_root, color_output);
 
-        index_phase = WorkspaceClock::now();
+        auto index_phase = WorkspaceClock::now();
+        log_workspace_line("rebuilding indexes...", color_output);
         schema::rebuild_indexes(conn_);
-        log_workspace_phase("indexes rebuilt", index_phase);
+        log_workspace_phase("indexes rebuilt", index_phase, color_output);
         auto cross_root_phase = WorkspaceClock::now();
+        log_workspace_line("resolving cross-root refs...", color_output);
         resolve_workspace_refs(root_id);
-        log_workspace_phase("cross-root refs resolved", cross_root_phase);
+        log_workspace_phase("cross-root refs resolved", cross_root_phase, color_output);
         fts::create_sync_triggers(conn_);
         auto content_pending_key = "workspace_content_fts_pending:" + std::to_string(root_id);
         if (cfg.workspace_content_fts) {
@@ -409,11 +419,12 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     // bounded transactions. This keeps node/file/ref/edge merge atomic while
     // preventing line-level trigram indexing from creating a multi-GB WAL.
     if (cfg.workspace_content_fts) {
-        populate_content_fts_for_root(root_id);
+        log_workspace_line("indexing file contents...", color_output);
+        populate_content_fts_for_root(root_id, color_output);
         conn_.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     } else {
         auto content_phase = WorkspaceClock::now();
-        log_workspace_phase("content_fts", content_phase, "(disabled; 0 files)");
+        log_workspace_phase("content_fts", content_phase, color_output, "(disabled; 0 files)");
     }
 
     // Query stats
@@ -445,6 +456,40 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
     result.edges = count_edges_for_root(conn_, root_id);
 
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM roots", -1, &stmt, nullptr);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.roots_total = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM files", -1, &stmt, nullptr);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.files_total = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL", -1, &stmt, nullptr);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.symbols_total = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM edges", -1, &stmt, nullptr);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.edges_total = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    std::ostringstream summary;
+    summary << stderr_dim("[workspace]", color_output) << " "
+            << stderr_bold_green("✓ done", color_output)
+            << " — " << format_with_commas(result.roots_total) << " roots | "
+            << format_with_commas(result.files_total) << " files | "
+            << format_with_commas(result.symbols_total) << " nodes | "
+            << format_with_commas(result.edges_total) << " edges  ("
+            << stderr_cyan(format_seconds(overall_phase) + "s total", color_output) << ")";
+    std::cerr << summary.str() << "\n";
+
     return result;
 }
 
@@ -468,7 +513,9 @@ WorkspaceDB::RemoveResult WorkspaceDB::remove_root(const std::string& root_path)
     int64_t offset = root_id * ID_SPACE;
 
     if (root_id == 0) {
-        std::cerr << "WARNING: Root not found in workspace: " << abs_root << "\n";
+        std::cerr << stderr_yellow("WARNING: Root not found in workspace: " + abs_root,
+                                   stderr_is_tty())
+                  << "\n";
         return result;
     }
 
@@ -579,17 +626,22 @@ void WorkspaceDB::check_overlap(const std::string& new_root_path) {
         auto new_str = new_path.string();
         auto exist_str = existing.string();
         if (new_str.find(exist_str) == 0 && new_str.size() > exist_str.size()) {
-            std::cerr << "WARNING: " << new_root_path << " is inside " << exist_str
-                      << " — files may be double-indexed.\n";
+            std::cerr << stderr_yellow("WARNING: " + new_root_path + " is inside " + exist_str +
+                                       " — files may be double-indexed.",
+                                       stderr_is_tty())
+                      << "\n";
         } else if (exist_str.find(new_str) == 0 && exist_str.size() > new_str.size()) {
-            std::cerr << "WARNING: " << exist_str << " is inside " << new_root_path
-                      << " — files may be double-indexed.\n";
+            std::cerr << stderr_yellow("WARNING: " + exist_str + " is inside " + new_root_path +
+                                       " — files may be double-indexed.",
+                                       stderr_is_tty())
+                      << "\n";
         }
     }
     sqlite3_finalize(stmt);
 }
 
-void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_path) {
+void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_path,
+                                      bool color_output) {
     // Assumes 'src' is already ATTACHed by the caller before the transaction.
     std::string root_prefix = root_path;
     if (!root_prefix.empty() && root_prefix.back() != '/') root_prefix += '/';
@@ -597,6 +649,7 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     int64_t offset = root_id * ID_SPACE;
 
     // 1. Files — map id → offset+id, path → absolute, with root_id
+    log_workspace_line("copying files...", color_output);
     auto phase = WorkspaceClock::now();
     sqlite3_stmt* stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
@@ -609,9 +662,11 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace files failed");
     sqlite3_int64 copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
-    log_workspace_phase("files copied", phase, "(" + std::to_string(copied) + " rows)");
+    log_workspace_phase("files copied", phase, color_output,
+                        "(" + format_with_commas(copied) + " rows)");
 
     // 2. Nodes — map id → offset+id, file_id → offset+file_id
+    log_workspace_line("copying nodes...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
@@ -629,9 +684,11 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace nodes failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
-    log_workspace_phase("nodes copied", phase, "(" + std::to_string(copied) + " rows)");
+    log_workspace_phase("nodes copied", phase, color_output,
+                        "(" + format_with_commas(copied) + " rows)");
 
     // 3. Edges — re-key src_id and dst_id
+    log_workspace_line("copying edges...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
@@ -643,9 +700,11 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace edges failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
-    log_workspace_phase("edges copied", phase, "(" + std::to_string(copied) + " rows)");
+    log_workspace_phase("edges copied", phase, color_output,
+                        "(" + format_with_commas(copied) + " rows)");
 
     // 4. Refs — re-key file_id, resolved_node_id, containing_node_id
+    log_workspace_line("copying refs...", color_output);
     phase = WorkspaceClock::now();
     bool src_has_arg_count = attached_table_has_column(conn_.raw(), "src", "refs", "arg_count");
     bool src_has_arg_pattern = attached_table_has_column(conn_.raw(), "src", "refs", "arg_pattern");
@@ -670,7 +729,8 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace refs failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
-    log_workspace_phase("refs copied", phase, "(" + std::to_string(copied) + " rows)");
+    log_workspace_phase("refs copied", phase, color_output,
+                        "(" + format_with_commas(copied) + " rows)");
 
     // 5. Populate symbol FTS in one bulk pass. Triggers are disabled by caller.
     phase = WorkspaceClock::now();
@@ -679,7 +739,7 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
         "SELECT id, name, qualname, signature, doc FROM nodes WHERE id >= " +
         std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
     conn_.exec(fts_sql);
-    log_workspace_phase("nodes_fts", phase);
+    log_workspace_phase("nodes_fts", phase, color_output);
 }
 
 std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_root_id) {
@@ -883,7 +943,7 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
     }
 }
 
-void WorkspaceDB::populate_content_fts_for_root(int64_t root_id) {
+void WorkspaceDB::populate_content_fts_for_root(int64_t root_id, bool color_output) {
     auto phase = WorkspaceClock::now();
     int64_t indexed_files = 0;
     int64_t offset = root_id * ID_SPACE;
@@ -950,7 +1010,8 @@ void WorkspaceDB::populate_content_fts_for_root(int64_t root_id) {
 
     conn_.exec("DELETE FROM kv WHERE key = " +
         sql_quote("workspace_content_fts_pending:" + std::to_string(root_id)));
-    log_workspace_phase("content_fts", phase, "(" + std::to_string(indexed_files) + " files)");
+    log_workspace_phase("content_fts", phase, color_output,
+                        "(" + format_with_commas(indexed_files) + " files)");
 }
 
 void WorkspaceDB::resume_pending_content_fts() {
@@ -984,7 +1045,7 @@ void WorkspaceDB::resume_pending_content_fts() {
         bool root_exists = exists_int64_range(conn_,
             "SELECT 1 FROM roots WHERE id = ? LIMIT 1", root_id);
         if (root_exists) {
-            populate_content_fts_for_root(root_id);
+            populate_content_fts_for_root(root_id, stderr_is_tty());
         } else {
             conn_.exec("DELETE FROM kv WHERE key = " +
                 sql_quote("workspace_content_fts_pending:" + std::to_string(root_id)));

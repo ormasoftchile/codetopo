@@ -5,6 +5,7 @@
 #include "index/scanner.h"
 #include "util/hash.h"
 #include "util/git.h"
+#include "util/log.h"
 #include "db/schema.h"
 #include <sqlite3.h>
 #include <string>
@@ -582,8 +583,12 @@ public:
                 ++loaded;
             }
             sqlite3_finalize(stmt);
-            std::cerr << "  Loaded " << loaded << " symbols into lookup map ("
-                      << symbol_map.size() << " unique names)\n";
+            const bool color_output = stderr_is_tty();
+            std::cerr << "  Loaded " << stderr_cyan(format_with_commas(loaded), color_output)
+                      << " symbols into lookup map ("
+                      << stderr_dim(format_with_commas(static_cast<int64_t>(symbol_map.size())) + " unique names",
+                                     color_output)
+                      << ")\n";
         }
 
         // --- Step 2: Build file-node lookup: file path → file node id ---
@@ -616,7 +621,8 @@ public:
         // --- Step 4: (merged into Step 1 above) ---
 
         // --- Step 5: Read all unresolved refs, resolve in memory, batch-update ---
-        std::cerr << "  Resolving refs in memory...\n";
+        const bool color_output = stderr_is_tty();
+        std::cerr << "  " << stderr_bold("Resolving refs in memory...", color_output) << "\n";
 
         // Prepare the UPDATE statement (by rowid — fastest possible)
         sqlite3_stmt* update_stmt = nullptr;
@@ -725,18 +731,20 @@ public:
         sqlite3_finalize(ref_stmt);
         sqlite3_finalize(update_stmt);
 
-        std::cerr << "  Resolved " << call_resolved << " call, "
-                  << include_resolved << " include, "
-                  << inherit_resolved << " inherit refs\n";
+        std::cerr << "  Resolved "
+                  << stderr_cyan(format_with_commas(call_resolved), color_output) << " call, "
+                  << stderr_cyan(format_with_commas(include_resolved), color_output) << " include, "
+                  << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit refs\n";
 
         // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
         // Without a unique constraint, re-runs would accumulate duplicate edges.
         // Delete only resolver-created edges (confidence=0.7, name-match evidence).
         if (!cold_index_) {
-            std::cerr << "  Clearing old cross-ref edges...\n";
+            std::cerr << "  " << stderr_bold("Clearing old cross-ref edges...", color_output) << "\n";
             conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
         }
-        std::cerr << "  Inserting " << edge_tuples.size() << " edges...\n";
+        std::cerr << "  Inserting " << stderr_cyan(format_with_commas(static_cast<int64_t>(edge_tuples.size())), color_output)
+                  << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
         // R3: Batch edge INSERT using 150-row chunks (no UNIQUE constraint on edges,
@@ -797,7 +805,8 @@ public:
         conn_.exec("COMMIT");
         sqlite3_finalize(batch_edge_stmt);
         sqlite3_finalize(single_edge_stmt);
-        std::cerr << "  Created " << edges_created << " edges\n";
+        std::cerr << "  Created " << stderr_cyan(format_with_commas(edges_created), color_output)
+                  << " edges\n";
 
         conn_.exec("PRAGMA foreign_keys = ON");
         return {total_resolved, edges_created};

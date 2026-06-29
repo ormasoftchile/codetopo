@@ -3,6 +3,7 @@
 #include "util/json.h"
 
 #include <string>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -15,8 +16,70 @@
 #include <sstream>
 #include <optional>
 #include <cstdlib>
+#include <cstdio>
+#include <string_view>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace codetopo {
+
+inline bool stderr_is_tty() {
+#ifdef _WIN32
+    return _isatty(_fileno(stderr)) != 0;
+#else
+    return isatty(STDERR_FILENO) != 0;
+#endif
+}
+
+inline std::string stderr_ansi(std::string_view text, const char* code, bool enabled) {
+    if (!enabled) return std::string(text);
+    return std::string(code) + std::string(text) + "\033[0m";
+}
+
+inline std::string stderr_dim(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[2m", enabled);
+}
+
+inline std::string stderr_bold(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[1m", enabled);
+}
+
+inline std::string stderr_cyan(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[36m", enabled);
+}
+
+inline std::string stderr_yellow(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[33m", enabled);
+}
+
+inline std::string stderr_bold_green(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[1;32m", enabled);
+}
+
+inline std::string stderr_bold_red(std::string_view text, bool enabled) {
+    return stderr_ansi(text, "\033[1;31m", enabled);
+}
+
+inline std::string format_with_commas(int64_t value) {
+    auto digits = std::to_string(value);
+    std::string formatted;
+    formatted.reserve(digits.size() + digits.size() / 3);
+    int count = 0;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (count == 3) {
+            formatted.push_back(',');
+            count = 0;
+        }
+        formatted.push_back(*it);
+        ++count;
+    }
+    std::reverse(formatted.begin(), formatted.end());
+    return formatted;
+}
 
 // When true, mcp_log also sends notifications/message over stdout (JSON-RPC channel).
 // Set to true after the MCP client sends notifications/initialized.

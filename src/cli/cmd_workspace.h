@@ -2,6 +2,7 @@
 
 #include "db/workspace.h"
 #include "core/config.h"
+#include "util/log.h"
 #include "util/repo.h"
 #include <string>
 #include <vector>
@@ -23,8 +24,10 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
     ensure_codetopo_dir(repo_root);
 
     if (!fs::exists(db_path)) {
-        std::cerr << "ERROR: No index.sqlite found at " << db_path
-                  << ". Run 'codetopo index --root " << repo_root << "' first.\n";
+        std::cerr << stderr_bold_red("ERROR: No index.sqlite found at " + db_path +
+                                     ". Run 'codetopo index --root " + repo_root + "' first.",
+                                     stderr_is_tty())
+                  << "\n";
         return 1;
     }
 
@@ -38,7 +41,7 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
                   << "  edges:   " << result.edges << "\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
+        std::cerr << stderr_bold_red(std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";
         return 1;
     }
 }
@@ -50,7 +53,7 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
     auto db_path = default_db(repo_root);
 
     if (!fs::exists(db_path)) {
-        std::cerr << "ERROR: No index.sqlite found at " << db_path << "\n";
+        std::cerr << stderr_bold_red("ERROR: No index.sqlite found at " + db_path, stderr_is_tty()) << "\n";
         return 1;
     }
 
@@ -63,7 +66,7 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
                   << "  edges removed:   " << result.edges << "\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
+        std::cerr << stderr_bold_red(std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";
         return 1;
     }
 }
@@ -97,7 +100,7 @@ inline int run_workspace_list(const std::string& root_str) {
         }
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
+        std::cerr << stderr_bold_red(std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";
         return 1;
     }
 }
