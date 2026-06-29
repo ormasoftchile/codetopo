@@ -296,3 +296,67 @@ Analyzed remaining optimization vectors after DEC-034 R1+R2. **Architecture asse
 - All meaningful changes require team consensus
 - Document architectural decisions here
 - Keep history focused on work, decisions focused on direction
+
+---
+
+## Backfilled Decisions — 2026-06-28 token/efficiency and tooling work
+
+> Reconstructed by Scribe from merged PR metadata and commit history after Squad memory ended at DEC-039. These entries document work already implemented and merged to `main`; they were not authored through the Squad workflow.
+
+### DEC-040: Token-efficient MCP output defaults and filters (Scribe backfill, 2026-06-28)
+**Status:** Implemented, merged to main  
+**References:** PR #30, PR #31, PR #33
+
+Decision: Prefer token-efficient MCP responses by default while preserving opt-in detail when callers need it.
+
+Implemented changes:
+- `symbols_in_path` and `symbol_list` gained `compact=true` and field filtering so callers can request only the columns they need (#30).
+- `symbols_in_path` now defaults to compact output to reduce routine symbol-list token cost (#33).
+- `context_for`, `callers_approx`, and `callees_approx` gained token-reduction parameters/compact output paths for graph exploration without overfetching (#31).
+
+Rationale: The MCP server is used primarily by LLM clients, so default response shapes should minimize token spend and reserve source-heavy/context-heavy output for explicit requests.
+
+### DEC-041: MCP activity logging hardening and client-visible notifications (Scribe backfill, 2026-06-28)
+**Status:** Implemented, merged to main  
+**References:** PR #22, PR #23, PR #24
+
+Decision: Treat MCP logging as an operational/debugging surface that must be timestamped, flushed promptly, and visible to compatible clients.
+
+Implemented changes:
+- Added timestamped MCP server activity logging (#22).
+- Flushed `stderr` after every `mcp_log` call to work around VS Code/Copilot buffering and make logs appear promptly (#23).
+- Sent MCP `notifications/message` events for all log output so clients can surface server activity without relying only on raw stderr (#24).
+
+Rationale: Local MCP debugging depends on timely logs. Explicit flushes and notifications make the server easier to diagnose across VS Code, Copilot CLI, and other MCP clients.
+
+### DEC-042: Lower-token navigation/search defaults and safer CLI tooling (Scribe backfill, 2026-06-28)
+**Status:** Implemented, merged to main  
+**References:** PR #26, PR #27, PR #28, PR #29, PR #32, PR #36
+
+Decision: Tune high-frequency navigation tools for smaller default responses, fix correctness gaps discovered during usage, and add explicit override flags for destructive/duplicate-sensitive commands.
+
+Implemented changes:
+- Implemented seven codetopo wishlist improvements gathered from usage feedback (#26).
+- Fixed `dir_tree` overflow behavior and closed JavaScript `constructor_fn` visibility gaps (#27).
+- Added `--force` to `codetopo index` and `codetopo init` so callers can explicitly override safety checks when needed (#28).
+- Reduced `dir_tree` default depth from 2 to 1 and updated Copilot instructions to steer callers toward narrower exploration (#29).
+- Reduced `code_search` default `context_lines` from 2 to 1 (#32).
+- Fixed `code_search` behavior at workspace roots and documented the `type_alias` symbol kind (#36).
+
+Rationale: Directory trees and code search are common first-hop tools. Smaller defaults reduce unnecessary tokens, while correctness fixes and `--force` flags keep workflows predictable and explicit.
+
+### DEC-043: Documentation, design notes, and Copilot instruction refresh (Scribe backfill, 2026-06-28)
+**Status:** Implemented, merged to main  
+**References:** PR #21, PR #25, PR #34, PR #35, PR #36, PR #37
+
+Decision: Keep public documentation and generated Copilot instructions aligned with the latest tool behavior, known limitations, and recommended token-efficient usage patterns.
+
+Implemented changes:
+- Added `--version`, design document footnotes, and expanded related-work coverage (#21).
+- Embedded Triton DS diagrams in the design document via `triton-latex` (#25).
+- Added token-efficient usage patterns to the Copilot instructions template (#34).
+- Published Copilot instructions template v2 (#35).
+- Documented `type_alias` kind behavior alongside the workspace-root `code_search` fix (#36).
+- Documented higher-order-function call-graph gaps and `method_fields` strength in design docs/instructions (#37).
+
+Rationale: The project’s guidance should teach agents and humans how to use codetopo efficiently, including where the graph is strong, where static analysis has known blind spots, and which defaults are intentionally token-conservative.
