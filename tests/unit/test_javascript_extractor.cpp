@@ -211,3 +211,50 @@ class Store {
     REQUIRE(member != result.refs.end());
     CHECK(member->receiver_type_hint == "LinkedMap");
 }
+
+TEST_CASE("TypeScript call refs capture receiver types from parameters and fields",
+          "[unit][typescript][extractor]") {
+    std::string source = R"(function inlineParam(client: SavedObjectsRepository) {
+  client.find("a");
+}
+
+function wrappedParam(
+  client:
+    SavedObjectsRepository
+) {
+  client.find("b");
+}
+
+class Holder {
+  private readonly client:
+    SavedObjectsRepository;
+
+  run() {
+    this.client.find("c");
+  }
+}
+)";
+
+    auto result = extract_typescript_for_test(source);
+
+    auto inline_param = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "client.find" && ref.start_line == 2;
+        });
+    REQUIRE(inline_param != result.refs.end());
+    CHECK(inline_param->receiver_type_hint == "SavedObjectsRepository");
+
+    auto wrapped_param = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "client.find" && ref.start_line == 9;
+        });
+    REQUIRE(wrapped_param != result.refs.end());
+    CHECK(wrapped_param->receiver_type_hint == "SavedObjectsRepository");
+
+    auto class_field = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "this.client.find";
+        });
+    REQUIRE(class_field != result.refs.end());
+    CHECK(class_field->receiver_type_hint == "SavedObjectsRepository");
+}

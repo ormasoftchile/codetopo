@@ -258,7 +258,7 @@ static size_t estimate_symbol_listing_bytes(const char* kind, const char* name,
 
 // Resolve a node by node_id, or by symbol+file name lookup.
 // Allows tools to be called with stable identifiers instead of volatile IDs.
-static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache& cache,
+static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCache& cache,
                                 const char* id_param = "node_id") {
     if (!params) return -1;
     int64_t id = json_get_int(params, id_param, -1);
@@ -1798,7 +1798,7 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
 }
 
 // T080: file_search — search file paths by GLOB pattern
-std::string file_search(yyjson_val* params, Connection& conn,
+std::string file_search(yyjson_val* params, Connection& /*conn*/,
                                 QueryCache& cache, const std::string& /*repo_root*/) {
     const char* pattern = params ? json_get_str(params, "pattern") : nullptr;
     if (!pattern) return McpError::invalid_input("Missing 'pattern' parameter").to_json_rpc(0);
@@ -2181,7 +2181,7 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
 }
 
 // T062: symbol_search
-std::string symbol_search(yyjson_val* params, Connection& conn,
+std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
                                    QueryCache& cache, const std::string& /*repo_root*/) {
     const char* query = params ? json_get_str(params, "query") : nullptr;
     if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
@@ -2431,7 +2431,7 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
 }
 
 // T062b: symbol_list — list/filter symbols without FTS, supports kind, file, and name-glob filters
-std::string symbol_list(yyjson_val* params, Connection& conn,
+std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
                                 QueryCache& cache, const std::string& /*repo_root*/) {
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
@@ -2920,7 +2920,7 @@ std::string symbol_get(yyjson_val* params, Connection& conn,
 }
 
 // T064: symbol_get_batch — multi-ID lookup
-std::string symbol_get_batch(yyjson_val* params, Connection& conn,
+std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
                                      QueryCache& cache, const std::string& repo_root) {
     if (!params) return McpError::invalid_input("Missing parameters").to_json_rpc(0);
 
@@ -3926,7 +3926,7 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
 // ===== US3: Graph Exploration Tools =====
 
 // T084: entrypoints — find natural starting points
-std::string entrypoints(yyjson_val* params, Connection& conn,
+std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
                                 QueryCache& cache, const std::string& /*repo_root*/) {
     int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
     const char* scope = params ? json_get_str(params, "scope") : nullptr;
@@ -4207,7 +4207,7 @@ std::string file_deps(yyjson_val* params, Connection& conn,
 }
 
 // T087: subgraph — multi-seed BFS extraction
-std::string subgraph(yyjson_val* params, Connection& conn,
+std::string subgraph(yyjson_val* params, Connection& /*conn*/,
                              QueryCache& cache, const std::string& /*repo_root*/) {
     if (!params) return McpError::invalid_input("Missing parameters").to_json_rpc(0);
 
@@ -4335,7 +4335,7 @@ std::string subgraph(yyjson_val* params, Connection& conn,
 }
 
 // T088: shortest_path — BFS between two nodes
-std::string shortest_path(yyjson_val* params, Connection& conn,
+std::string shortest_path(yyjson_val* params, Connection& /*conn*/,
                                   QueryCache& cache, const std::string& /*repo_root*/) {
     int64_t src_id = params ? json_get_int(params, "src_node_id", -1) : -1;
     int64_t dst_id = params ? json_get_int(params, "dst_node_id", -1) : -1;
@@ -4510,7 +4510,7 @@ std::string shortest_path(yyjson_val* params, Connection& conn,
 }
 
 // T089: find_implementations — find types that inherit from a base
-std::string find_implementations(yyjson_val* params, Connection& conn,
+std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
                                          QueryCache& cache, const std::string& /*repo_root*/) {
     const char* symbol = params ? json_get_str(params, "symbol") : nullptr;
     if (!symbol) return McpError::invalid_input("Missing 'symbol' parameter").to_json_rpc(0);
@@ -4708,7 +4708,7 @@ std::string method_fields(yyjson_val* params, Connection& conn,
 }
 
 // T091: dependency_cluster — group methods by shared field access with read/write weighting
-std::string dependency_cluster(yyjson_val* params, Connection& conn,
+std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
                                QueryCache& cache, const std::string& /*repo_root*/) {
     // Accept either file path or class node_id
     auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
@@ -5002,7 +5002,7 @@ std::string source_at(yyjson_val* params, Connection& conn,
 // Queries content_fts which stores one row per source line with file_id and line_no.
 // MATCH returns exact line numbers directly — no full-file scanning needed.
 std::string code_search(yyjson_val* params, Connection& conn,
-                        QueryCache& cache, const std::string& repo_root) {
+                        QueryCache& /*cache*/, const std::string& repo_root) {
     const char* query = params ? json_get_str(params, "query") : nullptr;
     if (!query || std::strlen(query) == 0) {
         return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
