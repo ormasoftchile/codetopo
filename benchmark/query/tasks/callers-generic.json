@@ -1,0 +1,26 @@
+{
+  "id": "callers-generic",
+  "description": "Measure noisy caller blast radius for Kibana's generic repository.find method",
+  "category": "callers",
+  "expected_status": "warn",
+  "repo_root": "/Volumes/Projects/triton",
+  "tool": "callers_approx",
+  "params": {
+    "symbol": "find",
+    "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/repository.ts",
+    "response_mode": "lean",
+    "limit": 20,
+    "top_n": 10
+  },
+  "expected": {
+    "total_field": "candidate_total",
+    "confidence_array_field": "candidate_results",
+    "min_total": 1000,
+    "max_avg_confidence": 0.5,
+    "must_contain_heuristics": [
+      "unrelated_member_suffix_match+arity_match"
+    ]
+  },
+  "grep_equivalent": "grep -rn '\\.find\\s*\\(' /Volumes/Projects/kibana/src/core/packages/saved-objects",
+  "benchmark_notes": "Verified 2026-06-29 against Kibana's saved-objects repository.find. codetopo returned 18,101 candidates and the returned top candidates all scored 0.36 confidence."
+}

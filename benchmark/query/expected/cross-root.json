@@ -1,0 +1,503 @@
+{
+  "budget_exceeded": true,
+  "filtered_hidden": 0,
+  "has_more": true,
+  "hidden_public_count": 0,
+  "limit": 2000,
+  "max_bytes": 16000,
+  "min_span_lines_lossy": false,
+  "next_offset": 81,
+  "offset": 0,
+  "path": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib",
+  "recursive": true,
+  "results": [
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "interface",
+      "name": "ExpectedErrorResult",
+      "start_line": 68
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "client",
+      "start_line": 75
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "repository",
+      "start_line": 76
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "migrator",
+      "start_line": 77
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "logger",
+      "start_line": 78
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "serializer",
+      "start_line": 79
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "securityExtension",
+      "start_line": 80
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "registry",
+      "start_line": 82
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "documentMigrator",
+      "start_line": 83
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expectSuccess",
+      "start_line": 85
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expectMigrationArgs",
+      "start_line": 90
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj",
+      "start_line": 91
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "allTypes",
+      "start_line": 114
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "allowedTypes",
+      "start_line": 115
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "mockMigrationVersion",
+      "start_line": 137
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "mockMigrateDocument",
+      "start_line": 138
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj1",
+      "start_line": 157
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj2",
+      "start_line": 164
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "namespace",
+      "start_line": 171
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expectClientCallArgsAction",
+      "start_line": 174
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 182
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expectObjArgs",
+      "start_line": 201
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 225
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 244
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 250
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj1WithSeq",
+      "start_line": 274
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 304
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj1WithManagedTrue",
+      "start_line": 312
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj2WithManagedTrue",
+      "start_line": 313
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 315
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "result",
+      "start_line": 327
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 343
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 349
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 350
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "existingDocument",
+      "start_line": 360
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 371
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 376
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 377
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 386
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 391
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 392
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 400
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 405
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 406
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 417
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 418
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 428
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 429
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 438
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 439
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 448
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 449
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 457
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 462
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 463
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "test",
+      "start_line": 471
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 472
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "[o1, o2]",
+      "start_line": 473
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected1",
+      "start_line": 483
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected2",
+      "start_line": 484
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 485
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "test",
+      "start_line": 498
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "ns2",
+      "start_line": 499
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "ns3",
+      "start_line": 500
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 501
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "[o1, o2, o3]",
+      "start_line": 506
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 520
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "test",
+      "start_line": 553
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 554
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 556
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "test",
+      "start_line": 571
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 572
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "expected",
+      "start_line": 574
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "operations",
+      "start_line": 575
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "getId",
+      "start_line": 615
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "getId",
+      "start_line": 621
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "getId",
+      "start_line": 627
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "objects",
+      "start_line": 628
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "obj3",
+      "start_line": 642
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "bulkCreateError",
+      "start_line": 649
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "variable",
+      "name": "response",
+      "start_line": 654
+    }
+  ],
+  "total": 3142,
+  "total_candidates": 3142
+}

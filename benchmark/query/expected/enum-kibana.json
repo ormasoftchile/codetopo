@@ -1,0 +1,458 @@
+{
+  "budget_exceeded": true,
+  "filtered_hidden": 3026,
+  "has_more": true,
+  "hidden_public_count": 92,
+  "limit": 200,
+  "max_bytes": 16000,
+  "min_span_lines_lossy": false,
+  "next_offset": 73,
+  "offset": 0,
+  "path": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib",
+  "recursive": true,
+  "results": [
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.test.ts",
+      "kind": "interface",
+      "name": "ExpectedErrorResult",
+      "start_line": 68
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.ts",
+      "kind": "interface",
+      "name": "PerformBulkCreateParams",
+      "start_line": 43
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.ts",
+      "kind": "type_alias",
+      "name": "ExpectedResult",
+      "start_line": 48
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_create.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkResult",
+      "start_line": 236
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_delete.test.ts",
+      "kind": "interface",
+      "name": "ExpectedErrorResult",
+      "start_line": 57
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_delete.ts",
+      "kind": "interface",
+      "name": "PerformBulkDeleteParams",
+      "start_line": 47
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_get.isolated.test.ts",
+      "kind": "interface",
+      "name": "ObjectInfo",
+      "start_line": 20
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_get.test.ts",
+      "kind": "interface",
+      "name": "ExpectedErrorResult",
+      "start_line": 53
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_get.ts",
+      "kind": "interface",
+      "name": "PerformBulkGetParams",
+      "start_line": 38
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_get.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkGetResult",
+      "start_line": 43
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_resolve.ts",
+      "kind": "interface",
+      "name": "PerformCreateParams",
+      "start_line": 26
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_update.test.ts",
+      "kind": "interface",
+      "name": "ExpectedErrorResult",
+      "start_line": 59
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_update.ts",
+      "kind": "interface",
+      "name": "PerformUpdateParams",
+      "start_line": 49
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_update.ts",
+      "kind": "type_alias",
+      "name": "DocumentToSave",
+      "start_line": 54
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_update.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkGetResult",
+      "start_line": 55
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/bulk_update.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkUpdateResult",
+      "start_line": 69
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/change_access_mode.ts",
+      "kind": "interface",
+      "name": "PerformChangeAccessModeParams",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/change_ownership.ts",
+      "kind": "interface",
+      "name": "PerformChangeOwnershipParams",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/check_conflicts.ts",
+      "kind": "interface",
+      "name": "PerformCheckConflictsParams",
+      "start_line": 27
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/check_conflicts.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkGetResult",
+      "start_line": 46
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/collect_multinamespaces_references.ts",
+      "kind": "interface",
+      "name": "PerformCreateParams",
+      "start_line": 18
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/create.ts",
+      "kind": "interface",
+      "name": "PerformCreateParams",
+      "start_line": 30
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/delete.ts",
+      "kind": "interface",
+      "name": "PerformDeleteParams",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/delete_by_namespace.ts",
+      "kind": "interface",
+      "name": "PerformDeleteByNamespaceParams",
+      "start_line": 21
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/esql.ts",
+      "kind": "interface",
+      "name": "PerformEsqlParams",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/find.isolated.test.ts",
+      "kind": "interface",
+      "name": "ObjectInfo",
+      "start_line": 17
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/find.ts",
+      "kind": "interface",
+      "name": "PerformFindParams",
+      "start_line": 40
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/get.ts",
+      "kind": "interface",
+      "name": "PerformGetParams",
+      "start_line": 18
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/common.ts",
+      "kind": "type_alias",
+      "name": "ICommonHelper",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/common.ts",
+      "kind": "class",
+      "name": "CommonHelper",
+      "start_line": 24
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/encryption.ts",
+      "kind": "type_alias",
+      "name": "IEncryptionHelper",
+      "start_line": 18
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/encryption.ts",
+      "kind": "class",
+      "name": "EncryptionHelper",
+      "start_line": 20
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/index.ts",
+      "kind": "interface",
+      "name": "RepositoryHelpers",
+      "start_line": 35
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/migration.ts",
+      "kind": "type_alias",
+      "name": "IMigrationHelper",
+      "start_line": 20
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/migration.ts",
+      "kind": "class",
+      "name": "MigrationHelper",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "type_alias",
+      "name": "IPreflightCheckHelper",
+      "start_line": 36
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "class",
+      "name": "PreflightCheckHelper",
+      "start_line": 38
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightCheckNamespacesParams",
+      "start_line": 259
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightNSParams",
+      "start_line": 273
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightNSResult",
+      "start_line": 289
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightCheckNamespacesResult",
+      "start_line": 306
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightDocParams",
+      "start_line": 321
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/preflight_check.ts",
+      "kind": "interface",
+      "name": "PreflightDocResult",
+      "start_line": 338
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/serializer.ts",
+      "kind": "type_alias",
+      "name": "ISerializerHelper",
+      "start_line": 23
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/serializer.ts",
+      "kind": "class",
+      "name": "SerializerHelper",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/user.ts",
+      "kind": "class",
+      "name": "UserHelper",
+      "start_line": 12
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/validation.ts",
+      "kind": "type_alias",
+      "name": "IValidationHelper",
+      "start_line": 23
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/helpers/validation.ts",
+      "kind": "class",
+      "name": "ValidationHelper",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/increment_counter.ts",
+      "kind": "interface",
+      "name": "PerformIncrementCounterParams",
+      "start_line": 19
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/change_object_access_control.test.ts",
+      "kind": "type_alias",
+      "name": "SetupParams",
+      "start_line": 37
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/change_object_access_control.ts",
+      "kind": "type_alias",
+      "name": "ChangeAccessControlActionType",
+      "start_line": 40
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/change_object_access_control.ts",
+      "kind": "interface",
+      "name": "ChangeAccessControlParams",
+      "start_line": 42
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/change_object_access_control.ts",
+      "kind": "type_alias",
+      "name": "AccessMode",
+      "start_line": 84
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/collect_multi_namespace_references.ts",
+      "kind": "interface",
+      "name": "CollectMultiNamespaceReferencesParams",
+      "start_line": 56
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/delete_legacy_url_aliases.test.ts",
+      "kind": "type_alias",
+      "name": "SetupParams",
+      "start_line": 19
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/delete_legacy_url_aliases.ts",
+      "kind": "interface",
+      "name": "DeleteLegacyUrlAliasesParams",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/find_legacy_url_aliases.ts",
+      "kind": "interface",
+      "name": "FindLegacyUrlAliasesObject",
+      "start_line": 18
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/increment_counter_internal.ts",
+      "kind": "interface",
+      "name": "PerformIncrementCounterInternalParams",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/internal_bulk_resolve.ts",
+      "kind": "interface",
+      "name": "InternalBulkResolveParams",
+      "start_line": 61
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/internal_bulk_resolve.ts",
+      "kind": "interface",
+      "name": "InternalSavedObjectsBulkResolveResponse",
+      "start_line": 77
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/internal_bulk_resolve.ts",
+      "kind": "type_alias",
+      "name": "AliasInfo",
+      "start_line": 81
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/internal_bulk_resolve.ts",
+      "kind": "class",
+      "name": "ResolveCounter",
+      "start_line": 345
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/preflight_check_for_create.ts",
+      "kind": "interface",
+      "name": "PreflightCheckForCreateObject",
+      "start_line": 46
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/preflight_check_for_create.ts",
+      "kind": "interface",
+      "name": "PreflightCheckForCreateParams",
+      "start_line": 57
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/preflight_check_for_create.ts",
+      "kind": "interface",
+      "name": "PreflightCheckForCreateResult",
+      "start_line": 66
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/preflight_check_for_create.ts",
+      "kind": "interface",
+      "name": "ParsedObject",
+      "start_line": 83
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "interface",
+      "name": "PreflightCheckForBulkDeleteParams",
+      "start_line": 24
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "interface",
+      "name": "ExpectedBulkDeleteMultiNamespaceDocsParams",
+      "start_line": 32
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "interface",
+      "name": "BulkDeleteParams",
+      "start_line": 45
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "type_alias",
+      "name": "ExpectedBulkDeleteResult",
+      "start_line": 52
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "interface",
+      "name": "BulkDeleteItemErrorResult",
+      "start_line": 66
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "type_alias",
+      "name": "NewBulkItemResponse",
+      "start_line": 76
+    },
+    {
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/repository_bulk_delete_internal_types.ts",
+      "kind": "type_alias",
+      "name": "BulkDeleteExpectedBulkGetResult",
+      "start_line": 82
+    }
+  ],
+  "total": 116,
+  "total_candidates": 3142,
+  "warnings": [
+    "kind filters hide public/API-like symbols; inspect total_candidates/hidden_public_count"
+  ]
+}

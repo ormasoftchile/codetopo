@@ -1,0 +1,21 @@
+{
+  "id": "method-fields",
+  "description": "Inspect run_query internals without reading source",
+  "category": "method_internals",
+  "repo_root": "/Volumes/Projects/codetopo",
+  "tool": "method_fields",
+  "params": {
+    "symbol": "run_query",
+    "file": "src/cli/cmd_mcp.h"
+  },
+  "expected": {
+    "must_contain_method_name": "run_query",
+    "min_outgoing_calls": 5,
+    "must_contain_calls": [
+      "exists",
+      "mcp_log"
+    ]
+  },
+  "grep_equivalent": "grep -n 'run_query' -A80 src/cli/cmd_mcp.h",
+  "benchmark_notes": "Verified 2026-06-29 against the codetopo repo. method_fields surfaced 5 outgoing calls for run_query, including exists and mcp_log."
+}

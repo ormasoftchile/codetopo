@@ -1,0 +1,180 @@
+{
+  "arity_filtered": 0,
+  "candidate_arity_filtered": 0,
+  "candidate_buckets": {
+    "arg_count": {
+      "\u0000": {
+        "count": 2,
+        "top_files": [
+          {
+            "count": 2,
+            "name": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/transform_path_file.js"
+          }
+        ]
+      },
+      "\u0000\u0000\u0000\u0000\u0000\u0000\u0000": {
+        "count": 37,
+        "top_files": [
+          {
+            "count": 5,
+            "name": "/Volumes/Projects/d3-force/test/find-test.js"
+          },
+          {
+            "count": 4,
+            "name": "/Volumes/Projects/kibana/.buildkite/scripts/steps/entity_store_performance/generate_performance_report.sh"
+          },
+          {
+            "count": 3,
+            "name": "/Volumes/Projects/dagre/dist/dagre.cjs.js"
+          }
+        ]
+      }
+    },
+    "file": [
+      {
+        "count": 57,
+        "name": "/Volumes/Projects/kibana/packages/kbn-docs-utils/src/integration_tests/api_doc_suite.test.ts"
+      },
+      {
+        "count": 45,
+        "name": "/Volumes/Projects/kibana/packages/kbn-docs-utils/src/build_api_declarations/build_api_declaration.test.ts"
+      },
+      {
+        "count": 5,
+        "name": "/Volumes/Projects/d3-force/test/find-test.js"
+      },
+      {
+        "count": 4,
+        "name": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/transform_path_file.js"
+      },
+      {
+        "count": 4,
+        "name": "/Volumes/Projects/kibana/.buildkite/scripts/steps/entity_store_performance/generate_performance_report.sh"
+      },
+      {
+        "count": 3,
+        "name": "/Volumes/Projects/dagre/dist/dagre.cjs.js"
+      },
+      {
+        "count": 3,
+        "name": "/Volumes/Projects/dagre/dist/dagre.esm.js"
+      },
+      {
+        "count": 3,
+        "name": "/Volumes/Projects/dagre/dist/dagre.js"
+      }
+    ],
+    "heuristic": [
+      {
+        "count": 163,
+        "name": "unrelated_member_suffix_match+arity_match"
+      },
+      {
+        "count": 21,
+        "name": "unrelated_member_suffix_match"
+      },
+      {
+        "count": 16,
+        "name": "bare_name_match"
+      }
+    ]
+  },
+  "candidate_eligible": 200,
+  "candidate_filtered_hidden": 18091,
+  "candidate_has_more": true,
+  "candidate_max_bytes": 4096,
+  "candidate_results": [
+    {
+      "arg_count": 1,
+      "caller": "retriedJob",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/pipeline-utils/buildkite/client.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 259
+    },
+    {
+      "arg_count": 1,
+      "caller": "existingComment",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/pipeline-utils/github/github.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 161
+    },
+    {
+      "arg_count": 1,
+      "caller": "getVersionsFile",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/pipeline-utils/utils.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 57
+    },
+    {
+      "arg_count": 1,
+      "caller": "rawEvaluationConnectorId",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/pipelines/evals/eval_pipeline.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 216
+    },
+    {
+      "arg_count": 1,
+      "caller": "group",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/pipelines/flaky_tests/pipeline.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 387
+    },
+    {
+      "arg_count": 1,
+      "caller": "matchedChromeConfig",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/entry.js",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 181
+    },
+    {
+      "arg_count": 1,
+      "caller": "match",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/entry.js",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 260
+    },
+    {
+      "arg_count": 2,
+      "caller": "packagesPropertyDefinition",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/transform_path_file.js",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 61
+    },
+    {
+      "arg_count": 2,
+      "caller": "packagesPropertyDefinition",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/transform_path_file.js",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 61
+    },
+    {
+      "arg_count": 1,
+      "caller": "packagesArray",
+      "confidence": 0.36000000000000004,
+      "file": "/Volumes/Projects/kibana/.buildkite/scripts/pipelines/chromium_linux_build/issue_feedback/transform_path_file.js",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 74
+    }
+  ],
+  "candidate_source": "refs",
+  "candidate_total": 18101,
+  "eligible_candidates": 200,
+  "exact_total": 0,
+  "filtered_hidden": 18091,
+  "has_more": false,
+  "max_bytes": 4096,
+  "response_mode": "lean",
+  "results": [],
+  "top_n": 10,
+  "total": 18101,
+  "total_candidates": 18101
+}
