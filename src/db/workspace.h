@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <utility>
 
 namespace codetopo {
 
@@ -39,6 +40,7 @@ private:
     Connection conn_;
     void ensure_schema();
     void merge_root_attached(int64_t root_id, const std::string& root_path);
+    std::pair<int64_t, int64_t> resolve_workspace_refs(int64_t added_root_id);
     void populate_content_fts_for_root(int64_t root_id);
     void resume_pending_content_fts();
 };
