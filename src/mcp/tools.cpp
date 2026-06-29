@@ -2996,6 +2996,10 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
     if (limit > 500) limit = 500;
 
+    double min_confidence = params ? json_get_double(params, "min_confidence", 0.0) : 0.0;
+    if (min_confidence < 0.0) min_confidence = 0.0;
+    if (min_confidence > 1.0) min_confidence = 1.0;
+
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
     bool compact = params ? json_get_bool(params, "compact", false) : false;
     CandidateMode candidate_mode = parse_candidate_mode(params);
@@ -3020,16 +3024,31 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
             exact_total = sqlite3_column_int64(count_stmt, 0);
     }
 
-    auto* stmt = cache.get("callers_approx",
-        "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
-        "FROM edges e "
-        "JOIN nodes n ON e.src_id = n.id "
-        "LEFT JOIN files f ON n.file_id = f.id "
-        "WHERE e.dst_id = ? AND e.kind = 'calls' "
-        "ORDER BY e.confidence DESC LIMIT ?");
-
-    sqlite3_bind_int64(stmt, 1, node_id);
-    sqlite3_bind_int64(stmt, 2, exact_limit);
+    // Use min_confidence to filter — if non-zero, use a separate parameterized statement
+    sqlite3_stmt* stmt = nullptr;
+    if (min_confidence > 0.0) {
+        sqlite3_prepare_v2(conn.raw(),
+            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
+            "FROM edges e "
+            "JOIN nodes n ON e.src_id = n.id "
+            "LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE e.dst_id = ? AND e.kind = 'calls' AND e.confidence >= ? "
+            "ORDER BY e.confidence DESC LIMIT ?",
+            -1, &stmt, nullptr);
+        sqlite3_bind_int64(stmt, 1, node_id);
+        sqlite3_bind_double(stmt, 2, min_confidence);
+        sqlite3_bind_int64(stmt, 3, exact_limit);
+    } else {
+        stmt = cache.get("callers_approx",
+            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
+            "FROM edges e "
+            "JOIN nodes n ON e.src_id = n.id "
+            "LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE e.dst_id = ? AND e.kind = 'calls' "
+            "ORDER BY e.confidence DESC LIMIT ?");
+        sqlite3_bind_int64(stmt, 1, node_id);
+        sqlite3_bind_int64(stmt, 2, exact_limit);
+    }
 
     // Collect raw results
     struct CallerRow {
@@ -3057,6 +3076,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         r.confidence = sqlite3_column_double(stmt, 7);
         rows.push_back(std::move(r));
     }
+    if (min_confidence > 0.0 && stmt) sqlite3_finalize(stmt);
     CallsiteCandidateSet candidates;
     if (should_collect_candidates(candidate_mode, rows.empty()))
         candidates = collect_callsite_candidates(

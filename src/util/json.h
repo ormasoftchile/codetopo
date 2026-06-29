@@ -93,6 +93,15 @@ inline int64_t json_get_int(yyjson_val* obj, const char* key, int64_t def = 0) {
     return val ? yyjson_get_sint(val) : def;
 }
 
+// Helper: get double from object
+inline double json_get_double(yyjson_val* obj, const char* key, double def = 0.0) {
+    yyjson_val* val = yyjson_obj_get(obj, key);
+    if (!val) return def;
+    if (yyjson_is_real(val)) return yyjson_get_real(val);
+    if (yyjson_is_int(val)) return static_cast<double>(yyjson_get_sint(val));
+    return def;
+}
+
 // Helper: get bool from object
 inline bool json_get_bool(yyjson_val* obj, const char* key, bool def = false) {
     yyjson_val* val = yyjson_obj_get(obj, key);
