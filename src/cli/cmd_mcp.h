@@ -67,7 +67,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                    int tool_timeout, int idle_timeout,
                    FreshnessPolicy freshness = FreshnessPolicy::normal,
                    int debounce_ms = 1000,
-                   bool watch = false) {
+                   bool watch = false,
+                   const std::string& trajectory_log = "") {
     namespace fs = std::filesystem;
 
     // Warn about legacy workspace.sqlite — it is no longer used.
@@ -130,6 +131,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     // lazy and off: no startup reindex
 
     McpServer server(conn, repo_root, tool_timeout, idle_timeout);
+    if (!trajectory_log.empty()) {
+        server.set_trajectory_log(trajectory_log);
+        mcp_log("trajectory: logging to " + trajectory_log);
+    }
 
     // Register all tools with descriptions and parameter schemas
     server.register_tool("server_info", tools::server_info,

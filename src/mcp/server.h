@@ -12,6 +12,7 @@
 #include <functional>
 #include <unordered_map>
 #include <iostream>
+#include <fstream>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -40,6 +41,13 @@ public:
         : conn_(conn), repo_root_(repo_root)
         , tool_timeout_s_(tool_timeout_s), idle_timeout_s_(idle_timeout_s)
         , cache_(conn), start_time_(std::chrono::steady_clock::now()) {}
+
+    // Optional trajectory log: when set, each tool call + result is appended as JSONL.
+    void set_trajectory_log(const std::string& path) {
+        traj_path_ = path;
+        traj_file_.open(path, std::ios::app);
+        if (!traj_file_) mcp_log("warn: could not open trajectory log: " + path);
+    }
 
     // P2: Thread-safe flag — set from watcher's reindex-complete callback,
     // consumed on the main stdio thread before each tool dispatch.
@@ -170,6 +178,29 @@ public:
                     done += ")";
                     mcp_log(done);
                     write_result(id, result, staleness_.stale ? &staleness_ : nullptr);
+
+                    // Trajectory logging: append {tool, arguments, result} as JSONL
+                    if (traj_file_.is_open()) {
+                        JsonMutDoc entry;
+                        auto* obj = entry.new_obj();
+                        entry.set_root(obj);
+                        yyjson_mut_obj_add_str(entry.doc, obj, "tool", tool_name);
+                        if (tool_params) {
+                            auto* args_copy = yyjson_val_mut_copy(entry.doc, tool_params);
+                            if (args_copy) yyjson_mut_obj_add_val(entry.doc, obj, "arguments", args_copy);
+                        }
+                        // Parse result JSON and embed it (fall back to raw string)
+                        auto result_doc = json_parse(result);
+                        if (result_doc) {
+                            auto* result_copy = yyjson_val_mut_copy(entry.doc, result_doc.root());
+                            if (result_copy) yyjson_mut_obj_add_val(entry.doc, obj, "result", result_copy);
+                        } else {
+                            yyjson_mut_obj_add_strcpy(entry.doc, obj, "result", result.c_str());
+                        }
+                        traj_file_ << entry.to_string() << "\n";
+                        traj_file_.flush();
+                    }
+
                 } catch (const std::exception& e) {
                     auto elapsed = std::chrono::steady_clock::now() - started;
                     mcp_log("error: " + std::string(tool_name) + " (" + format_duration_ms(elapsed) + "): "
@@ -430,6 +461,9 @@ private:
         staleness_.stale = !staleness_.indexed_head.empty()
                         && staleness_.indexed_head != current_head;
     }
+
+    std::string traj_path_;
+    std::ofstream traj_file_;
 };
 
 } // namespace codetopo
