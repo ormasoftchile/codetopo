@@ -396,6 +396,49 @@ TEST_CASE("callers_approx uses exact edges for uniquely named symbols",
     }
 }
 
+TEST_CASE("callers_approx keeps same-file candidates when exact callers are only file nodes",
+          "[unit][approx-callgraph]") {
+    TestDb db;
+    db.root = fs::path("build") / "test_approx_callgraph" / "hof-file-edge";
+    cleanup(db.root);
+    fs::create_directories(db.root);
+    db.db_path = db.root / "codetopo.sqlite";
+
+    Connection conn(db.db_path);
+    schema::ensure_schema(conn);
+
+    int64_t src_file = insert_file(conn, "src/layout.js");
+    int64_t bundled_file_node = insert_file_node(conn, "dist/dagre.js");
+    int64_t layout = insert_symbol(conn, src_file, "function", "layout", "layout", 4, 8, "function layout(g)");
+    int64_t run_layout = insert_symbol(conn, src_file, "function", "runLayout", "runLayout", 1, 3, "function runLayout(g)");
+    insert_call_ref(conn, src_file, "runLayout", 6, 5, 17, layout, 1, "unknown");
+    insert_edge(conn, bundled_file_node, run_layout, "calls", 0.7);
+
+    schema::set_kv(conn, "schema_version", "1");
+    schema::set_kv(conn, "indexer_version", "test");
+    schema::set_kv(conn, "repo_root", db.root.string());
+    schema::set_kv(conn, "last_index_time", "2026-06-28T22:59:24-04:00");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers(db, run_layout);
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+
+    auto* results = require_array_field(doc.root(), "results");
+    REQUIRE(yyjson_arr_size(results) == 1);
+    auto* exact = yyjson_arr_get_first(results);
+    REQUIRE(exact != nullptr);
+    REQUIRE(json_get_str(exact, "caller_name") != nullptr);
+    CHECK(std::string(json_get_str(exact, "caller_name")) == "dist/dagre.js");
+
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* candidate = find_item_with_string(candidates, "callee_text", "runLayout");
+    REQUIRE(candidate != nullptr);
+    REQUIRE(json_get_str(candidate, "caller_name") != nullptr);
+    CHECK(std::string(json_get_str(candidate, "caller_name")) == "layout");
+    CHECK(std::string(json_get_str(candidate, "file_path")) == "src/layout.js");
+}
+
 TEST_CASE("callers_approx candidate results respect max_bytes budget",
           "[unit][approx-callgraph]") {
     auto db = make_approx_db("candidate-budget", false, 200);

@@ -3077,8 +3077,13 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         rows.push_back(std::move(r));
     }
     if (min_confidence > 0.0 && stmt) sqlite3_finalize(stmt);
+    bool has_symbol_exact_callers = std::any_of(rows.begin(), rows.end(), [](const CallerRow& row) {
+        return row.kind != "file";
+    });
+    bool collect_candidates = candidate_mode == CandidateMode::ExactPlusCandidates
+        || (candidate_mode == CandidateMode::ExactThenCandidates && !has_symbol_exact_callers);
     CallsiteCandidateSet candidates;
-    if (should_collect_candidates(candidate_mode, rows.empty()))
+    if (collect_candidates)
         candidates = collect_callsite_candidates(
             node_id, lean_response ? top_n : limit, conn, cache, candidate_options, repo_root);
 
@@ -3125,7 +3130,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_val(doc.doc, root, "results", exact_results);
         yyjson_mut_obj_add_bool(doc.doc, root, "has_more", exact_total > static_cast<int64_t>(rows.size()));
 
-        if (!candidates.rows.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
+        if (!candidates.rows.empty() || collect_candidates) {
             auto* candidate_results = doc.new_arr();
             for (const auto& candidate : candidates.rows)
                 yyjson_mut_arr_append(candidate_results, emit_callsite_candidate_lean(doc, candidate));
@@ -3177,7 +3182,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_bool(doc.doc, root, "has_more", false);
     }
 
-    if (!candidates.rows.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
+    if (!candidates.rows.empty() || collect_candidates) {
         auto* candidate_results = doc.new_arr();
         for (const auto& candidate : candidates.rows)
             yyjson_mut_arr_append(candidate_results,
