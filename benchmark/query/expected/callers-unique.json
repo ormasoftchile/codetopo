@@ -1,0 +1,180 @@
+{
+  "arity_filtered": 0,
+  "candidate_arity_filtered": 0,
+  "candidate_buckets": {
+    "arg_count": {
+      "\u0000": {
+        "count": 2,
+        "top_files": [
+          {
+            "count": 1,
+            "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/find_legacy_url_aliases.ts"
+          },
+          {
+            "count": 1,
+            "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/utils/find_shared_origin_objects.ts"
+          }
+        ]
+      }
+    },
+    "file": [
+      {
+        "count": 3,
+        "name": "/Volumes/Projects/kibana/x-pack/platform/plugins/shared/alerting/server/backfill_client/backfill_client.ts"
+      },
+      {
+        "count": 3,
+        "name": "/Volumes/Projects/kibana/x-pack/platform/plugins/shared/cases/server/services/attachments/operations/get.ts"
+      },
+      {
+        "count": 2,
+        "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/open_point_in_time.test.ts"
+      },
+      {
+        "count": 2,
+        "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/saved_objects_client.test.ts"
+      },
+      {
+        "count": 2,
+        "name": "/Volumes/Projects/kibana/src/platform/plugins/private/kibana_usage_collection/server/collectors/application_usage/rollups/total.ts"
+      },
+      {
+        "count": 2,
+        "name": "/Volumes/Projects/kibana/src/platform/plugins/private/kibana_usage_collection/server/collectors/application_usage/telemetry_application_usage_collector.ts"
+      },
+      {
+        "count": 1,
+        "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/internals/find_legacy_url_aliases.ts"
+      },
+      {
+        "count": 1,
+        "name": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/utils/find_shared_origin_objects.ts"
+      }
+    ],
+    "heuristic": [
+      {
+        "count": 58,
+        "name": "unrelated_member_suffix_match+arity_match"
+      },
+      {
+        "count": 2,
+        "name": "bare_name_match+arity_match"
+      },
+      {
+        "count": 2,
+        "name": "cross_file_receiver_type_exact+arity_match"
+      },
+      {
+        "count": 1,
+        "name": "receiver_bare_target_owner+arity_match"
+      }
+    ]
+  },
+  "candidate_eligible": 63,
+  "candidate_filtered_hidden": 53,
+  "candidate_has_more": true,
+  "candidate_max_bytes": 4096,
+  "candidate_results": [
+    {
+      "arg_count": 1,
+      "caller": "result",
+      "confidence": 0.99,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/open_point_in_time.test.ts",
+      "heuristic": "cross_file_receiver_type_exact+arity_match",
+      "line": 211,
+      "receiver": "repository",
+      "receiver_type": "SavedObjectsRepository",
+      "receiver_type_resolved": true,
+      "resolved_receiver_type": "SavedObjectsRepository"
+    },
+    {
+      "arg_count": 2,
+      "confidence": 0.99,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/apis/open_point_in_time.test.ts",
+      "heuristic": "cross_file_receiver_type_exact+arity_match",
+      "line": 227,
+      "receiver": "repository",
+      "receiver_type": "SavedObjectsRepository",
+      "receiver_type_resolved": true,
+      "resolved_receiver_type": "SavedObjectsRepository"
+    },
+    {
+      "arg_count": 1,
+      "caller": "adHocRunFinder",
+      "confidence": 0.78,
+      "file": "/Volumes/Projects/kibana/x-pack/platform/plugins/shared/alerting/server/backfill_client/backfill_client.ts",
+      "heuristic": "receiver_bare_target_owner+arity_match",
+      "line": 605,
+      "receiver": "await savedObjectsRepository",
+      "receiver_type": "SavedObjectsRepository"
+    },
+    {
+      "arg_count": 1,
+      "caller": "result",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/saved_objects_client.test.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 98
+    },
+    {
+      "arg_count": 2,
+      "caller": "result",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/saved_objects_client.test.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 119
+    },
+    {
+      "arg_count": 2,
+      "caller": "createPointInTimeFinder",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/saved_objects_client.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 206
+    },
+    {
+      "arg_count": 1,
+      "caller": "finder",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/import-export-server-internal/src/export/saved_objects_exporter.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 162
+    },
+    {
+      "arg_count": 1,
+      "caller": "finder",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/platform/plugins/private/ftr_apis/server/routes/kbn_client_so/clean.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 36
+    },
+    {
+      "arg_count": 1,
+      "caller": "usageTotalsFinder",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/platform/plugins/private/kibana_usage_collection/server/collectors/application_usage/rollups/total.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 28
+    },
+    {
+      "arg_count": 1,
+      "caller": "usageDailyFinder",
+      "confidence": 0.46,
+      "file": "/Volumes/Projects/kibana/src/platform/plugins/private/kibana_usage_collection/server/collectors/application_usage/rollups/total.ts",
+      "heuristic": "unrelated_member_suffix_match+arity_match",
+      "line": 51
+    }
+  ],
+  "candidate_source": "refs",
+  "candidate_total": 63,
+  "eligible_candidates": 63,
+  "exact_total": 0,
+  "filtered_hidden": 53,
+  "has_more": false,
+  "max_bytes": 4096,
+  "response_mode": "lean",
+  "results": [],
+  "top_n": 10,
+  "total": 63,
+  "total_candidates": 63
+}

@@ -1,0 +1,20 @@
+{
+  "id": "field-access",
+  "description": "Search codetopo's own source for .confidence field access",
+  "category": "field_access",
+  "repo_root": "/Volumes/Projects/codetopo",
+  "tool": "code_search",
+  "params": {
+    "query": ".confidence",
+    "limit": 20
+  },
+  "expected": {
+    "min_total_matches": 20,
+    "max_total_matches": 25,
+    "min_total_files": 5,
+    "max_total_files": 5,
+    "max_duration_seconds": 1.0
+  },
+  "grep_equivalent": "grep -rn '\\.confidence' src tests",
+  "benchmark_notes": "Verified 2026-06-29 against the codetopo repo. code_search returned 21 matches across 5 files."
+}

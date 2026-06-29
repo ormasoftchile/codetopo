@@ -63,6 +63,8 @@ doctor-*.txt
 !package.json
 !CMakePresets.json
 !vcpkg.json
+!benchmark/query/tasks/*.json
+!benchmark/query/expected/*.json
 
 # Scratch/notes files
 *.md
@@ -92,3 +94,7 @@ image.png
 .squad/sessions/
 .squad-workstream
 .squad/.cache/
+
+# Query benchmark run output
+benchmark/query/results/*
+!benchmark/query/results/.gitkeep

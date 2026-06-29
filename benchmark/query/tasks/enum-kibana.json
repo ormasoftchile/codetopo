@@ -1,0 +1,43 @@
+{
+  "id": "enum-kibana",
+  "description": "Enumerate classes, interfaces, and type aliases in Kibana saved-objects internal lib",
+  "category": "enumeration",
+  "repo_root": "/Volumes/Projects/triton",
+  "tool": "symbols_in_path",
+  "params": {
+    "path": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib",
+    "kind": [
+      "class",
+      "interface",
+      "type_alias"
+    ],
+    "recursive": true,
+    "limit": 200
+  },
+  "expected": {
+    "min_total": 73,
+    "max_total": 73,
+    "kind_distribution": {
+      "interface": {
+        "min": 44,
+        "max": 44
+      },
+      "type_alias": {
+        "min": 21,
+        "max": 21
+      },
+      "class": {
+        "min": 8,
+        "max": 8
+      }
+    },
+    "must_contain_names": [
+      "PerformBulkCreateParams",
+      "CommonHelper",
+      "ChangeAccessControlActionType"
+    ],
+    "must_not_contain_names": []
+  },
+  "grep_equivalent": "grep -rnE '^(export )?(interface|class|type )' /Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib",
+  "benchmark_notes": "Verified 2026-06-29 against the /Volumes/Projects/triton workspace. codetopo returned 73 symbols: 44 interfaces, 21 type_aliases, 8 classes."
+}

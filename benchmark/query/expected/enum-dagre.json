@@ -1,0 +1,276 @@
+{
+  "filtered_hidden": 618,
+  "has_more": false,
+  "hidden_public_count": 148,
+  "limit": 200,
+  "max_bytes": 16000,
+  "min_span_lines_lossy": false,
+  "offset": 0,
+  "path": "/Volumes/Projects/dagre/lib",
+  "recursive": true,
+  "results": [
+    {
+      "file": "/Volumes/Projects/dagre/lib/data/list.ts",
+      "kind": "interface",
+      "name": "ListNode",
+      "start_line": 6
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/data/list.ts",
+      "kind": "class",
+      "name": "List",
+      "start_line": 13
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/greedy-fas.ts",
+      "kind": "interface",
+      "name": "FASEntry",
+      "start_line": 15
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/greedy-fas.ts",
+      "kind": "interface",
+      "name": "FASState",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/layout.ts",
+      "kind": "interface",
+      "name": "SelfEdge",
+      "start_line": 15
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/layout.ts",
+      "kind": "interface",
+      "name": "ExtendedNodeLabel",
+      "start_line": 20
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/layout.ts",
+      "kind": "interface",
+      "name": "SelfEdgeNodeLabel",
+      "start_line": 24
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/layout.ts",
+      "kind": "interface",
+      "name": "EdgeProxyNodeLabel",
+      "start_line": 29
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/barycenter.ts",
+      "kind": "interface",
+      "name": "BarycenterEntry",
+      "start_line": 3
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/build-layer-graph.ts",
+      "kind": "interface",
+      "name": "LayerGraphLabel",
+      "start_line": 5
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/cross-count.ts",
+      "kind": "interface",
+      "name": "SouthEntry",
+      "start_line": 28
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/index.ts",
+      "kind": "interface",
+      "name": "OrderOptions",
+      "start_line": 10
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/resolve-conflicts.ts",
+      "kind": "interface",
+      "name": "BarycenterEntry",
+      "start_line": 4
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/resolve-conflicts.ts",
+      "kind": "interface",
+      "name": "MappedEntry",
+      "start_line": 10
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/resolve-conflicts.ts",
+      "kind": "interface",
+      "name": "ResolvedEntry",
+      "start_line": 22
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/sort-subgraph.ts",
+      "kind": "interface",
+      "name": "SubgraphResult",
+      "start_line": 6
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/sort-subgraph.ts",
+      "kind": "interface",
+      "name": "BarycenterEntry",
+      "start_line": 12
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/sort.ts",
+      "kind": "interface",
+      "name": "SortEntry",
+      "start_line": 3
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/order/sort.ts",
+      "kind": "interface",
+      "name": "SortResult",
+      "start_line": 10
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/parent-dummy-chains.ts",
+      "kind": "interface",
+      "name": "PostorderNum",
+      "start_line": 6
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/parent-dummy-chains.ts",
+      "kind": "interface",
+      "name": "PathData",
+      "start_line": 11
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/position/bk.ts",
+      "kind": "type_alias",
+      "name": "Conflicts",
+      "start_line": 23
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/position/bk.ts",
+      "kind": "type_alias",
+      "name": "PositionMap",
+      "start_line": 24
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/position/bk.ts",
+      "kind": "type_alias",
+      "name": "AlignmentResult",
+      "start_line": 25
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/position/bk.ts",
+      "kind": "type_alias",
+      "name": "XssMap",
+      "start_line": 26
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/rank/feasible-tree.ts",
+      "kind": "interface",
+      "name": "TreeNodeLabel",
+      "start_line": 6
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/rank/feasible-tree.ts",
+      "kind": "interface",
+      "name": "TreeEdgeLabel",
+      "start_line": 13
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "Point",
+      "start_line": 7
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "NodeLabel",
+      "start_line": 13
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "EdgeLabel",
+      "start_line": 45
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "GraphLabel",
+      "start_line": 72
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "NodeConfig",
+      "start_line": 94
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "EdgeConfig",
+      "start_line": 99
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "LayoutConfig",
+      "start_line": 108
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "OrderConstraint",
+      "start_line": 115
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "type_alias",
+      "name": "LayoutOptions",
+      "start_line": 121
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "type_alias",
+      "name": "RankerFunction",
+      "start_line": 124
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "type_alias",
+      "name": "WeightFunction",
+      "start_line": 125
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "type_alias",
+      "name": "TimingFunction",
+      "start_line": 126
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "type_alias",
+      "name": "WeightMap",
+      "start_line": 129
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "PartitionResult",
+      "start_line": 131
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "ListEntry",
+      "start_line": 136
+    },
+    {
+      "file": "/Volumes/Projects/dagre/lib/types.ts",
+      "kind": "interface",
+      "name": "Edge",
+      "start_line": 143
+    }
+  ],
+  "total": 43,
+  "total_candidates": 661,
+  "warnings": [
+    "kind filters hide public/API-like symbols; inspect total_candidates/hidden_public_count"
+  ]
+}

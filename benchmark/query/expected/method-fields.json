@@ -1,0 +1,37 @@
+{
+  "calls": [
+    {
+      "count": 1,
+      "first_line": 375,
+      "name": "end",
+      "relationship": "calls_external"
+    },
+    {
+      "count": 1,
+      "first_line": 332,
+      "name": "exists",
+      "relationship": "calls_external"
+    },
+    {
+      "count": 3,
+      "first_line": 333,
+      "name": "mcp_log",
+      "relationship": "calls_external"
+    },
+    {
+      "count": 1,
+      "first_line": 385,
+      "name": "truncate_for_log",
+      "relationship": "calls_external"
+    },
+    {
+      "count": 1,
+      "first_line": 385,
+      "name": "what",
+      "relationship": "calls_external"
+    }
+  ],
+  "fields": [],
+  "method_name": "run_query",
+  "node_id": 725
+}

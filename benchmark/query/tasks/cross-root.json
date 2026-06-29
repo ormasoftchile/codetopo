@@ -1,0 +1,19 @@
+{
+  "id": "cross-root",
+  "description": "Verify that Kibana's saved-objects internal lib is queryable as a Triton workspace root",
+  "category": "cross_root",
+  "repo_root": "/Volumes/Projects/triton",
+  "tool": "symbols_in_path",
+  "params": {
+    "path": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib",
+    "recursive": true,
+    "limit": 5000
+  },
+  "expected": {
+    "min_total": 3142,
+    "max_total": 3142,
+    "min_results_returned": 1
+  },
+  "grep_equivalent": "find /Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib -type f | wc -l",
+  "benchmark_notes": "Verified 2026-06-29 against the /Volumes/Projects/triton workspace. symbols_in_path returned a total of 3,142 symbols from Kibana's saved-objects internal lib."
+}

@@ -1,0 +1,26 @@
+{
+  "id": "callers-unique",
+  "description": "Measure real caller blast radius for Kibana's unique createPointInTimeFinder method",
+  "category": "callers",
+  "repo_root": "/Volumes/Projects/triton",
+  "tool": "callers_approx",
+  "params": {
+    "symbol": "createPointInTimeFinder",
+    "file": "/Volumes/Projects/kibana/src/core/packages/saved-objects/api-server-internal/src/lib/repository.ts",
+    "response_mode": "lean",
+    "limit": 100,
+    "top_n": 10
+  },
+  "expected": {
+    "total_field": "candidate_total",
+    "confidence_array_field": "candidate_results",
+    "min_total": 60,
+    "max_total": 70,
+    "min_max_confidence": 0.7,
+    "must_contain_callers": [
+      "adHocRunFinder"
+    ]
+  },
+  "grep_equivalent": "grep -rn 'createPointInTimeFinder\\s*\\(' /Volumes/Projects/kibana",
+  "benchmark_notes": "Verified 2026-06-29 against Kibana's saved-objects repository.createPointInTimeFinder. codetopo returned 63 candidates with a 0.99 max confidence and a real production caller named adHocRunFinder at 0.78."
+}

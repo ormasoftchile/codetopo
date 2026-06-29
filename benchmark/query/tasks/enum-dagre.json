@@ -1,0 +1,43 @@
+{
+  "id": "enum-dagre",
+  "description": "Enumerate all structural types in dagre/lib",
+  "category": "enumeration",
+  "repo_root": "/Volumes/Projects/triton",
+  "tool": "symbols_in_path",
+  "params": {
+    "path": "/Volumes/Projects/dagre/lib",
+    "kind": [
+      "class",
+      "interface",
+      "type_alias"
+    ],
+    "recursive": true,
+    "limit": 200
+  },
+  "expected": {
+    "min_total": 43,
+    "max_total": 43,
+    "kind_distribution": {
+      "interface": {
+        "min": 33,
+        "max": 33
+      },
+      "type_alias": {
+        "min": 9,
+        "max": 9
+      },
+      "class": {
+        "min": 1,
+        "max": 1
+      }
+    },
+    "must_contain_names": [
+      "LayoutOptions",
+      "RankerFunction",
+      "Conflicts"
+    ],
+    "must_not_contain_names": []
+  },
+  "grep_equivalent": "grep -rnE '^(export )?(interface|class|type )' /Volumes/Projects/dagre/lib",
+  "benchmark_notes": "Verified 2026-06-29 against the /Volumes/Projects/triton workspace. codetopo returned 43 symbols: 33 interfaces, 9 type_aliases, 1 class."
+}

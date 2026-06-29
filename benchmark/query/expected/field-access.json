@@ -1,0 +1,122 @@
+{
+  "files_returned": 5,
+  "max_bytes": 16000,
+  "results": [
+    {
+      "file": "src/index/persister.h",
+      "match_count": 1,
+      "matches": [
+        {
+          "line": 429,
+          "text": "                    if (edge.confidence < 0.3) continue;  // FR-044"
+        }
+      ]
+    },
+    {
+      "file": "src/mcp/tools.cpp",
+      "match_count": 14,
+      "matches": [
+        {
+          "line": 974,
+          "text": "            row.confidence = 0.90;"
+        },
+        {
+          "line": 977,
+          "text": "            row.confidence = 0.82;"
+        },
+        {
+          "line": 980,
+          "text": "            row.confidence = 0.72;"
+        },
+        {
+          "line": 989,
+          "text": "            row.confidence = receiver_type_match == ReceiverMatchStrength::Exact ? 0.93 : 0.86;"
+        },
+        {
+          "line": 995,
+          "text": "            row.confidence = receiver_type_match == ReceiverMatchStrength::Exact ? 0.89 : 0.81;"
+        },
+        {
+          "line": 1004,
+          "text": "        row.confidence = 0.68;"
+        },
+        {
+          "line": 1009,
+          "text": "        row.confidence = 0.40;"
+        },
+        {
+          "line": 1013,
+          "text": "        row.confidence = 0.35;"
+        },
+        {
+          "line": 1019,
+          "text": "        row.confidence = std::max(0.20, row.confidence - 0.10);"
+        },
+        {
+          "line": 1037,
+          "text": "    row.confidence = std::min(0.99, row.confidence + 0.06);"
+        },
+        {
+          "line": 1042,
+          "text": "        row.confidence = std::min(0.99, row.confidence + bonus);"
+        },
+        {
+          "line": 1227,
+          "text": "        if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;"
+        },
+        {
+          "line": 1300,
+          "text": "    yyjson_mut_obj_add_real(doc.doc, item, \"confidence\", row.confidence);"
+        },
+        {
+          "line": 1316,
+          "text": "    yyjson_mut_obj_add_real(doc.doc, item, \"confidence\", row.confidence);"
+        }
+      ]
+    },
+    {
+      "file": "tests/unit/test_dec039_optimizations.cpp",
+      "match_count": 2,
+      "matches": [
+        {
+          "line": 87,
+          "text": "        edge.confidence = 1.0;"
+        },
+        {
+          "line": 458,
+          "text": "            edge.confidence = 0.9;"
+        }
+      ]
+    },
+    {
+      "file": "tests/unit/test_file_summary_nodeid.cpp",
+      "match_count": 3,
+      "matches": [
+        {
+          "line": 69,
+          "text": "        edge.confidence = 1.0;"
+        },
+        {
+          "line": 173,
+          "text": "        ExtractedEdge e1; e1.src_index = -1; e1.dst_index = 0; e1.kind = \"contains\"; e1.confidence = 1.0;"
+        },
+        {
+          "line": 174,
+          "text": "        ExtractedEdge e2; e2.src_index = -1; e2.dst_index = 1; e2.kind = \"contains\"; e2.confidence = 1.0;"
+        }
+      ]
+    },
+    {
+      "file": "tests/unit/test_persist_optimizations.cpp",
+      "match_count": 1,
+      "matches": [
+        {
+          "line": 72,
+          "text": "        edge.confidence = 1.0;"
+        }
+      ]
+    }
+  ],
+  "total_files": 5,
+  "total_matches": 21
+}
