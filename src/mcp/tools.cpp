@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <cctype>
 
 namespace codetopo {
 namespace tools {
@@ -272,6 +273,310 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache&
     sqlite3_bind_text(stmt, 2, yyjson_get_str(file_val), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) == SQLITE_ROW) return sqlite3_column_int64(stmt, 0);
     return -1;
+}
+
+enum class CandidateMode {
+    ExactOnly,
+    ExactThenCandidates,
+    ExactPlusCandidates
+};
+
+struct CallsiteCandidate {
+    int64_t ref_id = -1;
+    int64_t caller_node_id = -1;
+    std::string caller_name;
+    std::string caller_qualname;
+    std::string file_path;
+    std::string callee_text;
+    std::string receiver_hint;
+    std::string receiver_type_hint;
+    std::string heuristic;
+    std::string why;
+    std::string evidence;
+    int start_line = 0;
+    int start_col = 0;
+    int end_line = 0;
+    int end_col = 0;
+    double confidence = 0.0;
+};
+
+struct TargetCallsiteInfo {
+    std::string name;
+    std::string qualname;
+    std::string owner_name;
+    std::string owner_qualname;
+};
+
+static std::string lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool iequals(const std::string& lhs, const std::string& rhs) {
+    return lower_copy(lhs) == lower_copy(rhs);
+}
+
+static std::string trim_receiver_hint(std::string s) {
+    while (!s.empty() && (s.back() == '?' || std::isspace(static_cast<unsigned char>(s.back()))))
+        s.pop_back();
+    size_t first = 0;
+    while (first < s.size() && std::isspace(static_cast<unsigned char>(s[first]))) ++first;
+    if (first > 0) s.erase(0, first);
+    return s;
+}
+
+static std::string trailing_identifier(const std::string& text) {
+    if (text.empty()) return {};
+    size_t end = text.size();
+    while (end > 0) {
+        unsigned char c = static_cast<unsigned char>(text[end - 1]);
+        if (std::isalnum(c) || c == '_') break;
+        --end;
+    }
+    size_t start = end;
+    while (start > 0) {
+        unsigned char c = static_cast<unsigned char>(text[start - 1]);
+        if (!(std::isalnum(c) || c == '_')) break;
+        --start;
+    }
+    return text.substr(start, end - start);
+}
+
+static std::string qualname_owner(const std::string& qualname) {
+    if (qualname.empty()) return {};
+    size_t pos = std::string::npos;
+    for (const char* sep : {"::", ".", "#", "/"}) {
+        size_t p = qualname.rfind(sep);
+        if (p != std::string::npos && (pos == std::string::npos || p > pos)) pos = p;
+    }
+    if (pos == std::string::npos) return {};
+    return qualname.substr(0, pos);
+}
+
+static CandidateMode parse_candidate_mode(yyjson_val* params) {
+    CandidateMode mode = CandidateMode::ExactThenCandidates;
+    if (!params) return mode;
+
+    if (auto* mode_val = yyjson_obj_get(params, "mode")) {
+        if (yyjson_is_str(mode_val)) {
+            std::string raw = yyjson_get_str(mode_val);
+            if (raw == "exact") mode = CandidateMode::ExactOnly;
+            else if (raw == "exact_plus_candidates") mode = CandidateMode::ExactPlusCandidates;
+            else if (raw == "exact_then_candidates") mode = CandidateMode::ExactThenCandidates;
+        }
+    }
+
+    if (auto* include_val = yyjson_obj_get(params, "include_candidates")) {
+        if (yyjson_is_bool(include_val)) {
+            mode = yyjson_get_bool(include_val)
+                ? CandidateMode::ExactPlusCandidates
+                : CandidateMode::ExactOnly;
+        }
+    }
+    return mode;
+}
+
+static bool should_collect_candidates(CandidateMode mode, bool exact_empty) {
+    return mode == CandidateMode::ExactPlusCandidates
+        || (mode == CandidateMode::ExactThenCandidates && exact_empty);
+}
+
+static bool is_common_member_name(const std::string& name) {
+    static const std::unordered_set<std::string> common = {
+        "set", "get", "add", "remove", "delete", "dispose", "clear", "push",
+        "pop", "map", "filter", "find", "open", "close", "read", "write"
+    };
+    return common.count(lower_copy(name)) > 0;
+}
+
+static bool receiver_matches_owner(const std::string& receiver,
+                                   const TargetCallsiteInfo& target) {
+    if (receiver.empty()) return false;
+    std::string leaf = trailing_identifier(receiver);
+    std::string owner_leaf = trailing_identifier(target.owner_name);
+    std::string owner_qual_leaf = trailing_identifier(target.owner_qualname);
+    return (!target.owner_name.empty() &&
+            (iequals(receiver, target.owner_name) || (!leaf.empty() && iequals(leaf, owner_leaf)))) ||
+           (!target.owner_qualname.empty() &&
+            (iequals(receiver, target.owner_qualname) ||
+             (!leaf.empty() && iequals(leaf, owner_qual_leaf))));
+}
+
+static bool containing_context_matches_owner(const std::string& containing_name,
+                                             const std::string& containing_qualname,
+                                             const TargetCallsiteInfo& target) {
+    std::string containing_owner = qualname_owner(containing_qualname);
+    return (!target.owner_name.empty() &&
+            (iequals(containing_name, target.owner_name) ||
+             iequals(containing_owner, target.owner_name))) ||
+           (!target.owner_qualname.empty() &&
+            (iequals(containing_qualname, target.owner_qualname) ||
+             iequals(containing_owner, target.owner_qualname)));
+}
+
+static std::string extract_receiver_hint(const std::string& callee_text,
+                                         const std::string& target_name) {
+    if (target_name.empty() || callee_text.size() <= target_name.size()) return {};
+    auto ends_with = [&](const std::string& suffix) {
+        return callee_text.size() >= suffix.size() &&
+               callee_text.compare(callee_text.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
+    std::string suffix = "." + target_name;
+    if (ends_with(suffix))
+        return trim_receiver_hint(callee_text.substr(0, callee_text.size() - suffix.size()));
+    suffix = "::" + target_name;
+    if (ends_with(suffix))
+        return trim_receiver_hint(callee_text.substr(0, callee_text.size() - suffix.size()));
+    suffix = "->" + target_name;
+    if (ends_with(suffix))
+        return trim_receiver_hint(callee_text.substr(0, callee_text.size() - suffix.size()));
+    return {};
+}
+
+static void score_candidate(CallsiteCandidate& row,
+                            const TargetCallsiteInfo& target,
+                            const std::string& containing_name,
+                            const std::string& containing_qualname) {
+    bool has_receiver = !row.receiver_hint.empty();
+    bool strong_owner = receiver_matches_owner(row.receiver_hint, target);
+    bool this_in_owner = iequals(row.receiver_hint, "this") &&
+                         containing_context_matches_owner(containing_name, containing_qualname, target);
+
+    if (strong_owner) {
+        row.confidence = 0.75;
+        row.heuristic = "receiver_matches_target_owner";
+        row.receiver_type_hint = !target.owner_name.empty() ? target.owner_name : target.owner_qualname;
+        row.why = "call receiver text matches the target's containing type";
+    } else if (this_in_owner) {
+        row.confidence = 0.65;
+        row.heuristic = "this_receiver_in_target_owner";
+        row.receiver_type_hint = !target.owner_name.empty() ? target.owner_name : target.owner_qualname;
+        row.why = "this receiver appears inside the target's containing type";
+    } else if (has_receiver) {
+        row.confidence = 0.55;
+        row.heuristic = "member_suffix_match";
+        row.why = "call ref ends with the target member name";
+    } else {
+        row.confidence = 0.45;
+        row.heuristic = "bare_name_match";
+        row.why = "bare call ref matches the target name";
+    }
+
+    if (is_common_member_name(target.name) && !strong_owner && !this_in_owner) {
+        row.confidence = std::max(0.30, row.confidence - 0.05);
+        row.why += "; confidence reduced for common member name";
+    }
+}
+
+static std::vector<CallsiteCandidate> collect_callsite_candidates(
+        int64_t target_node_id, int64_t limit, Connection& conn, QueryCache& cache) {
+    std::vector<CallsiteCandidate> rows;
+    if (limit <= 0) return rows;
+    if (limit > 500) limit = 500;
+
+    TargetCallsiteInfo target;
+    auto* target_stmt = cache.get("approx_callsite_target",
+        "SELECT n.name, n.qualname, cn.name, cn.qualname "
+        "FROM nodes n "
+        "LEFT JOIN edges ce ON ce.dst_id = n.id AND ce.kind = 'contains' "
+        "LEFT JOIN nodes cn ON cn.id = ce.src_id "
+        "WHERE n.id = ? AND n.node_type = 'symbol' LIMIT 1");
+    sqlite3_bind_int64(target_stmt, 1, target_node_id);
+    if (sqlite3_step(target_stmt) != SQLITE_ROW) return rows;
+
+    auto* name_txt = sqlite3_column_text(target_stmt, 0);
+    if (!name_txt) return rows;
+    target.name = reinterpret_cast<const char*>(name_txt);
+    auto* qn_txt = sqlite3_column_text(target_stmt, 1);
+    target.qualname = qn_txt ? reinterpret_cast<const char*>(qn_txt) : "";
+    auto* owner_txt = sqlite3_column_text(target_stmt, 2);
+    target.owner_name = owner_txt ? reinterpret_cast<const char*>(owner_txt) : "";
+    auto* owner_qn_txt = sqlite3_column_text(target_stmt, 3);
+    target.owner_qualname = owner_qn_txt ? reinterpret_cast<const char*>(owner_qn_txt) : "";
+    if (target.owner_name.empty()) target.owner_name = trailing_identifier(qualname_owner(target.qualname));
+    if (target.owner_qualname.empty()) target.owner_qualname = qualname_owner(target.qualname);
+
+    auto like_dot = "%." + target.name;
+    auto like_colon = "%::" + target.name;
+    auto like_arrow = "%->" + target.name;
+    int64_t query_limit = std::min<int64_t>(1000, std::max<int64_t>(limit * 4, limit));
+
+    auto* stmt = cache.get("approx_callsite_candidates",
+        "SELECT r.id, r.name, f.path, r.start_line, r.start_col, r.end_line, r.end_col, "
+        "r.evidence, r.containing_node_id, cn.name, cn.qualname "
+        "FROM refs r "
+        "LEFT JOIN files f ON f.id = r.file_id "
+        "LEFT JOIN nodes cn ON cn.id = r.containing_node_id "
+        "WHERE r.kind = 'call' AND (r.name = ? OR r.name LIKE ? OR r.name LIKE ? OR r.name LIKE ?) "
+        "ORDER BY f.path, r.start_line, r.start_col LIMIT ?");
+    sqlite3_bind_text(stmt, 1, target.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, like_dot.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, like_colon.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, like_arrow.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, query_limit);
+
+    std::unordered_set<std::string> seen;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        CallsiteCandidate row;
+        row.ref_id = sqlite3_column_int64(stmt, 0);
+        auto* callee = sqlite3_column_text(stmt, 1);
+        row.callee_text = callee ? reinterpret_cast<const char*>(callee) : "";
+        auto* fp = sqlite3_column_text(stmt, 2);
+        row.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
+        row.start_line = sqlite3_column_int(stmt, 3);
+        row.start_col = sqlite3_column_int(stmt, 4);
+        row.end_line = sqlite3_column_int(stmt, 5);
+        row.end_col = sqlite3_column_int(stmt, 6);
+        auto* evidence = sqlite3_column_text(stmt, 7);
+        row.evidence = evidence ? reinterpret_cast<const char*>(evidence) : "";
+        row.caller_node_id = sqlite3_column_int64(stmt, 8);
+        auto* caller = sqlite3_column_text(stmt, 9);
+        row.caller_name = caller ? reinterpret_cast<const char*>(caller) : "";
+        auto* caller_qn = sqlite3_column_text(stmt, 10);
+        row.caller_qualname = caller_qn ? reinterpret_cast<const char*>(caller_qn) : "";
+        row.receiver_hint = extract_receiver_hint(row.callee_text, target.name);
+
+        std::string key = row.file_path + ":" + std::to_string(row.start_line) + ":" +
+                          std::to_string(row.start_col) + ":" + row.callee_text;
+        if (!seen.insert(key).second) continue;
+
+        score_candidate(row, target, row.caller_name, row.caller_qualname);
+        rows.push_back(std::move(row));
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;
+        if (lhs.file_path != rhs.file_path) return lhs.file_path < rhs.file_path;
+        if (lhs.start_line != rhs.start_line) return lhs.start_line < rhs.start_line;
+        return lhs.start_col < rhs.start_col;
+    });
+    if (static_cast<int64_t>(rows.size()) > limit) rows.resize(static_cast<size_t>(limit));
+    return rows;
+}
+
+static yyjson_mut_val* emit_callsite_candidate(JsonMutDoc& doc, const CallsiteCandidate& row) {
+    auto* item = doc.new_obj();
+    yyjson_mut_obj_add_int(doc.doc, item, "ref_id", row.ref_id);
+    if (row.caller_node_id > 0) yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", row.caller_node_id);
+    if (!row.caller_name.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", row.caller_name.c_str());
+    if (!row.caller_qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_qualname", row.caller_qualname.c_str());
+    if (!row.file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", row.file_path.c_str());
+    auto* span = doc.new_obj();
+    yyjson_mut_obj_add_int(doc.doc, span, "start_line", row.start_line);
+    yyjson_mut_obj_add_int(doc.doc, span, "start_col", row.start_col);
+    yyjson_mut_obj_add_int(doc.doc, span, "end_line", row.end_line);
+    yyjson_mut_obj_add_int(doc.doc, span, "end_col", row.end_col);
+    yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_text", row.callee_text.c_str());
+    if (!row.receiver_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_hint", row.receiver_hint.c_str());
+    if (!row.receiver_type_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_type_hint", row.receiver_type_hint.c_str());
+    yyjson_mut_obj_add_real(doc.doc, item, "confidence", row.confidence);
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "heuristic", row.heuristic.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "why", row.why.c_str());
+    if (!row.evidence.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", row.evidence.c_str());
+    return item;
 }
 
 // Resolves a user-supplied path to the canonical absolute path as stored in the DB.
@@ -541,6 +846,7 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
     yyjson_mut_arr_add_str(doc.doc, caps, "source_snippets");
     yyjson_mut_arr_add_str(doc.doc, caps, "context_for");
     yyjson_mut_arr_add_str(doc.doc, caps, "impact_of");
+    yyjson_mut_arr_add_str(doc.doc, caps, "approx_callgraph_candidates");
     yyjson_mut_arr_add_str(doc.doc, caps, "code_search");
     yyjson_mut_obj_add_val(doc.doc, root, "capabilities", caps);
 
@@ -1764,6 +2070,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
 
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
     bool compact = params ? json_get_bool(params, "compact", false) : false;
+    CandidateMode candidate_mode = parse_candidate_mode(params);
     (void)repo_root;
 
     auto* stmt = cache.get("callers_approx",
@@ -1803,6 +2110,9 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         r.confidence = sqlite3_column_double(stmt, 7);
         rows.push_back(std::move(r));
     }
+    auto candidates = should_collect_candidates(candidate_mode, rows.empty())
+        ? collect_callsite_candidates(node_id, limit, conn, cache)
+        : std::vector<CallsiteCandidate>();
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -1863,6 +2173,14 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
             yyjson_mut_arr_append(results, emit_caller_item(r));
         yyjson_mut_obj_add_val(doc.doc, root, "results", results);
         yyjson_mut_obj_add_bool(doc.doc, root, "has_more", false);
+    }
+
+    if (!candidates.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
+        auto* candidate_results = doc.new_arr();
+        for (const auto& candidate : candidates)
+            yyjson_mut_arr_append(candidate_results, emit_callsite_candidate(doc, candidate));
+        yyjson_mut_obj_add_val(doc.doc, root, "candidate_results", candidate_results);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_source", "refs");
     }
 
     return doc.to_string();
@@ -2306,6 +2624,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
     auto* max_callees_val = params ? yyjson_obj_get(params, "max_callees") : nullptr;
     int64_t max_callers = max_callers_val ? yyjson_get_sint(max_callers_val) : 10;
     int64_t max_callees = max_callees_val ? yyjson_get_sint(max_callees_val) : 10;
+    CandidateMode candidate_mode = parse_candidate_mode(params);
     if (max_source_lines < 0)
         return McpError::invalid_input("Invalid 'max_source_lines': must be >= 0").to_json_rpc(0);
     if (max_callers < 0)
@@ -2376,6 +2695,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
         row.confidence = sqlite3_column_double(callers_stmt, 3);
         caller_rows.push_back(std::move(row));
     }
+    bool exact_callers_empty = caller_rows.empty();
     bool callers_truncated = max_callers > 0 && static_cast<int64_t>(caller_rows.size()) > max_callers;
     if (callers_truncated) caller_rows.resize(static_cast<size_t>(max_callers));
 
@@ -2389,6 +2709,15 @@ std::string context_for(yyjson_val* params, Connection& conn,
     }
     yyjson_mut_obj_add_val(doc.doc, root, "callers", callers_arr);
     if (callers_truncated) yyjson_mut_obj_add_bool(doc.doc, root, "callers_truncated", true);
+    if (should_collect_candidates(candidate_mode, exact_callers_empty)) {
+        int64_t candidate_limit = max_callers > 0 ? max_callers : 500;
+        auto candidates = collect_callsite_candidates(node_id, candidate_limit, conn, cache);
+        auto* candidate_callers = doc.new_arr();
+        for (const auto& candidate : candidates)
+            yyjson_mut_arr_append(candidate_callers, emit_callsite_candidate(doc, candidate));
+        yyjson_mut_obj_add_val(doc.doc, root, "candidate_callers", candidate_callers);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_callers_source", "refs");
+    }
 
     // Callees
     auto* callees_stmt = cache.get("context_callees",
@@ -2704,6 +3033,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     if (depth > 3) depth = 3;
     int64_t max_nodes = params ? json_get_int(params, "max_nodes", 50) : 50;
     if (max_nodes > 200) max_nodes = 200;
+    CandidateMode candidate_mode = parse_candidate_mode(params);
 
     // BFS from node_id following reverse edges
     std::vector<int64_t> frontier = {node_id};
@@ -2731,6 +3061,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     auto* impacted = doc.new_arr();
     std::unordered_set<std::string> impacted_files;
     bool truncated = false;
+    bool exact_seed_inbound_call_found = false;
     int total = 0;
 
     for (int d = 1; d <= depth && !truncated; ++d) {
@@ -2746,6 +3077,9 @@ std::string impact_of(yyjson_val* params, Connection& conn,
 
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 int64_t src_id = sqlite3_column_int64(stmt, 0);
+                auto* kind_txt = sqlite3_column_text(stmt, 3);
+                const char* relationship = kind_txt ? reinterpret_cast<const char*>(kind_txt) : "";
+                if (d == 1 && strcmp(relationship, "calls") == 0) exact_seed_inbound_call_found = true;
                 if (visited.count(src_id)) continue;
                 visited.insert(src_id);
 
@@ -2762,8 +3096,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
                     yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", fpath.c_str());
                     impacted_files.insert(fpath);
                 }
-                yyjson_mut_obj_add_strcpy(doc.doc, item, "relationship",
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)));
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "relationship", relationship);
                 yyjson_mut_obj_add_int(doc.doc, item, "distance", d);
                 yyjson_mut_arr_append(impacted, item);
 
@@ -2775,6 +3108,25 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     }
 
     yyjson_mut_obj_add_val(doc.doc, root, "impacted", impacted);
+
+    if (should_collect_candidates(candidate_mode, !exact_seed_inbound_call_found)) {
+        auto candidates = collect_callsite_candidates(node_id, max_nodes, conn, cache);
+        auto* candidate_impacted = doc.new_arr();
+        std::unordered_set<std::string> candidate_files;
+        for (const auto& candidate : candidates) {
+            auto* item = emit_callsite_candidate(doc, candidate);
+            yyjson_mut_obj_add_str(doc.doc, item, "relationship", "calls_candidate");
+            yyjson_mut_obj_add_int(doc.doc, item, "distance", 1);
+            yyjson_mut_arr_append(candidate_impacted, item);
+            if (!candidate.file_path.empty()) candidate_files.insert(candidate.file_path);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "candidate_impacted", candidate_impacted);
+        auto* candidate_files_arr = doc.new_arr();
+        for (const auto& f : candidate_files)
+            yyjson_mut_arr_add_strcpy(doc.doc, candidate_files_arr, f.c_str());
+        yyjson_mut_obj_add_val(doc.doc, root, "candidate_impacted_files", candidate_files_arr);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_impacted_source", "refs");
+    }
 
     auto* files_arr = doc.new_arr();
     for (auto& f : impacted_files) {

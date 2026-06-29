@@ -1,0 +1,346 @@
+// Regression tests for refs-backed approximate call-site recovery.
+
+#include <catch2/catch_test_macros.hpp>
+#include "db/connection.h"
+#include "db/schema.h"
+#include "db/queries.h"
+#include "mcp/tools.h"
+#include "util/json.h"
+#include <filesystem>
+#include <string>
+
+namespace fs = std::filesystem;
+using namespace codetopo;
+
+namespace {
+
+void cleanup(const fs::path& p) {
+    std::error_code ec;
+    fs::remove_all(p, ec);
+}
+
+struct ApproxIds {
+    int64_t linked_set = 0;
+    int64_t use_linked = 0;
+    int64_t exact_set_caller = 0;
+    int64_t flush = 0;
+    int64_t flush_caller = 0;
+};
+
+struct TestDb {
+    fs::path root;
+    fs::path db_path;
+    ApproxIds ids;
+
+    TestDb() = default;
+    TestDb(const TestDb&) = delete;
+    TestDb& operator=(const TestDb&) = delete;
+    TestDb(TestDb&& other) noexcept
+        : root(std::move(other.root)), db_path(std::move(other.db_path)), ids(other.ids) {
+        other.root.clear();
+    }
+    TestDb& operator=(TestDb&& other) noexcept {
+        if (this != &other) {
+            cleanup(root);
+            root = std::move(other.root);
+            db_path = std::move(other.db_path);
+            ids = other.ids;
+            other.root.clear();
+        }
+        return *this;
+    }
+    ~TestDb() { cleanup(root); }
+};
+
+static void step_done(Connection& conn, sqlite3_stmt* stmt) {
+    int rc = sqlite3_step(stmt);
+    INFO(sqlite3_errmsg(conn.raw()));
+    REQUIRE(rc == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+}
+
+static int64_t insert_file(Connection& conn, const char* path) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status) "
+        "VALUES(?, 'typescript', 100, 1000000, ?, 'ok')",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+    std::string hash = std::string("hash:") + path;
+    sqlite3_bind_text(stmt, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(conn, stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
+static int64_t insert_symbol(Connection& conn, int64_t file_id, const char* kind,
+                             const char* name, const char* qualname,
+                             int start_line, int end_line) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO nodes(node_type, file_id, kind, name, qualname, start_line, end_line, stable_key) "
+        "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, file_id);
+    sqlite3_bind_text(stmt, 2, kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, qualname, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, start_line);
+    sqlite3_bind_int(stmt, 6, end_line);
+    std::string stable_key = std::string(qualname) + "::" + kind + "::" + name +
+                             "::" + std::to_string(start_line);
+    sqlite3_bind_text(stmt, 7, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(conn, stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
+static void insert_edge(Connection& conn, int64_t src, int64_t dst,
+                        const char* kind, double confidence = 1.0) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO edges(src_id, dst_id, kind, confidence) VALUES(?, ?, ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, src);
+    sqlite3_bind_int64(stmt, 2, dst);
+    sqlite3_bind_text(stmt, 3, kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 4, confidence);
+    step_done(conn, stmt);
+}
+
+static void insert_call_ref(Connection& conn, int64_t file_id, const char* name,
+                            int start_line, int start_col, int end_col,
+                            int64_t containing_node_id) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, "
+        "evidence, containing_node_id) VALUES(?, 'call', ?, ?, ?, ?, ?, 'call_expression', ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, file_id);
+    sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, start_line);
+    sqlite3_bind_int(stmt, 4, start_col);
+    sqlite3_bind_int(stmt, 5, start_line);
+    sqlite3_bind_int(stmt, 6, end_col);
+    sqlite3_bind_int64(stmt, 7, containing_node_id);
+    step_done(conn, stmt);
+}
+
+static TestDb make_approx_db(const std::string& name, bool exact_set_edge = false) {
+    TestDb db;
+    db.root = fs::path("build") / "test_approx_callgraph" / name;
+    cleanup(db.root);
+    fs::create_directories(db.root);
+    db.db_path = db.root / "codetopo.sqlite";
+
+    Connection conn(db.db_path);
+    schema::ensure_schema(conn);
+
+    int64_t map_file = insert_file(conn, "src/linked_map.ts");
+    int64_t other_file = insert_file(conn, "src/other_map.ts");
+    int64_t caller_file = insert_file(conn, "src/use_map.ts");
+    int64_t exact_file = insert_file(conn, "src/exact_set.ts");
+    int64_t unique_file = insert_file(conn, "src/use_flush.ts");
+
+    int64_t linked_map = insert_symbol(conn, map_file, "class", "LinkedMap", "LinkedMap", 1, 20);
+    db.ids.linked_set = insert_symbol(conn, map_file, "method", "set", "LinkedMap.set", 3, 5);
+    int64_t linked_set_overload = insert_symbol(conn, map_file, "method", "set", "LinkedMap.set overload", 7, 9);
+    db.ids.flush = insert_symbol(conn, map_file, "method", "flush", "LinkedMap.flush", 11, 13);
+    int64_t other_map = insert_symbol(conn, other_file, "class", "OtherMap", "OtherMap", 1, 8);
+    int64_t other_set = insert_symbol(conn, other_file, "method", "set", "OtherMap.set", 3, 5);
+
+    db.ids.use_linked = insert_symbol(conn, caller_file, "function", "useLinked", "useLinked", 1, 6);
+    db.ids.exact_set_caller = insert_symbol(conn, exact_file, "function", "setExactly", "setExactly", 1, 4);
+    db.ids.flush_caller = insert_symbol(conn, unique_file, "function", "callFlush", "callFlush", 1, 4);
+
+    insert_edge(conn, linked_map, db.ids.linked_set, "contains");
+    insert_edge(conn, linked_map, linked_set_overload, "contains");
+    insert_edge(conn, linked_map, db.ids.flush, "contains");
+    insert_edge(conn, other_map, other_set, "contains");
+    insert_edge(conn, db.ids.flush_caller, db.ids.flush, "calls", 0.9);
+    if (exact_set_edge) {
+        insert_edge(conn, db.ids.exact_set_caller, db.ids.linked_set, "calls", 0.9);
+    }
+
+    insert_call_ref(conn, caller_file, "linked.set", 4, 3, 13, db.ids.use_linked);
+    insert_call_ref(conn, caller_file, "this.set", 5, 3, 11, db.ids.use_linked);
+
+    schema::set_kv(conn, "schema_version", "1");
+    schema::set_kv(conn, "indexer_version", "test");
+    schema::set_kv(conn, "repo_root", db.root.string());
+    schema::set_kv(conn, "last_index_time", "2026-06-28T22:59:24-04:00");
+    conn.wal_checkpoint();
+
+    return db;
+}
+
+static std::string invoke_callers(const TestDb& db, int64_t node_id,
+                                  const char* mode = "exact_then_candidates") {
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    std::string params = "{\"node_id\":" + std::to_string(node_id) +
+                         ",\"limit\":20,\"include_candidates\":true,\"mode\":\"" +
+                         mode + "\"}";
+    auto params_doc = json_parse(params);
+    REQUIRE(params_doc);
+    return tools::callers_approx(params_doc.root(), conn, cache, db.root.string());
+}
+
+static std::string invoke_context_for(const TestDb& db, int64_t node_id) {
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    std::string params = "{\"node_id\":" + std::to_string(node_id) +
+                         ",\"include_source\":false,\"max_callers\":20,"
+                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\"}";
+    auto params_doc = json_parse(params);
+    REQUIRE(params_doc);
+    return tools::context_for(params_doc.root(), conn, cache, db.root.string());
+}
+
+static std::string invoke_impact_of(const TestDb& db, int64_t node_id) {
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    std::string params = "{\"node_id\":" + std::to_string(node_id) +
+                         ",\"depth\":1,\"max_nodes\":20,"
+                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\"}";
+    auto params_doc = json_parse(params);
+    REQUIRE(params_doc);
+    return tools::impact_of(params_doc.root(), conn, cache, db.root.string());
+}
+
+static yyjson_val* require_array_field(yyjson_val* obj, const char* key) {
+    yyjson_val* arr = yyjson_obj_get(obj, key);
+    INFO("expected JSON array field: " << key);
+    REQUIRE(arr != nullptr);
+    REQUIRE(yyjson_is_arr(arr));
+    return arr;
+}
+
+static yyjson_val* find_item_with_string(yyjson_val* arr, const char* key,
+                                         const std::string& value) {
+    yyjson_val* item = nullptr;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(arr, &iter);
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        const char* field = json_get_str(item, key);
+        if (field && value == field) return item;
+    }
+    return nullptr;
+}
+
+static void require_callsite_candidate(yyjson_val* candidate, const std::string& callee_text) {
+    REQUIRE(candidate != nullptr);
+    const char* file_path = json_get_str(candidate, "file_path");
+    REQUIRE(file_path != nullptr);
+    CHECK(std::string(file_path) == "src/use_map.ts");
+
+    yyjson_val* span = yyjson_obj_get(candidate, "span");
+    REQUIRE(span != nullptr);
+    CHECK(json_get_int(span, "start_line", -1) == 4);
+    CHECK(json_get_int(span, "start_col", -1) == 3);
+    CHECK(json_get_int(span, "end_line", -1) == 4);
+    CHECK(json_get_int(span, "end_col", -1) == 13);
+
+    const char* actual_callee_text = json_get_str(candidate, "callee_text");
+    REQUIRE(actual_callee_text != nullptr);
+    CHECK(std::string(actual_callee_text) == callee_text);
+    const char* receiver_hint = json_get_str(candidate, "receiver_hint");
+    REQUIRE(receiver_hint != nullptr);
+    CHECK(std::string(receiver_hint) == "linked");
+    yyjson_val* confidence = yyjson_obj_get(candidate, "confidence");
+    REQUIRE(confidence != nullptr);
+    REQUIRE(yyjson_is_num(confidence));
+    CHECK(yyjson_get_real(confidence) > 0.0);
+}
+
+static void require_no_exact_set_edges(const TestDb& db) {
+    Connection conn(db.db_path, true);
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "SELECT COUNT(*) FROM edges WHERE dst_id = ? AND kind = 'calls'",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, db.ids.linked_set);
+    REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+    CHECK(sqlite3_column_int64(stmt, 0) == 0);
+    sqlite3_finalize(stmt);
+}
+
+} // namespace
+
+TEST_CASE("callers/context/impact recover approx call sites for overloaded set without exact edges",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("set-no-exact");
+    require_no_exact_set_edges(db);
+
+    auto callers_result = invoke_callers(db, db.ids.linked_set);
+    auto callers_doc = json_parse(callers_result);
+    REQUIRE(callers_doc);
+    CHECK(yyjson_arr_size(require_array_field(callers_doc.root(), "results")) == 0);
+
+    // TODO(approx-callgraph): Keep using Simon's proposed response field names
+    // until the implementation settles: candidate_results, candidate_callers,
+    // and candidate_impacted.
+    auto* candidates = require_array_field(callers_doc.root(), "candidate_results");
+    REQUIRE(yyjson_arr_size(candidates) >= 1);
+    require_callsite_candidate(find_item_with_string(candidates, "callee_text", "linked.set"), "linked.set");
+
+    auto context_result = invoke_context_for(db, db.ids.linked_set);
+    auto context_doc = json_parse(context_result);
+    REQUIRE(context_doc);
+    INFO(context_result);
+    CHECK(yyjson_arr_size(require_array_field(context_doc.root(), "callers")) == 0);
+    auto* candidate_callers = require_array_field(context_doc.root(), "candidate_callers");
+    REQUIRE(yyjson_arr_size(candidate_callers) >= 1);
+    require_callsite_candidate(find_item_with_string(candidate_callers, "callee_text", "linked.set"),
+                               "linked.set");
+
+    auto impact_result = invoke_impact_of(db, db.ids.linked_set);
+    auto impact_doc = json_parse(impact_result);
+    REQUIRE(impact_doc);
+    INFO(impact_result);
+    CHECK(yyjson_arr_size(require_array_field(impact_doc.root(), "impacted")) == 0);
+    auto* candidate_impacted = require_array_field(impact_doc.root(), "candidate_impacted");
+    REQUIRE(yyjson_arr_size(candidate_impacted) >= 1);
+    require_callsite_candidate(find_item_with_string(candidate_impacted, "callee_text", "linked.set"),
+                               "linked.set");
+}
+
+TEST_CASE("callers_approx keeps approximate candidates separate from exact edges",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("set-exact-plus-candidate", true);
+
+    auto result = invoke_callers(db, db.ids.linked_set, "exact_plus_candidates");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+
+    auto* results = require_array_field(doc.root(), "results");
+    REQUIRE(yyjson_arr_size(results) == 1);
+    auto* exact = yyjson_arr_get_first(results);
+    REQUIRE(exact != nullptr);
+    REQUIRE(json_get_str(exact, "caller_name") != nullptr);
+    CHECK(std::string(json_get_str(exact, "caller_name")) == "setExactly");
+
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    REQUIRE(yyjson_arr_size(candidates) >= 1);
+    CHECK(find_item_with_string(candidates, "caller_name", "setExactly") == nullptr);
+    require_callsite_candidate(find_item_with_string(candidates, "callee_text", "linked.set"), "linked.set");
+}
+
+TEST_CASE("callers_approx uses exact edges for uniquely named symbols",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("unique-exact");
+
+    auto result = invoke_callers(db, db.ids.flush);
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+
+    auto* results = require_array_field(doc.root(), "results");
+    REQUIRE(yyjson_arr_size(results) == 1);
+    auto* exact = yyjson_arr_get_first(results);
+    REQUIRE(json_get_str(exact, "caller_name") != nullptr);
+    CHECK(std::string(json_get_str(exact, "caller_name")) == "callFlush");
+
+    yyjson_val* candidates = yyjson_obj_get(doc.root(), "candidate_results");
+    if (candidates) {
+        REQUIRE(yyjson_is_arr(candidates));
+        CHECK(yyjson_arr_size(candidates) == 0);
+    }
+}
