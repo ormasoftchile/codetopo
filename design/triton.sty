@@ -1,0 +1,198 @@
+% triton.sty — author Triton diagrams directly in LaTeX (like TikZ), or include
+% precompiled vector PDFs as an Overleaf fallback.
+%
+% ── HEADLINE: inline authoring ──────────────────────────────────────────────
+% Put the diagram SOURCE straight in your .tex and it renders inline:
+%
+%   \documentclass{article}
+%   \usepackage{triton}
+%   \begin{document}
+%   \begin{triton}
+%   flowchart LR
+%     A[Start] --> B{Choice}
+%     B --> C[End]
+%   \end{triton}
+%   \end{document}
+%
+% Compile WITH shell-escape (this is required for the inline environment):
+%   pdflatex -shell-escape file.tex
+%   lualatex -shell-escape file.tex
+%   tectonic -Z shell-escape -Z shell-escape-cwd=. file.tex
+%
+% How it works (the minted model): the `triton` environment captures its body
+% VERBATIM, writes it to a temp file, content-hashes the source (so a diagram is
+% only re-rendered when it changes), shells out via \write18 to the @triton/latex
+% CLI to produce a vector PDF in a cache directory, then \includegraphics it.
+%
+% ── FALLBACK: precompiled include (Overleaf / no shell-escape) ──────────────
+% Overleaf disallows arbitrary shell-escape. There, precompile the diagrams to
+% PDF (see the @triton/latex CLI `render-dir`) and drop them in by NAME — this is
+% engine-agnostic and needs no Node/Triton toolchain on the LaTeX side:
+%
+%   \tritondir{figures}        % where the *.pdf live (default: triton-figures)
+%   \triton{flowchart}         % \includegraphics the precompiled figures/flowchart.pdf
+%   \triton[width=0.6\linewidth]{avl}
+%
+% \triton{<name>} is BOTH the precompiled-include command AND the name of the
+% inline environment — LaTeX would normally forbid that, so the package dispatches
+% on \@currenvir: inside \begin{triton}…\end{triton} it authors inline; used as a
+% bare command \triton[opts]{name} it includes a precompiled PDF.
+%
+% ── Macro summary ───────────────────────────────────────────────────────────
+%   \begin{triton} … \end{triton}           inline authoring (needs shell-escape)
+%   \tritonnext{opts}                         \includegraphics opts for the NEXT
+%                                             inline diagram only (per-diagram size)
+%   \tritoninline[opts]|… one line …|         one-line inline source
+%   \triton[opts]{name}                       include precompiled <dir>/name.pdf
+%   \tritonfile[opts]{name}                   explicit alias of the include form
+%   \tritonfig[opts]{name}{caption}           precompiled include in a figure
+%   \tritondir{path}                          precompiled-PDF directory
+%   \tritonsetup{opts}                        default \includegraphics options
+%   \tritoncli{cmd}                           CLI invocation (default: triton-latex)
+%   \tritontheme{name}                        theme preset for inline renders
+%   \tritonscale{n}                           scale passed to the CLI (default 1)
+%   \tritoncachedir{dir}                      render cache (default \jobname.triton-cache)
+%
+% NOTE on sizing: a verbatim environment cannot reliably take an inline optional
+% argument (\begin{triton}[width=…] would swallow the diagram's first line), so
+% per-diagram \includegraphics options are set just BEFORE the environment with
+% \tritonnext{…}; \tritonsetup{…} sets the global default.
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{triton}[2026/06/24 v0.2.0 Inline Triton diagram authoring in LaTeX]
+
+\RequirePackage{graphicx}
+\RequirePackage{fancyvrb}   % verbatim body capture (VerbatimOut)
+\RequirePackage{pdftexcmds} % \pdf@shellescape, \pdf@filemdfivesum (engine-agnostic)
+
+% ── Shared default \includegraphics options ─────────────────────────────────
+\def\triton@opts{width=\linewidth}
+\newcommand{\tritonsetup}[1]{\def\triton@opts{#1}}
+
+% ── Precompiled-PDF directory (fallback workflow) ───────────────────────────
+\def\triton@dir{triton-figures}
+\newcommand{\tritondir}[1]{\def\triton@dir{#1}}
+
+% The precompiled-include behaviour, shared by \tritonfile and by the bare
+% \triton[opts]{name} command form (dispatched below).
+\newcommand{\triton@include}[2][\triton@opts]{%
+  \includegraphics[#1]{\triton@dir/#2.pdf}%
+}
+\let\tritonfile\triton@include
+
+\newcommand{\tritonfig}[3][\triton@opts]{%
+  \begin{figure}[htbp]%
+    \centering
+    \triton@include[#1]{#2}%
+    \caption{#3}%
+  \end{figure}%
+}
+
+% ── Inline-render configuration ─────────────────────────────────────────────
+\def\triton@cli{triton-latex}
+\newcommand{\tritoncli}[1]{\def\triton@cli{#1}}
+\def\triton@scale{1}
+\newcommand{\tritonscale}[1]{\def\triton@scale{#1}}
+\def\triton@themearg{}
+\newcommand{\tritontheme}[1]{\def\triton@themearg{\space--theme #1}}
+\def\triton@cachedir{\jobname.triton-cache}
+\newcommand{\tritoncachedir}[1]{\def\triton@cachedir{#1}}
+% Temp file the verbatim diagram source is written to before rendering. The
+% input extension is irrelevant to the CLI's single-file `render' (the renderer
+% auto-detects the diagram kind from the source header); only the .pdf OUTPUT
+% extension matters.
+\def\triton@tmpfile{\jobname.triton-src.triton}
+
+% Per-diagram \includegraphics options for the NEXT inline render. Defaults to
+% the global \triton@opts; \tritonnext{…} overrides it for the next diagram only.
+% (A verbatim environment cannot reliably carry an inline optional argument like
+%  \begin{triton}[width=…] — peeking for the `[' tokenises the line break that
+%  fancyvrb needs to delimit the body — so per-diagram sizing is set just BEFORE
+%  the environment with \tritonnext instead.)
+\newif\iftriton@nextset
+\newcommand{\tritonnext}[1]{\def\triton@nextopts{#1}\triton@nextsettrue}
+
+% Stream used by \tritoninline to write its verbatim argument to the temp file.
+\newwrite\triton@inlinestream
+
+% ── Core render step (shared by the environment and \tritoninline) ──────────
+% Precondition: \triton@tmpfile holds the diagram source and \triton@curopts
+% holds the \includegraphics options. Content-hash → cache → shell-out → include.
+\newcommand{\triton@render}{%
+  \ifnum\pdf@shellescape=\@ne
+    \edef\triton@hash{\pdf@filemdfivesum{\triton@tmpfile}}%
+    \edef\triton@pdf{\triton@cachedir/\triton@hash.pdf}%
+    % Only render when this exact source has not been rendered before.
+    \IfFileExists{\triton@pdf}{}{%
+      \immediate\write18{\triton@cli\space render "\triton@tmpfile" -o
+        "\triton@pdf" --scale \triton@scale\triton@themearg}%
+    }%
+    \IfFileExists{\triton@pdf}{%
+      % \triton@curopts is a macro (e.g. width=\linewidth); graphicx mis-parses
+      % an unexpanded key-list macro in the optional argument ("Missing
+      % \endcsname" on the dimen), so expand it once into literal keys first.
+      \expandafter\includegraphics\expandafter[\triton@curopts]{\triton@pdf}%
+    }{%
+      \PackageError{triton}{Inline render produced no PDF}{%
+        The CLI did not create \triton@pdf.\MessageBreak
+        Check that Node and the triton-latex CLI are installed and that
+        \protect\tritoncli\space points at it (e.g.
+        \protect\tritoncli{node /path/to/latex/dist/cli.cjs}).}%
+    }%
+  \else
+    \PackageError{triton}{The inline `triton' environment needs shell-escape}{%
+      Recompile with -shell-escape (pdflatex/lualatex) or -Z shell-escape
+      (tectonic),\MessageBreak or use the precompiled \protect\triton{<name>}
+      workflow (render the diagrams to PDF first).}%
+    \fbox{\ttfamily[triton: shell-escape required for inline diagram]}%
+  \fi
+}
+
+% ── Inline environment + backward-compatible command, sharing the name `triton'
+% LaTeX cannot have a command \triton AND an environment `triton' independently,
+% because \begin{triton} simply calls \triton. We resolve this by dispatching on
+% \@currenvir, which LaTeX sets to the environment name inside \begin{...}:
+%   • inside \begin{triton} …            → start verbatim capture (inline author)
+%   • bare \triton[opts]{name}           → include a precompiled PDF (fallback)
+\def\triton@marker{triton}
+\newcommand{\triton}{%
+  \ifx\@currenvir\triton@marker
+    \let\triton@dispatch\triton@beginenv
+  \else
+    \let\triton@dispatch\triton@include
+  \fi
+  \triton@dispatch
+}
+
+% Environment begin: capture the body verbatim to the temp file. NOTHING may be
+% looked-ahead here (no optional argument), or the line break fancyvrb needs to
+% find the end of the \begin{triton} line is consumed and the first body line is
+% swallowed. \VerbatimEnvironment makes fancyvrb scan until \end{triton}.
+\def\triton@beginenv{%
+  \iftriton@nextset
+    \let\triton@curopts\triton@nextopts
+  \else
+    \let\triton@curopts\triton@opts
+  \fi
+  \VerbatimEnvironment
+  \begin{VerbatimOut}{\triton@tmpfile}%
+}
+\def\endtriton{%
+  \end{VerbatimOut}%
+  \triton@render
+  \triton@nextsetfalse
+}
+
+% ── \tritoninline[opts]|one-line source| ────────────────────────────────────
+% Convenience for short, single-line diagrams. The body is read verbatim (xparse
+% `v' argument), written to the temp file, and rendered like the environment.
+% Multi-statement diagrams should use the \begin{triton} environment instead.
+\NewDocumentCommand{\tritoninline}{O{\triton@opts} v}{%
+  \def\triton@curopts{#1}%
+  \immediate\openout\triton@inlinestream=\triton@tmpfile\relax
+  \immediate\write\triton@inlinestream{#2}%
+  \immediate\closeout\triton@inlinestream
+  \triton@render
+}
+
+\endinput
