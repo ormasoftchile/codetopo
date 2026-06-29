@@ -176,7 +176,6 @@ CREATE VIRTUAL TABLE nodes_fts USING fts5(
 This is used by \texttt{symbol\_search} for BM25-ranked prefix queries over
 symbol names, qualified names, signatures, and docstrings.
 
-<<<<<<< HEAD
 \paragraph{content\_fts.}  A \emph{contentless}\footnote{A \texttt{content=}
 FTS5 table mirrors the original rows in its shadow tables, enabling
 snippet generation from stored data, but it doubles storage --- every indexed
@@ -185,9 +184,6 @@ string is kept both in the shadow table and on disk. The contentless variant
 cost of requiring the source file to be re-read for result display. This
 trade-off is acceptable because source files are always present locally.}
 FTS5 table with the trigram
-=======
-\paragraph{content\_fts.}  A \emph{contentless} FTS5 table with the trigram
->>>>>>> origin/main
 tokenizer, indexed per source line:
 
 \begin{lstlisting}[language=sql]
@@ -217,15 +213,11 @@ CREATE TABLE content_fts_tracker (
 \subsection{Multi-root ID scheme}
 
 All nodes across all workspace roots share a single \texttt{nodes} table. To
-<<<<<<< HEAD
 keep IDs globally unique, codetopo uses a multiplicative offset\footnote{The
 factor $10^9$ was chosen for readability in debug output: root 1's IDs begin
 at \texttt{1\,000\,000\,001}. SQLite's 64-bit signed rowid ceiling
 ($2^{63}-1 \approx 9.2 \times 10^{18}$) accommodates up to $\sim$9.2 billion
 root slots at this scale, far beyond any practical need.}:
-=======
-keep IDs globally unique, codetopo uses a multiplicative offset:
->>>>>>> origin/main
 \[
   \text{global\_id} = \text{root\_id} \times 10^9 + \text{local\_id}
 \]

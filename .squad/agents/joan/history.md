@@ -64,3 +64,8 @@
 - **Key learning**: `ts_tree_delete()` calls arena's free (which is a no-op), so `arena->used()` may increase slightly during delete due to tree-sitter internal allocations. Don't assert exact equality of `used()` before/after tree destruction — assert `> 0` instead.
 - **Build**: Clean compile, all 146 tests green (1039 assertions). No regressions.
 - **Files**: `tests/unit/test_arena_lifetime.cpp`, `CMakeLists.txt` (test registration)
+
+## 2026-06-28 23:11 QA: candidate call-site tuning
+- Extended `tests/unit/test_approx_callgraph.cpp` for candidate max_bytes budget, receiver confidence ranking, receiver filtering metadata, and include_handles opt-in.
+- Build: `cmake --build build --target codetopo_tests --parallel` PASS.
+- Unit run: `./build/codetopo_tests "[unit]"` FAIL: candidate max_bytes metadata/budget missing, receiver filter ignored, default candidate handles still emitted.

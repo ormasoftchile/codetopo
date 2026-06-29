@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/fts.h"
 #include "index/persister.h"
 #include "index/extractor.h"
 #include "index/scanner.h"
@@ -101,6 +102,18 @@ static int64_t count_rows(Connection& conn, const char* table) {
     return count;
 }
 
+static int64_t count_query(Connection& conn, const std::string& query) {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(conn.raw(), query.c_str(), -1, &stmt, nullptr);
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    int64_t count = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 // ===========================================================================
 // OPT-1: Skip DELETE on cold index
 // ===========================================================================
@@ -160,6 +173,94 @@ TEST_CASE("OPT-1: Warm index (cold_index=false) still executes DELETE", "[persis
         REQUIRE(count_rows(conn, "files") == 1);
         int64_t final_nodes = count_rows(conn, "nodes");
         REQUIRE(final_nodes == 5);  // 1 file node + 4 new symbols (old symbols deleted)
+        REQUIRE(count_rows(conn, "edges") == 4);  // file-node edges point at the replacement file node
+    }
+    cleanup(tmp);
+}
+
+TEST_CASE("Force clear truncates main-project index but keeps metadata", "[unit][persist_opt][force]") {
+    auto tmp = make_test_dir("test_force_clear_main_only");
+    auto db_path = tmp / "force_main.sqlite";
+
+    {
+        Connection conn(db_path);
+        schema::ensure_schema(conn);
+        fts::create_sync_triggers(conn);
+        schema::set_kv(conn, "custom_key", "custom_value");
+        schema::quarantine_file(conn, "src/bad.cpp", "boom");
+
+        Persister persister(conn);
+        auto file = make_scanned_file("src/force.cpp");
+        auto extraction = make_extraction_with_symbols(2, "force");
+        REQUIRE(persister.persist_file(file, extraction, "hash1", "ok"));
+        content_fts::insert_file(conn, persister.last_file_id(), "int main() {\nreturn 0;\n}\n");
+
+        REQUIRE(count_rows(conn, "files") == 1);
+        REQUIRE(count_rows(conn, "nodes") == 3);
+        REQUIRE(count_rows(conn, "edges") == 2);
+        REQUIRE(count_rows(conn, "content_fts_tracker") == 1);
+
+        int64_t cleared = persister.clear_main_project_index_for_force();
+        REQUIRE(cleared == 1);
+        REQUIRE(persister.is_cold_index());
+
+        REQUIRE(count_rows(conn, "files") == 0);
+        REQUIRE(count_rows(conn, "nodes") == 0);
+        REQUIRE(count_rows(conn, "refs") == 0);
+        REQUIRE(count_rows(conn, "edges") == 0);
+        REQUIRE(count_rows(conn, "content_fts_tracker") == 0);
+        REQUIRE(schema::get_kv(conn, "custom_key", "") == "custom_value");
+        REQUIRE(schema::quarantine_count(conn) == 1);
+    }
+    cleanup(tmp);
+}
+
+TEST_CASE("Force clear preserves workspace-root rows", "[unit][persist_opt][force]") {
+    auto tmp = make_test_dir("test_force_clear_preserve_workspace");
+    auto db_path = tmp / "force_workspace.sqlite";
+
+    {
+        Connection conn(db_path);
+        schema::ensure_schema(conn);
+
+        Persister persister(conn);
+        auto main_file = make_scanned_file("src/main.cpp");
+        auto main_extraction = make_extraction_with_symbols(1, "main");
+        REQUIRE(persister.persist_file(main_file, main_extraction, "hash-main", "ok"));
+        int64_t main_file_id = persister.last_file_id();
+        content_fts::insert_file(conn, main_file_id, "void main_symbol() {}\n");
+
+        conn.exec("INSERT INTO roots(path, added_at) VALUES('/workspace', datetime('now'))");
+        int64_t root_id = sqlite3_last_insert_rowid(conn.raw());
+
+        sqlite3_stmt* file_stmt = nullptr;
+        sqlite3_prepare_v2(conn.raw(),
+            "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, root_id) "
+            "VALUES('workspace/lib.cpp', 'cpp', 10, 20, 'hash-ws', 'ok', ?)",
+            -1, &file_stmt, nullptr);
+        sqlite3_bind_int64(file_stmt, 1, root_id);
+        REQUIRE(sqlite3_step(file_stmt) == SQLITE_DONE);
+        sqlite3_finalize(file_stmt);
+        int64_t workspace_file_id = sqlite3_last_insert_rowid(conn.raw());
+
+        conn.exec(
+            "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
+            "VALUES('symbol', " + std::to_string(workspace_file_id) + ", 'function', 'workspace_fn', 'workspace/lib.cpp::function::workspace_fn')");
+        conn.exec(
+            "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
+            "VALUES('file', NULL, 'file', 'workspace/lib.cpp', 'workspace/lib.cpp::file')");
+        content_fts::insert_file(conn, workspace_file_id, "void workspace_fn() {}\n");
+
+        int64_t cleared = persister.clear_main_project_index_for_force();
+        REQUIRE(cleared == 1);
+
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM files WHERE root_id IS NULL") == 0);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM files WHERE root_id IS NOT NULL") == 1);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM nodes WHERE name = 'main_0'") == 0);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM nodes WHERE name = 'workspace_fn'") == 1);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM nodes WHERE name = 'workspace/lib.cpp'") == 1);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM content_fts_tracker WHERE file_id = " + std::to_string(main_file_id)) == 0);
+        REQUIRE(count_query(conn, "SELECT COUNT(*) FROM content_fts_tracker WHERE file_id = " + std::to_string(workspace_file_id)) == 1);
     }
     cleanup(tmp);
 }

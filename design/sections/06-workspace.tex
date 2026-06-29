@@ -35,7 +35,7 @@ the offset formula lifts it into the global ID space.
 
 \begin{figure}[htbp]
   \centering
-  \tritonnext{width=0.7\textwidth}
+  \tritonnext{width=0.4\textwidth}
 \begin{triton}
 array
   title local_id within one root slot
@@ -71,16 +71,12 @@ live at different absolute paths on different machines.
   \item Canonicalize the path (resolve symlinks).
   \item Ensure the path is indexed: if no \texttt{roots} row exists, run a
         full index first.
-<<<<<<< HEAD
   \item \texttt{ATTACH} the source database (if separate).\footnote{A SQLite
         gotcha: \texttt{ATTACH DATABASE} must be issued \emph{before}
         \texttt{BEGIN TRANSACTION} on the same connection. Attempting to
         attach inside an open transaction raises \texttt{SQLITE\_ERROR}. The
         workspace-add flow therefore attaches the source database first, then
         opens the write transaction for the row copy.}
-=======
-  \item \texttt{ATTACH} the source database (if separate).
->>>>>>> origin/main
   \item \texttt{INSERT} a row into \texttt{roots} to obtain the new
         \texttt{root\_id}.
   \item Copy all \texttt{files}, \texttt{nodes}, \texttt{edges}, and

@@ -70,6 +70,20 @@ codetopo index --root /path/to/repo \
 codetopo index --root /path/to/repo --max-files 10000
 ```
 
+### Add workspace roots
+
+```bash
+codetopo workspace add /path/to/extra/root --root /path/to/main/repo
+```
+
+Workspace add always merges files, symbols, edges, refs, and symbol FTS. Line-level
+content FTS for added roots is off by default for faster large-root adds; opt in
+only when code-content search over added roots is needed:
+
+```bash
+codetopo workspace add /path/to/extra/root --root /path/to/main/repo --with-content-fts
+```
+
 ### Query the code graph
 
 ```bash
@@ -132,6 +146,7 @@ codetopo doctor --root /path/to/repo
 | `index` | Build or update the code graph |
 | `mcp` | Start the MCP server over stdio |
 | `watch` | Watch for file changes and re‑index |
+| `workspace` | Add, remove, or list extra workspace roots |
 | `query` | Run an ad‑hoc tool query from the CLI |
 | `parse-file` | Parse a single file and show diagnostics |
 | `skills` | List or install agent skill files |

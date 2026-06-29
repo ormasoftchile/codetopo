@@ -10,7 +10,7 @@
 
 namespace codetopo {
 
-// codetopo workspace add    --root /myproject /path/to/add
+// codetopo workspace add    --root /myproject /path/to/add [--with-content-fts]
 // codetopo workspace remove --root /myproject /path/to/remove
 // codetopo workspace list   --root /myproject
 

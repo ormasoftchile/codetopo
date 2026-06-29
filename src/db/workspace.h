@@ -39,6 +39,8 @@ private:
     Connection conn_;
     void ensure_schema();
     void merge_root_attached(int64_t root_id, const std::string& root_path);
+    void populate_content_fts_for_root(int64_t root_id);
+    void resume_pending_content_fts();
 };
 
 // Legacy path — kept only for detecting old installations.

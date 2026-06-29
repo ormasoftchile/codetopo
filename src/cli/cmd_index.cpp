@@ -176,6 +176,8 @@ int run_index(const Config& config) {
 
     Persister persister(conn);
     std::vector<ScannedFile> work_list;
+    bool force_cleared_index = false;
+    bool force_dropped_fts_triggers = false;
 
     bool resumed = false;
     if (config.resume && fs::exists(worklist_path)) {
@@ -236,7 +238,7 @@ int run_index(const Config& config) {
         }
 
         // Prune deleted files (T041)
-        if (!changes.deleted_paths.empty()) {
+        if (!config.force_reindex && !changes.deleted_paths.empty()) {
             int pruned = persister.prune_deleted(changes.deleted_paths);
             std::cerr << "Pruned " << pruned << " deleted files\n";
         }
@@ -251,12 +253,35 @@ int run_index(const Config& config) {
             if (!quarantined.count(f.relative_path))
                 work_list.push_back(f);
         }
+
+        // --force means "rebuild this root from scratch".  The old path
+        // reindexed by deleting each file as it was reinserted; on populated
+        // DBs that cascaded through refs/edges thousands of times.  Clear the
+        // main-project rows once up front so the persist phase behaves like a
+        // cold index.  On --resume this is intentionally skipped because the
+        // first attempt already cleared the DB before writing progress.
+        if (config.force_reindex) {
+            std::cerr << "Force reindex: clearing existing index rows...\n";
+            if (!config.safe_mode) {
+                fts::drop_sync_triggers(conn);
+                force_dropped_fts_triggers = true;
+            }
+            int64_t cleared = persister.clear_main_project_index_for_force();
+            force_cleared_index = true;
+            std::cerr << "Force reindex: cleared " << cleared << " existing files\n";
+        }
     }
 
     if (work_list.empty()) {
         std::cerr << "Nothing to index. Database is up to date.\n";
 
         // No files changed → no new refs to resolve. Skip the expensive resolver.
+
+        // If --force cleared rows but there is nothing to reinsert, rebuild
+        // symbol FTS so it reflects the now-empty (or workspace-only) nodes.
+        if (force_cleared_index) {
+            fts::rebuild(conn);
+        }
 
         // Ensure FTS triggers are active for future incremental updates
         fts::create_sync_triggers(conn);
@@ -328,7 +353,7 @@ int run_index(const Config& config) {
         large_pool = std::make_unique<ArenaPool>(large_arena_count, config.large_arena_size_bytes());
     }
 
-    std::atomic<int> errors{0};
+    std::atomic<int> file_errors{0};
     int total = static_cast<int>(work_list.size());
     int display_offset = config.progress_offset;
     int display_total = config.progress_total > 0 ? config.progress_total : total;
@@ -377,11 +402,13 @@ int run_index(const Config& config) {
     // Building indexes on a populated table is 10-50x faster than maintaining
     // them per-insert. FTS rebuild is similarly much faster in one pass.
     // Uses IF EXISTS / IF NOT EXISTS — safe to call on resume after crash.
-    bool bulk_mode = (total > 1000) && !config.safe_mode;
+    bool bulk_mode = (force_cleared_index || total > 1000) && !config.safe_mode;
     if (bulk_mode) {
         std::cerr << "Bulk mode: dropping indexes for fast insert...\n";
         schema::drop_bulk_indexes(conn);
-        fts::drop_sync_triggers(conn);
+        if (!force_dropped_fts_triggers) {
+            fts::drop_sync_triggers(conn);
+        }
     } else {
         fts::create_sync_triggers(conn);
     }
@@ -747,10 +774,6 @@ int run_index(const Config& config) {
             
             auto& result = item.parsed;
             
-            if (result.has_error) {
-                persist_state.persist_errors.fetch_add(1, std::memory_order_relaxed);
-            }
-            
             {
                 ScopedPhase _ps(profiler.persist);
                 if (!persister.persist_file(result.file, result.extraction,
@@ -868,7 +891,7 @@ int run_index(const Config& config) {
         auto& result = item.parsed;
 
         if (result.has_error) {
-            errors.fetch_add(1, std::memory_order_relaxed);
+            file_errors.fetch_add(1, std::memory_order_relaxed);
         }
 
         // DEC-038 OPT-3: Push to persist queue (may block if queue is full)
@@ -907,9 +930,7 @@ int run_index(const Config& config) {
     persist_queue.close();
     if (persist_thread.joinable()) persist_thread.join();
 
-    // Accumulate persist thread errors
-    errors.fetch_add(persist_state.persist_errors.load(std::memory_order_relaxed), 
-                     std::memory_order_relaxed);
+    int persist_errors = persist_state.persist_errors.load(std::memory_order_relaxed);
 
     // Stop watchdog thread
     watchdog_stop.store(true, std::memory_order_relaxed);
@@ -921,7 +942,8 @@ int run_index(const Config& config) {
 
     std::cerr << "Done: " << total << " files in " << elapsed_s << "s"
               << " (" << static_cast<int>(rate) << " files/s)";
-    if (errors > 0) std::cerr << " [" << errors << " errors]";
+    if (file_errors > 0) std::cerr << " [" << file_errors << " file errors]";
+    if (persist_errors > 0) std::cerr << " [" << persist_errors << " persist errors]";
     std::cerr << "\n";
 
     // Checkpoint WAL to main DB before read-heavy post-processing
@@ -979,7 +1001,7 @@ int run_index(const Config& config) {
     }
 
     // Rebuild FTS5 symbol index in one pass (much faster than per-row triggers)
-    if (bulk_mode) {
+    if (bulk_mode || force_cleared_index) {
         std::cerr << "Rebuilding symbol FTS index...\n";
         ScopedPhase _fts(profiler.fts_rebuild);
         auto fts_start = std::chrono::steady_clock::now();
@@ -1029,7 +1051,7 @@ int run_index(const Config& config) {
     auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(total_elapsed).count();
     profiler.print_report(total_us, total, thread_count);
 
-    return errors > 0 ? 1 : 0;
+    return persist_errors > 0 ? 1 : 0;
 }
 
 } // namespace codetopo

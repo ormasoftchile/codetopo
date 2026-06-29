@@ -11,7 +11,7 @@ all: pdf
 pdf: triton.sty
 	tectonic -Z shell-escape -Z shell-escape-cwd=. codetopo.tex
 
-triton.sty: /Volumes/Projects/triton/latex/triton.sty
+triton.sty: /Users/cristianormazabal/Projects/triton/latex/triton.sty
 	cp $< $@
 
 clean:
