@@ -98,6 +98,18 @@ static int64_t insert_symbol(Connection& conn, int64_t file_id, const char* kind
     return sqlite3_last_insert_rowid(conn.raw());
 }
 
+static int64_t insert_file_node(Connection& conn, const char* path) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO nodes(node_type, kind, name, stable_key) VALUES('file', 'file', ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT);
+    std::string stable_key = std::string("file:") + path;
+    sqlite3_bind_text(stmt, 2, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(conn, stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
 static void insert_edge(Connection& conn, int64_t src, int64_t dst,
                         const char* kind, double confidence = 1.0) {
     sqlite3_stmt* stmt = nullptr;
@@ -545,5 +557,102 @@ TEST_CASE("callers_approx prefers same-file local receiver type hints",
     CHECK(std::string(json_get_str(typed_receiver, "receiver_type_hint")) == "LinkedMap");
     CHECK(require_confidence(typed_receiver) > require_confidence(unrelated_receiver));
     REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
-    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("local_receiver_type") != std::string::npos);
+    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("receiver_type") != std::string::npos);
+}
+
+TEST_CASE("callers_approx lean mode returns summary buckets and top candidates",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-lean-mode", false, 40);
+
+    auto verbose_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":100,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto lean_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"response_mode\":\"lean\",\"top_n\":3,\"include_candidates\":true,"
+        "\"mode\":\"exact_plus_candidates\"}");
+
+    INFO("verbose bytes: " << verbose_result.size() << " lean bytes: " << lean_result.size());
+    CHECK(lean_result.size() < verbose_result.size());
+
+    auto doc = json_parse(lean_result);
+    REQUIRE(doc);
+    auto* root = doc.root();
+    REQUIRE(json_get_str(root, "response_mode") != nullptr);
+    CHECK(std::string(json_get_str(root, "response_mode")) == "lean");
+    CHECK(json_get_int(root, "exact_total", -1) == 0);
+    CHECK(json_get_int(root, "candidate_total", -1) > 3);
+    CHECK(json_get_int(root, "candidate_eligible", -1) > 0);
+    CHECK(json_get_int(root, "candidate_max_bytes", -1) == 4096);
+
+    auto* candidates = require_array_field(root, "candidate_results");
+    CHECK(yyjson_arr_size(candidates) <= 3);
+    auto* first = yyjson_arr_get_first(candidates);
+    REQUIRE(first != nullptr);
+    CHECK(has_field(first, "file"));
+    CHECK(has_field(first, "line"));
+    CHECK_FALSE(has_field(first, "span"));
+    CHECK_FALSE(has_field(first, "evidence"));
+    CHECK_FALSE(has_field(first, "why"));
+
+    auto* buckets = yyjson_obj_get(root, "candidate_buckets");
+    REQUIRE(buckets != nullptr);
+    REQUIRE(yyjson_obj_get(buckets, "arg_count") != nullptr);
+    REQUIRE(yyjson_obj_get(buckets, "heuristic") != nullptr);
+    REQUIRE(yyjson_obj_get(buckets, "file") != nullptr);
+}
+
+TEST_CASE("callers_approx resolves receiver type through include edges conservatively",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-cross-file-receiver-type");
+    Connection conn(db.db_path);
+    int64_t duplicate_file = insert_file(conn, "src/duplicate_linked_map.ts");
+    insert_symbol(conn, duplicate_file, "class", "LinkedMap", "Duplicate.LinkedMap", 1, 10);
+    int64_t caller_file_node = insert_file_node(conn, "src/use_map.ts");
+    int64_t map_file_node = insert_file_node(conn, "src/linked_map.ts");
+    insert_edge(conn, caller_file_node, map_file_node, "includes", 0.7);
+    conn.exec("UPDATE refs SET receiver_type_hint = 'LinkedMap' WHERE name = 'linked.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* typed_receiver = find_item_with_string(candidates, "callee_text", "linked.set");
+    auto* unrelated_receiver = find_item_with_string(candidates, "callee_text", "unrelated.set");
+    REQUIRE(typed_receiver != nullptr);
+    REQUIRE(unrelated_receiver != nullptr);
+    CHECK(json_get_bool(typed_receiver, "receiver_type_resolved", false));
+    REQUIRE(json_get_str(typed_receiver, "receiver_type_resolution_source") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "receiver_type_resolution_source")) == "include");
+    REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("cross_file_receiver_type") != std::string::npos);
+    CHECK(require_confidence(typed_receiver) > require_confidence(unrelated_receiver));
+}
+
+TEST_CASE("callers_approx does not boost ambiguous global receiver type hints",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-ambiguous-receiver-type");
+    Connection conn(db.db_path);
+    int64_t duplicate_file = insert_file(conn, "src/ambiguous_linked_map.ts");
+    insert_symbol(conn, duplicate_file, "class", "LinkedMap", "Ambiguous.LinkedMap", 1, 10);
+    conn.exec("UPDATE refs SET receiver_type_hint = 'LinkedMap' WHERE name = 'linked.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* typed_receiver = find_item_with_string(candidates, "callee_text", "linked.set");
+    REQUIRE(typed_receiver != nullptr);
+    CHECK(json_get_bool(typed_receiver, "receiver_type_ambiguous", false));
+    REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("cross_file_receiver_type") == std::string::npos);
 }

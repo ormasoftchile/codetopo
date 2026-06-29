@@ -287,6 +287,7 @@ enum class CandidateMode {
 
 struct CallsiteCandidate {
     int64_t ref_id = -1;
+    int64_t file_id = -1;
     int64_t caller_node_id = -1;
     std::string caller_name;
     std::string caller_qualname;
@@ -294,6 +295,8 @@ struct CallsiteCandidate {
     std::string callee_text;
     std::string receiver_hint;
     std::string receiver_type_hint;
+    std::string resolved_receiver_type;
+    std::string receiver_type_resolution_source;
     std::string arg_pattern;
     std::string heuristic;
     std::string why;
@@ -304,6 +307,7 @@ struct CallsiteCandidate {
     int end_line = 0;
     int end_col = 0;
     double confidence = 0.0;
+    bool receiver_type_ambiguous = false;
 };
 
 struct CallsiteCandidateOptions {
@@ -315,11 +319,19 @@ struct CallsiteCandidateOptions {
 struct CallsiteCandidateSet {
     std::vector<CallsiteCandidate> rows;
     int64_t total = 0;
+    int64_t eligible_total = 0;
     int64_t filtered_hidden = 0;
     int64_t arity_filtered = 0;
     bool budget_exceeded = false;
     bool has_more = false;
     int64_t max_bytes = 16000;
+    struct ArityBucket {
+        int64_t count = 0;
+        std::map<std::string, int64_t> files;
+    };
+    std::map<int, ArityBucket> arity_buckets;
+    std::map<std::string, int64_t> heuristic_buckets;
+    std::map<std::string, int64_t> file_buckets;
 };
 
 struct TargetCallsiteInfo {
@@ -403,8 +415,42 @@ static std::string qualname_owner(const std::string& qualname) {
         size_t p = qualname.rfind(sep);
         if (p != std::string::npos && (pos == std::string::npos || p > pos)) pos = p;
     }
+
     if (pos == std::string::npos) return {};
     return qualname.substr(0, pos);
+}
+
+
+static std::string strip_generic_suffix(std::string s) {
+    int depth = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '<') {
+            if (depth == 0) return trim_receiver_hint(s.substr(0, i));
+            ++depth;
+        } else if (s[i] == '>' && depth > 0) {
+            --depth;
+        }
+    }
+    return s;
+}
+
+static std::string canonical_type_hint(std::string s) {
+    s = trim_receiver_hint(std::move(s));
+    if (s.empty()) return {};
+    for (const char* prefix : {"readonly ", "typeof "}) {
+        size_t len = std::strlen(prefix);
+        if (s.size() > len && lower_copy(s.substr(0, len)) == prefix)
+            s = trim_receiver_hint(s.substr(len));
+    }
+    size_t split = s.find_first_of("|&=");
+    if (split != std::string::npos) s = trim_receiver_hint(s.substr(0, split));
+    s = strip_generic_suffix(s);
+    while (s.size() >= 2 && s.compare(s.size() - 2, 2, "[]") == 0)
+        s = trim_receiver_hint(s.substr(0, s.size() - 2));
+    while (!s.empty() && (s.back() == '*' || s.back() == '&' || s.back() == '?' ||
+                          std::isspace(static_cast<unsigned char>(s.back()))))
+        s.pop_back();
+    return trim_receiver_hint(s);
 }
 
 static int64_t parse_max_bytes(yyjson_val* params, int64_t default_value = 16000) {
@@ -492,6 +538,158 @@ static ReceiverMatchStrength receiver_owner_match_strength(const std::string& re
     }
 
     return ReceiverMatchStrength::None;
+}
+
+struct TypeCandidateNode {
+    int64_t id = 0;
+    std::string name;
+    std::string qualname;
+};
+
+struct ReceiverTypeResolution {
+    ReceiverMatchStrength strength = ReceiverMatchStrength::None;
+    bool resolved = false;
+    bool ambiguous = false;
+    std::string resolved_type;
+    std::string source;
+};
+
+static ReceiverMatchStrength type_candidate_owner_match(const TypeCandidateNode& candidate,
+                                                       const TargetCallsiteInfo& target) {
+    if (!candidate.qualname.empty() && !target.owner_qualname.empty() &&
+        iequals(candidate.qualname, target.owner_qualname))
+        return ReceiverMatchStrength::Exact;
+    if (!candidate.qualname.empty() && !target.owner_qualname.empty() &&
+        (iends_with_separator_suffix(candidate.qualname, target.owner_qualname) ||
+         iends_with_separator_suffix(target.owner_qualname, candidate.qualname)))
+        return ReceiverMatchStrength::Suffix;
+    if (!candidate.name.empty() && !target.owner_name.empty() &&
+        iequals(candidate.name, target.owner_name))
+        return ReceiverMatchStrength::Bare;
+    if (!candidate.qualname.empty() && !target.owner_name.empty() &&
+        iends_with_separator_suffix(candidate.qualname, target.owner_name))
+        return ReceiverMatchStrength::Suffix;
+    return ReceiverMatchStrength::None;
+}
+
+static ReceiverTypeResolution choose_receiver_type_resolution(
+        const std::vector<TypeCandidateNode>& candidates,
+        const TargetCallsiteInfo& target,
+        const std::string& source) {
+    ReceiverTypeResolution result;
+    if (candidates.empty()) return result;
+    result.source = source;
+
+    std::vector<std::pair<TypeCandidateNode, ReceiverMatchStrength>> matches;
+    for (const auto& candidate : candidates) {
+        auto strength = type_candidate_owner_match(candidate, target);
+        if (strength != ReceiverMatchStrength::None)
+            matches.push_back({candidate, strength});
+    }
+    if (matches.empty()) {
+        result.ambiguous = candidates.size() > 1;
+        return result;
+    }
+
+    auto best = matches.front();
+    for (const auto& match : matches) {
+        if (static_cast<int>(match.second) > static_cast<int>(best.second))
+            best = match;
+    }
+
+    int equally_good = 0;
+    for (const auto& match : matches) {
+        if (match.second == best.second) ++equally_good;
+    }
+    if (equally_good > 1) {
+        result.ambiguous = true;
+        return result;
+    }
+
+    if (source == "global" && candidates.size() > 1) {
+        result.ambiguous = true;
+        return result;
+    }
+
+    result.resolved = true;
+    result.strength = best.second;
+    result.resolved_type = best.first.qualname.empty() ? best.first.name : best.first.qualname;
+    return result;
+}
+
+static std::vector<TypeCandidateNode> fetch_type_candidates(sqlite3_stmt* stmt) {
+    std::vector<TypeCandidateNode> candidates;
+    std::unordered_set<int64_t> seen;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        TypeCandidateNode candidate;
+        candidate.id = sqlite3_column_int64(stmt, 0);
+        if (!seen.insert(candidate.id).second) continue;
+        auto* name = sqlite3_column_text(stmt, 1);
+        auto* qualname = sqlite3_column_text(stmt, 2);
+        candidate.name = name ? reinterpret_cast<const char*>(name) : "";
+        candidate.qualname = qualname ? reinterpret_cast<const char*>(qualname) : "";
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
+}
+
+static ReceiverTypeResolution resolve_receiver_type_hint(
+        const CallsiteCandidate& row,
+        const TargetCallsiteInfo& target,
+        Connection& /*conn*/,
+        QueryCache& cache) {
+    std::string type_name = canonical_type_hint(row.receiver_type_hint);
+    if (type_name.empty() || row.file_id <= 0) return {};
+    std::string type_leaf = trailing_identifier(type_name);
+    if (type_leaf.empty()) type_leaf = type_name;
+    std::string like_qual = "%." + type_leaf;
+
+    auto resolve_with = [&](const std::string& key, const std::string& sql,
+                            const std::string& source) {
+        auto* stmt = cache.get(key, sql);
+        sqlite3_bind_int64(stmt, 1, row.file_id);
+        sqlite3_bind_text(stmt, 2, type_leaf.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, type_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, like_qual.c_str(), -1, SQLITE_TRANSIENT);
+        return choose_receiver_type_resolution(fetch_type_candidates(stmt), target, source);
+    };
+
+    auto same_file = resolve_with("approx_receiver_type_same_file",
+        "SELECT n.id, n.name, n.qualname "
+        "FROM nodes n "
+        "WHERE n.file_id = ? AND n.node_type = 'symbol' "
+        "AND n.kind IN ('class','struct','interface','type_alias','type','enum') "
+        "AND (n.name = ? OR n.qualname = ? OR n.qualname LIKE ?) "
+        "ORDER BY n.is_definition DESC, n.id ASC LIMIT 8",
+        "same_file");
+    if (same_file.resolved || same_file.ambiguous) return same_file;
+
+    auto included = resolve_with("approx_receiver_type_included_file",
+        "SELECT n.id, n.name, n.qualname "
+        "FROM files cf "
+        "JOIN nodes cfn ON cfn.node_type = 'file' AND cfn.name = cf.path "
+        "JOIN edges e ON e.src_id = cfn.id AND e.kind = 'includes' "
+        "JOIN nodes ifn ON ifn.id = e.dst_id AND ifn.node_type = 'file' "
+        "JOIN files inf ON inf.path = ifn.name "
+        "JOIN nodes n ON n.file_id = inf.id "
+        "WHERE cf.id = ? AND n.node_type = 'symbol' "
+        "AND n.kind IN ('class','struct','interface','type_alias','type','enum') "
+        "AND (n.name = ? OR n.qualname = ? OR n.qualname LIKE ?) "
+        "ORDER BY n.is_definition DESC, n.id ASC LIMIT 12",
+        "include");
+    if (included.resolved || included.ambiguous) return included;
+
+    auto* global_stmt = cache.get("approx_receiver_type_global",
+        "SELECT n.id, n.name, n.qualname "
+        "FROM nodes n "
+        "WHERE n.node_type = 'symbol' "
+        "AND n.kind IN ('class','struct','interface','type_alias','type','enum') "
+        "AND (n.name = ? OR n.qualname = ? OR n.qualname LIKE ?) "
+        "ORDER BY n.is_definition DESC, n.id ASC LIMIT 16");
+    sqlite3_bind_text(global_stmt, 1, type_leaf.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(global_stmt, 2, type_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(global_stmt, 3, like_qual.c_str(), -1, SQLITE_TRANSIENT);
+    return choose_receiver_type_resolution(fetch_type_candidates(global_stmt), target, "global");
 }
 
 static bool containing_context_matches_owner(const std::string& containing_name,
@@ -714,7 +912,11 @@ static void score_candidate(CallsiteCandidate& row,
                             const std::string& containing_qualname) {
     bool has_receiver = !row.receiver_hint.empty();
     ReceiverMatchStrength receiver_match = receiver_owner_match_strength(row.receiver_hint, target);
-    ReceiverMatchStrength receiver_type_match = receiver_owner_match_strength(row.receiver_type_hint, target);
+    const std::string& receiver_type_for_score =
+        row.resolved_receiver_type.empty() ? row.receiver_type_hint : row.resolved_receiver_type;
+    ReceiverMatchStrength receiver_type_match = row.receiver_type_ambiguous
+        ? ReceiverMatchStrength::None
+        : receiver_owner_match_strength(receiver_type_for_score, target);
     bool strong_owner = receiver_match != ReceiverMatchStrength::None;
     bool strong_receiver_type = receiver_type_match != ReceiverMatchStrength::None;
     bool this_in_owner = iequals(row.receiver_hint, "this") &&
@@ -735,11 +937,23 @@ static void score_candidate(CallsiteCandidate& row,
         row.heuristic = receiver_match_name(receiver_match);
         row.receiver_type_hint = owner_hint;
     } else if (strong_receiver_type) {
-        row.confidence = receiver_type_match == ReceiverMatchStrength::Exact ? 0.88 : 0.80;
-        row.heuristic = receiver_type_match == ReceiverMatchStrength::Exact
-            ? "local_receiver_type_exact_target_owner"
-            : "local_receiver_type_matches_target_owner";
-        row.why = "local receiver declaration type matches the target's containing type";
+        bool resolved_cross_file = !row.receiver_type_resolution_source.empty() &&
+                                   row.receiver_type_resolution_source != "same_file";
+        if (resolved_cross_file) {
+            row.confidence = receiver_type_match == ReceiverMatchStrength::Exact ? 0.93 : 0.86;
+            row.heuristic = receiver_type_match == ReceiverMatchStrength::Exact
+                ? "cross_file_receiver_type_exact"
+                : "cross_file_receiver_type_suffix";
+            row.why = "resolved receiver declaration type matches the target's containing type";
+        } else {
+            row.confidence = receiver_type_match == ReceiverMatchStrength::Exact ? 0.89 : 0.81;
+            row.heuristic = receiver_type_match == ReceiverMatchStrength::Exact
+                ? "local_receiver_type_exact_target_owner"
+                : "local_receiver_type_matches_target_owner";
+            row.why = "local receiver declaration type matches the target's containing type";
+        }
+        if (!row.resolved_receiver_type.empty())
+            row.receiver_type_hint = row.resolved_receiver_type;
     } else if (this_in_owner) {
         row.confidence = 0.68;
         row.heuristic = "this_receiver_in_target_owner";
@@ -758,6 +972,9 @@ static void score_candidate(CallsiteCandidate& row,
     if (is_common_member_name(target.name) && !strong_owner && !strong_receiver_type && !this_in_owner) {
         row.confidence = std::max(0.20, row.confidence - 0.10);
         row.why += "; confidence reduced for common member name";
+    }
+    if (row.receiver_type_ambiguous) {
+        row.why += "; receiver type hint was ambiguous across visible types";
     }
 }
 
@@ -845,7 +1062,11 @@ static CallsiteCandidateSet collect_callsite_candidates(
     auto like_arrow = "%->" + target.name;
     int64_t query_limit = std::min<int64_t>(
         5000,
-        std::max<int64_t>(options.receiver_filter.empty() ? limit * 4 : limit * 20, limit));
+        std::max<int64_t>({
+            options.receiver_filter.empty() ? limit * 4 : limit * 20,
+            limit,
+            200
+        }));
 
     auto* count_stmt = cache.get("approx_callsite_candidates_count",
         "SELECT COUNT(*) "
@@ -858,7 +1079,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
     if (sqlite3_step(count_stmt) == SQLITE_ROW) result.total = sqlite3_column_int64(count_stmt, 0);
 
     auto* stmt = cache.get("approx_callsite_candidates",
-        "SELECT r.id, r.name, f.path, r.start_line, r.start_col, r.end_line, r.end_col, "
+        "SELECT r.id, r.file_id, r.name, f.path, r.start_line, r.start_col, r.end_line, r.end_col, "
         "r.evidence, r.containing_node_id, cn.name, cn.qualname, "
         "r.arg_count, r.arg_pattern, r.receiver_type_hint "
         "FROM refs r "
@@ -877,25 +1098,26 @@ static CallsiteCandidateSet collect_callsite_candidates(
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CallsiteCandidate row;
         row.ref_id = sqlite3_column_int64(stmt, 0);
-        auto* callee = sqlite3_column_text(stmt, 1);
+        row.file_id = sqlite3_column_int64(stmt, 1);
+        auto* callee = sqlite3_column_text(stmt, 2);
         row.callee_text = callee ? reinterpret_cast<const char*>(callee) : "";
-        auto* fp = sqlite3_column_text(stmt, 2);
+        auto* fp = sqlite3_column_text(stmt, 3);
         row.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
-        row.start_line = sqlite3_column_int(stmt, 3);
-        row.start_col = sqlite3_column_int(stmt, 4);
-        row.end_line = sqlite3_column_int(stmt, 5);
-        row.end_col = sqlite3_column_int(stmt, 6);
-        auto* evidence = sqlite3_column_text(stmt, 7);
+        row.start_line = sqlite3_column_int(stmt, 4);
+        row.start_col = sqlite3_column_int(stmt, 5);
+        row.end_line = sqlite3_column_int(stmt, 6);
+        row.end_col = sqlite3_column_int(stmt, 7);
+        auto* evidence = sqlite3_column_text(stmt, 8);
         row.evidence = evidence ? reinterpret_cast<const char*>(evidence) : "";
-        row.caller_node_id = sqlite3_column_int64(stmt, 8);
-        auto* caller = sqlite3_column_text(stmt, 9);
+        row.caller_node_id = sqlite3_column_int64(stmt, 9);
+        auto* caller = sqlite3_column_text(stmt, 10);
         row.caller_name = caller ? reinterpret_cast<const char*>(caller) : "";
-        auto* caller_qn = sqlite3_column_text(stmt, 10);
+        auto* caller_qn = sqlite3_column_text(stmt, 11);
         row.caller_qualname = caller_qn ? reinterpret_cast<const char*>(caller_qn) : "";
-        if (sqlite3_column_type(stmt, 11) != SQLITE_NULL) row.arg_count = sqlite3_column_int(stmt, 11);
-        auto* arg_pattern = sqlite3_column_text(stmt, 12);
+        if (sqlite3_column_type(stmt, 12) != SQLITE_NULL) row.arg_count = sqlite3_column_int(stmt, 12);
+        auto* arg_pattern = sqlite3_column_text(stmt, 13);
         row.arg_pattern = arg_pattern ? reinterpret_cast<const char*>(arg_pattern) : "";
-        auto* receiver_type = sqlite3_column_text(stmt, 13);
+        auto* receiver_type = sqlite3_column_text(stmt, 14);
         row.receiver_type_hint = receiver_type ? reinterpret_cast<const char*>(receiver_type) : "";
         row.receiver_hint = extract_receiver_hint(row.callee_text, target.name);
 
@@ -903,6 +1125,15 @@ static CallsiteCandidateSet collect_callsite_candidates(
                           std::to_string(row.start_col) + ":" + row.callee_text;
         if (!seen.insert(key).second) continue;
 
+        if (!row.receiver_type_hint.empty()) {
+            auto resolved = resolve_receiver_type_hint(row, target, conn, cache);
+            if (resolved.resolved) {
+                row.resolved_receiver_type = resolved.resolved_type;
+                row.receiver_type_resolution_source = resolved.source;
+            } else if (resolved.ambiguous) {
+                row.receiver_type_ambiguous = true;
+            }
+        }
         score_candidate(row, target, row.caller_name, row.caller_qualname);
         if (!apply_arity_and_pattern_score(row, target)) {
             ++result.arity_filtered;
@@ -918,9 +1149,22 @@ static CallsiteCandidateSet collect_callsite_candidates(
         return lhs.start_col < rhs.start_col;
     });
 
-    size_t approx_bytes = 256;
+    std::vector<const CallsiteCandidate*> visible_rows;
+    visible_rows.reserve(rows.size());
     for (const auto& row : rows) {
         if (!candidate_matches_receiver_filter(row, options.receiver_filter)) continue;
+        visible_rows.push_back(&row);
+        ++result.eligible_total;
+        auto& arity_bucket = result.arity_buckets[row.arg_count];
+        ++arity_bucket.count;
+        arity_bucket.files[row.file_path.empty() ? "(unknown)" : row.file_path]++;
+        result.heuristic_buckets[row.heuristic.empty() ? "(unknown)" : row.heuristic]++;
+        result.file_buckets[row.file_path.empty() ? "(unknown)" : row.file_path]++;
+    }
+
+    size_t approx_bytes = 256;
+    for (const auto* row_ptr : visible_rows) {
+        const auto& row = *row_ptr;
         size_t item_bytes = estimate_callsite_candidate_bytes(row, options.include_handles);
         if (result.max_bytes > 0 && !result.rows.empty() &&
             approx_bytes + item_bytes > static_cast<size_t>(result.max_bytes)) {
@@ -963,6 +1207,15 @@ static yyjson_mut_val* emit_callsite_candidate(JsonMutDoc& doc, const CallsiteCa
     yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_text", row.callee_text.c_str());
     if (!row.receiver_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_hint", row.receiver_hint.c_str());
     if (!row.receiver_type_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_type_hint", row.receiver_type_hint.c_str());
+    if (!row.resolved_receiver_type.empty()) {
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "resolved_receiver_type", row.resolved_receiver_type.c_str());
+        yyjson_mut_obj_add_bool(doc.doc, item, "receiver_type_resolved", true);
+        if (!row.receiver_type_resolution_source.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_type_resolution_source",
+                                      row.receiver_type_resolution_source.c_str());
+    }
+    if (row.receiver_type_ambiguous)
+        yyjson_mut_obj_add_bool(doc.doc, item, "receiver_type_ambiguous", true);
     yyjson_mut_obj_add_real(doc.doc, item, "confidence", row.confidence);
     yyjson_mut_obj_add_strcpy(doc.doc, item, "heuristic", row.heuristic.c_str());
     if (include_handles) {
@@ -974,6 +1227,73 @@ static yyjson_mut_val* emit_callsite_candidate(JsonMutDoc& doc, const CallsiteCa
     return item;
 }
 
+static yyjson_mut_val* emit_callsite_candidate_lean(JsonMutDoc& doc, const CallsiteCandidate& row) {
+    auto* item = doc.new_obj();
+    if (!row.file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", row.file_path.c_str());
+    yyjson_mut_obj_add_int(doc.doc, item, "line", row.start_line);
+    if (!row.caller_name.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller", row.caller_name.c_str());
+    yyjson_mut_obj_add_real(doc.doc, item, "confidence", row.confidence);
+    if (row.arg_count >= 0) yyjson_mut_obj_add_int(doc.doc, item, "arg_count", row.arg_count);
+    bool receiver_explains =
+        row.heuristic.find("receiver") != std::string::npos ||
+        row.heuristic.find("target_owner") != std::string::npos;
+    if (receiver_explains && !row.receiver_hint.empty())
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver", row.receiver_hint.c_str());
+    if (receiver_explains && !row.receiver_type_hint.empty())
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_type", row.receiver_type_hint.c_str());
+    if (!row.resolved_receiver_type.empty()) {
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "resolved_receiver_type", row.resolved_receiver_type.c_str());
+        yyjson_mut_obj_add_bool(doc.doc, item, "receiver_type_resolved", true);
+    }
+    yyjson_mut_obj_add_strcpy(doc.doc, item, "heuristic", row.heuristic.c_str());
+    return item;
+}
+
+static std::vector<std::pair<std::string, int64_t>> top_counts(
+        const std::map<std::string, int64_t>& counts,
+        size_t limit) {
+    std::vector<std::pair<std::string, int64_t>> items(counts.begin(), counts.end());
+    std::sort(items.begin(), items.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.second != rhs.second) return lhs.second > rhs.second;
+        return lhs.first < rhs.first;
+    });
+    if (items.size() > limit) items.resize(limit);
+    return items;
+}
+
+static yyjson_mut_val* emit_count_array(JsonMutDoc& doc,
+                                        const std::map<std::string, int64_t>& counts,
+                                        size_t limit) {
+    auto* arr = doc.new_arr();
+    for (const auto& [name, count] : top_counts(counts, limit)) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name.c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "count", count);
+        yyjson_mut_arr_append(arr, item);
+    }
+    return arr;
+}
+
+static void add_callsite_candidate_buckets(JsonMutDoc& doc, yyjson_mut_val* root,
+                                           const CallsiteCandidateSet& candidates) {
+    auto* buckets = doc.new_obj();
+    auto* by_arg_count = doc.new_obj();
+    for (const auto& [arity, bucket] : candidates.arity_buckets) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "count", bucket.count);
+        yyjson_mut_obj_add_val(doc.doc, item, "top_files",
+            emit_count_array(doc, bucket.files, 3));
+        std::string key = arity < 0 ? "unknown" : std::to_string(arity);
+        yyjson_mut_obj_add_val(doc.doc, by_arg_count, key.c_str(), item);
+    }
+    yyjson_mut_obj_add_val(doc.doc, buckets, "arg_count", by_arg_count);
+    yyjson_mut_obj_add_val(doc.doc, buckets, "heuristic",
+        emit_count_array(doc, candidates.heuristic_buckets, 8));
+    yyjson_mut_obj_add_val(doc.doc, buckets, "file",
+        emit_count_array(doc, candidates.file_buckets, 8));
+    yyjson_mut_obj_add_val(doc.doc, root, "candidate_buckets", buckets);
+}
+
 static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* root,
                                             const char* prefix,
                                             const CallsiteCandidateSet& candidates,
@@ -981,6 +1301,7 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
     std::string p(prefix ? prefix : "candidate");
     if (p == "candidate") {
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_arity_filtered", candidates.arity_filtered);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_max_bytes", candidates.max_bytes);
@@ -990,12 +1311,14 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
             yyjson_mut_obj_add_strcpy(doc.doc, root, "candidate_receiver", options.receiver_filter.c_str());
         yyjson_mut_obj_add_int(doc.doc, root, "total", candidates.total);
         yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "eligible_candidates", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "arity_filtered", candidates.arity_filtered);
         yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", candidates.max_bytes);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     } else if (p == "candidate_callers") {
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_arity_filtered", candidates.arity_filtered);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_max_bytes", candidates.max_bytes);
@@ -1005,6 +1328,7 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
             yyjson_mut_obj_add_strcpy(doc.doc, root, "candidate_callers_receiver", options.receiver_filter.c_str());
     } else if (p == "candidate_impacted") {
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_arity_filtered", candidates.arity_filtered);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_max_bytes", candidates.max_bytes);
@@ -2508,6 +2832,25 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     bool compact = params ? json_get_bool(params, "compact", false) : false;
     CandidateMode candidate_mode = parse_candidate_mode(params);
     CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
+    const char* response_mode = params ? json_get_str(params, "response_mode") : nullptr;
+    bool lean_response = (response_mode && std::strcmp(response_mode, "lean") == 0) ||
+                         (params && json_get_bool(params, "lean", false));
+    bool include_buckets = !params || json_get_bool(params, "buckets", true);
+    int64_t top_n = params ? json_get_int(params, "top_n", 10) : 10;
+    if (top_n <= 0) top_n = 10;
+    if (top_n > 100) top_n = 100;
+    if (lean_response && params && !yyjson_obj_get(params, "max_bytes"))
+        candidate_options.max_bytes = 4096;
+    int64_t exact_limit = lean_response ? std::min<int64_t>(limit, top_n) : limit;
+
+    int64_t exact_total = 0;
+    {
+        auto* count_stmt = cache.get("callers_approx_exact_count",
+            "SELECT COUNT(*) FROM edges WHERE dst_id = ? AND kind = 'calls'");
+        sqlite3_bind_int64(count_stmt, 1, node_id);
+        if (sqlite3_step(count_stmt) == SQLITE_ROW)
+            exact_total = sqlite3_column_int64(count_stmt, 0);
+    }
 
     auto* stmt = cache.get("callers_approx",
         "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
@@ -2518,7 +2861,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         "ORDER BY e.confidence DESC LIMIT ?");
 
     sqlite3_bind_int64(stmt, 1, node_id);
-    sqlite3_bind_int64(stmt, 2, limit);
+    sqlite3_bind_int64(stmt, 2, exact_limit);
 
     // Collect raw results
     struct CallerRow {
@@ -2548,7 +2891,8 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     }
     CallsiteCandidateSet candidates;
     if (should_collect_candidates(candidate_mode, rows.empty()))
-        candidates = collect_callsite_candidates(node_id, limit, conn, cache, candidate_options, repo_root);
+        candidates = collect_callsite_candidates(
+            node_id, lean_response ? top_n : limit, conn, cache, candidate_options, repo_root);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -2570,6 +2914,40 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
         return item;
     };
+
+    auto emit_caller_item_lean = [&](const CallerRow& r) -> yyjson_mut_val* {
+        auto* item = doc.new_obj();
+        if (!r.file_path.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", r.file_path.c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "line", r.start_line);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "caller", r.name.c_str());
+        yyjson_mut_obj_add_real(doc.doc, item, "confidence", r.confidence);
+        return item;
+    };
+
+    if (lean_response) {
+        yyjson_mut_obj_add_str(doc.doc, root, "response_mode", "lean");
+        yyjson_mut_obj_add_int(doc.doc, root, "exact_total", exact_total);
+        yyjson_mut_obj_add_int(doc.doc, root, "top_n", top_n);
+        yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", candidate_options.max_bytes);
+
+        auto* exact_results = doc.new_arr();
+        for (const auto& r : rows)
+            yyjson_mut_arr_append(exact_results, emit_caller_item_lean(r));
+        yyjson_mut_obj_add_val(doc.doc, root, "results", exact_results);
+        yyjson_mut_obj_add_bool(doc.doc, root, "has_more", exact_total > static_cast<int64_t>(rows.size()));
+
+        if (!candidates.rows.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
+            auto* candidate_results = doc.new_arr();
+            for (const auto& candidate : candidates.rows)
+                yyjson_mut_arr_append(candidate_results, emit_callsite_candidate_lean(doc, candidate));
+            yyjson_mut_obj_add_val(doc.doc, root, "candidate_results", candidate_results);
+            yyjson_mut_obj_add_str(doc.doc, root, "candidate_source", "refs");
+            add_callsite_candidate_metadata(doc, root, "candidate", candidates, candidate_options);
+            if (include_buckets) add_callsite_candidate_buckets(doc, root, candidates);
+        }
+        return doc.to_string();
+    }
 
     if (group_by && (strcmp(group_by, "file") == 0 || strcmp(group_by, "module") == 0)) {
         // Group by file path (module uses file's directory as key)
