@@ -300,6 +300,21 @@ struct CallsiteCandidate {
     double confidence = 0.0;
 };
 
+struct CallsiteCandidateOptions {
+    std::string receiver_filter;
+    bool include_handles = false;
+    int64_t max_bytes = 16000;
+};
+
+struct CallsiteCandidateSet {
+    std::vector<CallsiteCandidate> rows;
+    int64_t total = 0;
+    int64_t filtered_hidden = 0;
+    bool budget_exceeded = false;
+    bool has_more = false;
+    int64_t max_bytes = 16000;
+};
+
 struct TargetCallsiteInfo {
     std::string name;
     std::string qualname;
@@ -315,6 +330,31 @@ static std::string lower_copy(std::string s) {
 
 static bool iequals(const std::string& lhs, const std::string& rhs) {
     return lower_copy(lhs) == lower_copy(rhs);
+}
+
+static std::string trailing_identifier(const std::string& text);
+
+static bool iends_with_separator_suffix(const std::string& text,
+                                        const std::string& suffix) {
+    if (text.size() <= suffix.size() || suffix.empty()) return false;
+    std::string lhs = lower_copy(text);
+    std::string rhs = lower_copy(suffix);
+    if (lhs.compare(lhs.size() - rhs.size(), rhs.size(), rhs) != 0) return false;
+    size_t sep_end = lhs.size() - rhs.size();
+    if (sep_end == 0) return false;
+    char prev = lhs[sep_end - 1];
+    return prev == '.' || prev == ':' || prev == '#' || prev == '/' || prev == '>';
+}
+
+static bool receiver_text_matches_name(const std::string& receiver,
+                                       const std::string& name) {
+    if (receiver.empty() || name.empty()) return false;
+    if (iequals(receiver, name)) return true;
+    if (iends_with_separator_suffix(receiver, name) ||
+        iends_with_separator_suffix(name, receiver)) return true;
+    std::string receiver_leaf = trailing_identifier(receiver);
+    std::string name_leaf = trailing_identifier(name);
+    return !receiver_leaf.empty() && !name_leaf.empty() && iequals(receiver_leaf, name_leaf);
 }
 
 static std::string trim_receiver_hint(std::string s) {
@@ -354,6 +394,23 @@ static std::string qualname_owner(const std::string& qualname) {
     return qualname.substr(0, pos);
 }
 
+static int64_t parse_max_bytes(yyjson_val* params, int64_t default_value = 16000) {
+    int64_t max_bytes = params ? json_get_int(params, "max_bytes", default_value) : default_value;
+    if (max_bytes < 0) max_bytes = 0;
+    if (max_bytes > 100000) max_bytes = 100000;
+    return max_bytes;
+}
+
+static CallsiteCandidateOptions parse_callsite_candidate_options(yyjson_val* params) {
+    CallsiteCandidateOptions options;
+    if (!params) return options;
+    if (const char* receiver = json_get_str(params, "receiver"))
+        options.receiver_filter = trim_receiver_hint(receiver);
+    options.include_handles = json_get_bool(params, "include_handles", false);
+    options.max_bytes = parse_max_bytes(params);
+    return options;
+}
+
 static CandidateMode parse_candidate_mode(yyjson_val* params) {
     CandidateMode mode = CandidateMode::ExactThenCandidates;
     if (!params) return mode;
@@ -390,17 +447,38 @@ static bool is_common_member_name(const std::string& name) {
     return common.count(lower_copy(name)) > 0;
 }
 
-static bool receiver_matches_owner(const std::string& receiver,
-                                   const TargetCallsiteInfo& target) {
-    if (receiver.empty()) return false;
-    std::string leaf = trailing_identifier(receiver);
+enum class ReceiverMatchStrength {
+    None = 0,
+    Bare = 1,
+    Suffix = 2,
+    Exact = 3
+};
+
+static ReceiverMatchStrength receiver_owner_match_strength(const std::string& receiver,
+                                                           const TargetCallsiteInfo& target) {
+    if (receiver.empty()) return ReceiverMatchStrength::None;
+    if ((!target.owner_qualname.empty() && iequals(receiver, target.owner_qualname)) ||
+        (!target.owner_name.empty() && iequals(receiver, target.owner_name))) {
+        return ReceiverMatchStrength::Exact;
+    }
+
+    if ((!target.owner_qualname.empty() &&
+         (iends_with_separator_suffix(receiver, target.owner_qualname) ||
+          iends_with_separator_suffix(target.owner_qualname, receiver))) ||
+        (!target.owner_name.empty() && iends_with_separator_suffix(receiver, target.owner_name))) {
+        return ReceiverMatchStrength::Suffix;
+    }
+
+    std::string receiver_leaf = trailing_identifier(receiver);
     std::string owner_leaf = trailing_identifier(target.owner_name);
     std::string owner_qual_leaf = trailing_identifier(target.owner_qualname);
-    return (!target.owner_name.empty() &&
-            (iequals(receiver, target.owner_name) || (!leaf.empty() && iequals(leaf, owner_leaf)))) ||
-           (!target.owner_qualname.empty() &&
-            (iequals(receiver, target.owner_qualname) ||
-             (!leaf.empty() && iequals(leaf, owner_qual_leaf))));
+    if (!receiver_leaf.empty() &&
+        ((!owner_leaf.empty() && iequals(receiver_leaf, owner_leaf)) ||
+         (!owner_qual_leaf.empty() && iequals(receiver_leaf, owner_qual_leaf)))) {
+        return ReceiverMatchStrength::Bare;
+    }
+
+    return ReceiverMatchStrength::None;
 }
 
 static bool containing_context_matches_owner(const std::string& containing_name,
@@ -435,45 +513,86 @@ static std::string extract_receiver_hint(const std::string& callee_text,
     return {};
 }
 
+static const char* receiver_match_name(ReceiverMatchStrength strength) {
+    switch (strength) {
+        case ReceiverMatchStrength::Exact: return "receiver_exact_target_owner";
+        case ReceiverMatchStrength::Suffix: return "receiver_suffix_target_owner";
+        case ReceiverMatchStrength::Bare: return "receiver_bare_target_owner";
+        case ReceiverMatchStrength::None: break;
+    }
+    return "receiver_unrelated";
+}
+
 static void score_candidate(CallsiteCandidate& row,
                             const TargetCallsiteInfo& target,
                             const std::string& containing_name,
                             const std::string& containing_qualname) {
     bool has_receiver = !row.receiver_hint.empty();
-    bool strong_owner = receiver_matches_owner(row.receiver_hint, target);
+    ReceiverMatchStrength receiver_match = receiver_owner_match_strength(row.receiver_hint, target);
+    bool strong_owner = receiver_match != ReceiverMatchStrength::None;
     bool this_in_owner = iequals(row.receiver_hint, "this") &&
                          containing_context_matches_owner(containing_name, containing_qualname, target);
+    std::string owner_hint = !target.owner_qualname.empty() ? target.owner_qualname : target.owner_name;
 
     if (strong_owner) {
-        row.confidence = 0.75;
-        row.heuristic = "receiver_matches_target_owner";
-        row.receiver_type_hint = !target.owner_name.empty() ? target.owner_name : target.owner_qualname;
-        row.why = "call receiver text matches the target's containing type";
+        if (receiver_match == ReceiverMatchStrength::Exact) {
+            row.confidence = 0.90;
+            row.why = "call receiver text exactly matches the target's containing type";
+        } else if (receiver_match == ReceiverMatchStrength::Suffix) {
+            row.confidence = 0.82;
+            row.why = "call receiver text suffix matches the target's containing type";
+        } else {
+            row.confidence = 0.72;
+            row.why = "call receiver bare name matches the target's containing type";
+        }
+        row.heuristic = receiver_match_name(receiver_match);
+        row.receiver_type_hint = owner_hint;
     } else if (this_in_owner) {
-        row.confidence = 0.65;
+        row.confidence = 0.68;
         row.heuristic = "this_receiver_in_target_owner";
-        row.receiver_type_hint = !target.owner_name.empty() ? target.owner_name : target.owner_qualname;
+        row.receiver_type_hint = owner_hint;
         row.why = "this receiver appears inside the target's containing type";
     } else if (has_receiver) {
-        row.confidence = 0.55;
-        row.heuristic = "member_suffix_match";
-        row.why = "call ref ends with the target member name";
+        row.confidence = 0.40;
+        row.heuristic = "unrelated_member_suffix_match";
+        row.why = "call ref ends with the target member name but receiver text does not match the target type";
     } else {
-        row.confidence = 0.45;
+        row.confidence = 0.35;
         row.heuristic = "bare_name_match";
         row.why = "bare call ref matches the target name";
     }
 
     if (is_common_member_name(target.name) && !strong_owner && !this_in_owner) {
-        row.confidence = std::max(0.30, row.confidence - 0.05);
+        row.confidence = std::max(0.20, row.confidence - 0.10);
         row.why += "; confidence reduced for common member name";
     }
 }
 
-static std::vector<CallsiteCandidate> collect_callsite_candidates(
-        int64_t target_node_id, int64_t limit, Connection& conn, QueryCache& cache) {
-    std::vector<CallsiteCandidate> rows;
-    if (limit <= 0) return rows;
+static bool candidate_matches_receiver_filter(const CallsiteCandidate& row,
+                                              const std::string& receiver_filter) {
+    if (receiver_filter.empty()) return true;
+    return receiver_text_matches_name(row.receiver_hint, receiver_filter) ||
+           receiver_text_matches_name(row.receiver_type_hint, receiver_filter);
+}
+
+static size_t estimate_callsite_candidate_bytes(const CallsiteCandidate& row,
+                                                bool include_handles) {
+    size_t bytes = 96 + cstr_len(row.caller_name.c_str()) + cstr_len(row.file_path.c_str()) +
+                   cstr_len(row.callee_text.c_str()) + cstr_len(row.receiver_hint.c_str()) +
+                   cstr_len(row.receiver_type_hint.c_str()) + cstr_len(row.heuristic.c_str());
+    if (include_handles) {
+        bytes += 120 + cstr_len(row.caller_qualname.c_str()) + cstr_len(row.why.c_str()) +
+                 cstr_len(row.evidence.c_str());
+    }
+    return bytes;
+}
+
+static CallsiteCandidateSet collect_callsite_candidates(
+        int64_t target_node_id, int64_t limit, Connection& conn, QueryCache& cache,
+        const CallsiteCandidateOptions& options) {
+    CallsiteCandidateSet result;
+    result.max_bytes = options.max_bytes;
+    if (limit <= 0) return result;
     if (limit > 500) limit = 500;
 
     TargetCallsiteInfo target;
@@ -484,10 +603,10 @@ static std::vector<CallsiteCandidate> collect_callsite_candidates(
         "LEFT JOIN nodes cn ON cn.id = ce.src_id "
         "WHERE n.id = ? AND n.node_type = 'symbol' LIMIT 1");
     sqlite3_bind_int64(target_stmt, 1, target_node_id);
-    if (sqlite3_step(target_stmt) != SQLITE_ROW) return rows;
+    if (sqlite3_step(target_stmt) != SQLITE_ROW) return result;
 
     auto* name_txt = sqlite3_column_text(target_stmt, 0);
-    if (!name_txt) return rows;
+    if (!name_txt) return result;
     target.name = reinterpret_cast<const char*>(name_txt);
     auto* qn_txt = sqlite3_column_text(target_stmt, 1);
     target.qualname = qn_txt ? reinterpret_cast<const char*>(qn_txt) : "";
@@ -501,7 +620,19 @@ static std::vector<CallsiteCandidate> collect_callsite_candidates(
     auto like_dot = "%." + target.name;
     auto like_colon = "%::" + target.name;
     auto like_arrow = "%->" + target.name;
-    int64_t query_limit = std::min<int64_t>(1000, std::max<int64_t>(limit * 4, limit));
+    int64_t query_limit = std::min<int64_t>(
+        5000,
+        std::max<int64_t>(options.receiver_filter.empty() ? limit * 4 : limit * 20, limit));
+
+    auto* count_stmt = cache.get("approx_callsite_candidates_count",
+        "SELECT COUNT(*) "
+        "FROM refs r "
+        "WHERE r.kind = 'call' AND (r.name = ? OR r.name LIKE ? OR r.name LIKE ? OR r.name LIKE ?)");
+    sqlite3_bind_text(count_stmt, 1, target.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 2, like_dot.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 3, like_colon.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(count_stmt, 4, like_arrow.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) result.total = sqlite3_column_int64(count_stmt, 0);
 
     auto* stmt = cache.get("approx_callsite_candidates",
         "SELECT r.id, r.name, f.path, r.start_line, r.start_col, r.end_line, r.end_col, "
@@ -517,6 +648,7 @@ static std::vector<CallsiteCandidate> collect_callsite_candidates(
     sqlite3_bind_text(stmt, 4, like_arrow.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 5, query_limit);
 
+    std::vector<CallsiteCandidate> rows;
     std::unordered_set<std::string> seen;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CallsiteCandidate row;
@@ -552,31 +684,96 @@ static std::vector<CallsiteCandidate> collect_callsite_candidates(
         if (lhs.start_line != rhs.start_line) return lhs.start_line < rhs.start_line;
         return lhs.start_col < rhs.start_col;
     });
-    if (static_cast<int64_t>(rows.size()) > limit) rows.resize(static_cast<size_t>(limit));
-    return rows;
+
+    size_t approx_bytes = 256;
+    for (const auto& row : rows) {
+        if (!candidate_matches_receiver_filter(row, options.receiver_filter)) continue;
+        size_t item_bytes = estimate_callsite_candidate_bytes(row, options.include_handles);
+        if (result.max_bytes > 0 && !result.rows.empty() &&
+            approx_bytes + item_bytes > static_cast<size_t>(result.max_bytes)) {
+            result.budget_exceeded = true;
+            result.has_more = true;
+            break;
+        }
+        if (static_cast<int64_t>(result.rows.size()) >= limit) {
+            result.has_more = true;
+            break;
+        }
+        result.rows.push_back(row);
+        approx_bytes += item_bytes + 1;
+    }
+    if (result.total > static_cast<int64_t>(result.rows.size()))
+        result.filtered_hidden = result.total - static_cast<int64_t>(result.rows.size());
+    return result;
 }
 
-static yyjson_mut_val* emit_callsite_candidate(JsonMutDoc& doc, const CallsiteCandidate& row) {
+static yyjson_mut_val* emit_callsite_candidate(JsonMutDoc& doc, const CallsiteCandidate& row,
+                                               bool include_handles) {
     auto* item = doc.new_obj();
-    yyjson_mut_obj_add_int(doc.doc, item, "ref_id", row.ref_id);
-    if (row.caller_node_id > 0) yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", row.caller_node_id);
     if (!row.caller_name.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", row.caller_name.c_str());
-    if (!row.caller_qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_qualname", row.caller_qualname.c_str());
-    if (!row.file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", row.file_path.c_str());
-    auto* span = doc.new_obj();
-    yyjson_mut_obj_add_int(doc.doc, span, "start_line", row.start_line);
-    yyjson_mut_obj_add_int(doc.doc, span, "start_col", row.start_col);
-    yyjson_mut_obj_add_int(doc.doc, span, "end_line", row.end_line);
-    yyjson_mut_obj_add_int(doc.doc, span, "end_col", row.end_col);
-    yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+    if (!row.file_path.empty()) {
+        yyjson_mut_obj_add_strcpy(doc.doc, item, include_handles ? "file_path" : "file", row.file_path.c_str());
+    }
+    yyjson_mut_obj_add_int(doc.doc, item, "start_line", row.start_line);
+    if (row.start_col > 0) yyjson_mut_obj_add_int(doc.doc, item, "start_col", row.start_col);
+    if (include_handles) {
+        yyjson_mut_obj_add_int(doc.doc, item, "ref_id", row.ref_id);
+        if (row.caller_node_id > 0) yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", row.caller_node_id);
+        if (!row.caller_qualname.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_qualname", row.caller_qualname.c_str());
+        auto* span = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, span, "start_line", row.start_line);
+        yyjson_mut_obj_add_int(doc.doc, span, "start_col", row.start_col);
+        yyjson_mut_obj_add_int(doc.doc, span, "end_line", row.end_line);
+        yyjson_mut_obj_add_int(doc.doc, span, "end_col", row.end_col);
+        yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+    }
     yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_text", row.callee_text.c_str());
     if (!row.receiver_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_hint", row.receiver_hint.c_str());
     if (!row.receiver_type_hint.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "receiver_type_hint", row.receiver_type_hint.c_str());
     yyjson_mut_obj_add_real(doc.doc, item, "confidence", row.confidence);
     yyjson_mut_obj_add_strcpy(doc.doc, item, "heuristic", row.heuristic.c_str());
-    yyjson_mut_obj_add_strcpy(doc.doc, item, "why", row.why.c_str());
-    if (!row.evidence.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", row.evidence.c_str());
+    if (include_handles) {
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "why", row.why.c_str());
+        if (!row.evidence.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", row.evidence.c_str());
+    }
     return item;
+}
+
+static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* root,
+                                            const char* prefix,
+                                            const CallsiteCandidateSet& candidates,
+                                            const CallsiteCandidateOptions& options) {
+    std::string p(prefix ? prefix : "candidate");
+    if (p == "candidate") {
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_filtered_hidden", candidates.filtered_hidden);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_max_bytes", candidates.max_bytes);
+        if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_has_more", true);
+        if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_budget_exceeded", true);
+        if (!options.receiver_filter.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, root, "candidate_receiver", options.receiver_filter.c_str());
+        yyjson_mut_obj_add_int(doc.doc, root, "total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", candidates.filtered_hidden);
+        yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", candidates.max_bytes);
+        if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
+    } else if (p == "candidate_callers") {
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_filtered_hidden", candidates.filtered_hidden);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_max_bytes", candidates.max_bytes);
+        if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_has_more", true);
+        if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_budget_exceeded", true);
+        if (!options.receiver_filter.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, root, "candidate_callers_receiver", options.receiver_filter.c_str());
+    } else if (p == "candidate_impacted") {
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_total", candidates.total);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_filtered_hidden", candidates.filtered_hidden);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_max_bytes", candidates.max_bytes);
+        if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_has_more", true);
+        if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_budget_exceeded", true);
+        if (!options.receiver_filter.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, root, "candidate_impacted_receiver", options.receiver_filter.c_str());
+    }
 }
 
 // Resolves a user-supplied path to the canonical absolute path as stored in the DB.
@@ -2071,6 +2268,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     const char* group_by = params ? json_get_str(params, "group_by") : nullptr;
     bool compact = params ? json_get_bool(params, "compact", false) : false;
     CandidateMode candidate_mode = parse_candidate_mode(params);
+    CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
     (void)repo_root;
 
     auto* stmt = cache.get("callers_approx",
@@ -2110,9 +2308,9 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         r.confidence = sqlite3_column_double(stmt, 7);
         rows.push_back(std::move(r));
     }
-    auto candidates = should_collect_candidates(candidate_mode, rows.empty())
-        ? collect_callsite_candidates(node_id, limit, conn, cache)
-        : std::vector<CallsiteCandidate>();
+    CallsiteCandidateSet candidates;
+    if (should_collect_candidates(candidate_mode, rows.empty()))
+        candidates = collect_callsite_candidates(node_id, limit, conn, cache, candidate_options);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -2175,12 +2373,14 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_bool(doc.doc, root, "has_more", false);
     }
 
-    if (!candidates.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
+    if (!candidates.rows.empty() || should_collect_candidates(candidate_mode, rows.empty())) {
         auto* candidate_results = doc.new_arr();
-        for (const auto& candidate : candidates)
-            yyjson_mut_arr_append(candidate_results, emit_callsite_candidate(doc, candidate));
+        for (const auto& candidate : candidates.rows)
+            yyjson_mut_arr_append(candidate_results,
+                emit_callsite_candidate(doc, candidate, candidate_options.include_handles));
         yyjson_mut_obj_add_val(doc.doc, root, "candidate_results", candidate_results);
         yyjson_mut_obj_add_str(doc.doc, root, "candidate_source", "refs");
+        add_callsite_candidate_metadata(doc, root, "candidate", candidates, candidate_options);
     }
 
     return doc.to_string();
@@ -2625,6 +2825,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
     int64_t max_callers = max_callers_val ? yyjson_get_sint(max_callers_val) : 10;
     int64_t max_callees = max_callees_val ? yyjson_get_sint(max_callees_val) : 10;
     CandidateMode candidate_mode = parse_candidate_mode(params);
+    CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
     if (max_source_lines < 0)
         return McpError::invalid_input("Invalid 'max_source_lines': must be >= 0").to_json_rpc(0);
     if (max_callers < 0)
@@ -2711,12 +2912,14 @@ std::string context_for(yyjson_val* params, Connection& conn,
     if (callers_truncated) yyjson_mut_obj_add_bool(doc.doc, root, "callers_truncated", true);
     if (should_collect_candidates(candidate_mode, exact_callers_empty)) {
         int64_t candidate_limit = max_callers > 0 ? max_callers : 500;
-        auto candidates = collect_callsite_candidates(node_id, candidate_limit, conn, cache);
+        auto candidates = collect_callsite_candidates(node_id, candidate_limit, conn, cache, candidate_options);
         auto* candidate_callers = doc.new_arr();
-        for (const auto& candidate : candidates)
-            yyjson_mut_arr_append(candidate_callers, emit_callsite_candidate(doc, candidate));
+        for (const auto& candidate : candidates.rows)
+            yyjson_mut_arr_append(candidate_callers,
+                emit_callsite_candidate(doc, candidate, candidate_options.include_handles));
         yyjson_mut_obj_add_val(doc.doc, root, "candidate_callers", candidate_callers);
         yyjson_mut_obj_add_str(doc.doc, root, "candidate_callers_source", "refs");
+        add_callsite_candidate_metadata(doc, root, "candidate_callers", candidates, candidate_options);
     }
 
     // Callees
@@ -3034,6 +3237,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     int64_t max_nodes = params ? json_get_int(params, "max_nodes", 50) : 50;
     if (max_nodes > 200) max_nodes = 200;
     CandidateMode candidate_mode = parse_candidate_mode(params);
+    CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
 
     // BFS from node_id following reverse edges
     std::vector<int64_t> frontier = {node_id};
@@ -3110,11 +3314,11 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_val(doc.doc, root, "impacted", impacted);
 
     if (should_collect_candidates(candidate_mode, !exact_seed_inbound_call_found)) {
-        auto candidates = collect_callsite_candidates(node_id, max_nodes, conn, cache);
+        auto candidates = collect_callsite_candidates(node_id, max_nodes, conn, cache, candidate_options);
         auto* candidate_impacted = doc.new_arr();
         std::unordered_set<std::string> candidate_files;
-        for (const auto& candidate : candidates) {
-            auto* item = emit_callsite_candidate(doc, candidate);
+        for (const auto& candidate : candidates.rows) {
+            auto* item = emit_callsite_candidate(doc, candidate, candidate_options.include_handles);
             yyjson_mut_obj_add_str(doc.doc, item, "relationship", "calls_candidate");
             yyjson_mut_obj_add_int(doc.doc, item, "distance", 1);
             yyjson_mut_arr_append(candidate_impacted, item);
@@ -3126,6 +3330,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
             yyjson_mut_arr_add_strcpy(doc.doc, candidate_files_arr, f.c_str());
         yyjson_mut_obj_add_val(doc.doc, root, "candidate_impacted_files", candidate_files_arr);
         yyjson_mut_obj_add_str(doc.doc, root, "candidate_impacted_source", "refs");
+        add_callsite_candidate_metadata(doc, root, "candidate_impacted", candidates, candidate_options);
     }
 
     auto* files_arr = doc.new_arr();

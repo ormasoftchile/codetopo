@@ -124,7 +124,8 @@ static void insert_call_ref(Connection& conn, int64_t file_id, const char* name,
     step_done(conn, stmt);
 }
 
-static TestDb make_approx_db(const std::string& name, bool exact_set_edge = false) {
+static TestDb make_approx_db(const std::string& name, bool exact_set_edge = false,
+                             int extra_linked_set_refs = 0) {
     TestDb db;
     db.root = fs::path("build") / "test_approx_callgraph" / name;
     cleanup(db.root);
@@ -162,6 +163,12 @@ static TestDb make_approx_db(const std::string& name, bool exact_set_edge = fals
 
     insert_call_ref(conn, caller_file, "linked.set", 4, 3, 13, db.ids.use_linked);
     insert_call_ref(conn, caller_file, "this.set", 5, 3, 11, db.ids.use_linked);
+    insert_call_ref(conn, caller_file, "LinkedMap.set", 6, 3, 16, db.ids.use_linked);
+    insert_call_ref(conn, caller_file, "unrelated.set", 7, 3, 17, db.ids.use_linked);
+    insert_call_ref(conn, caller_file, "OtherMap.set", 8, 3, 16, db.ids.use_linked);
+    for (int i = 0; i < extra_linked_set_refs; ++i) {
+        insert_call_ref(conn, caller_file, "LinkedMap.set", 20 + i, 3, 16, db.ids.use_linked);
+    }
 
     schema::set_kv(conn, "schema_version", "1");
     schema::set_kv(conn, "indexer_version", "test");
@@ -172,16 +179,20 @@ static TestDb make_approx_db(const std::string& name, bool exact_set_edge = fals
     return db;
 }
 
-static std::string invoke_callers(const TestDb& db, int64_t node_id,
-                                  const char* mode = "exact_then_candidates") {
+static std::string invoke_callers_raw(const TestDb& db, const std::string& params) {
     Connection conn(db.db_path, true);
     QueryCache cache(conn);
-    std::string params = "{\"node_id\":" + std::to_string(node_id) +
-                         ",\"limit\":20,\"include_candidates\":true,\"mode\":\"" +
-                         mode + "\"}";
     auto params_doc = json_parse(params);
     REQUIRE(params_doc);
     return tools::callers_approx(params_doc.root(), conn, cache, db.root.string());
+}
+
+static std::string invoke_callers(const TestDb& db, int64_t node_id,
+                                 const char* mode = "exact_then_candidates") {
+    std::string params = "{\"node_id\":" + std::to_string(node_id) +
+                         ",\"limit\":20,\"include_candidates\":true,\"mode\":\"" +
+                         mode + "\",\"include_handles\":true}";
+    return invoke_callers_raw(db, params);
 }
 
 static std::string invoke_context_for(const TestDb& db, int64_t node_id) {
@@ -189,7 +200,8 @@ static std::string invoke_context_for(const TestDb& db, int64_t node_id) {
     QueryCache cache(conn);
     std::string params = "{\"node_id\":" + std::to_string(node_id) +
                          ",\"include_source\":false,\"max_callers\":20,"
-                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\"}";
+                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\","
+                         "\"include_handles\":true}";
     auto params_doc = json_parse(params);
     REQUIRE(params_doc);
     return tools::context_for(params_doc.root(), conn, cache, db.root.string());
@@ -200,7 +212,8 @@ static std::string invoke_impact_of(const TestDb& db, int64_t node_id) {
     QueryCache cache(conn);
     std::string params = "{\"node_id\":" + std::to_string(node_id) +
                          ",\"depth\":1,\"max_nodes\":20,"
-                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\"}";
+                         "\"include_candidates\":true,\"mode\":\"exact_then_candidates\","
+                         "\"include_handles\":true}";
     auto params_doc = json_parse(params);
     REQUIRE(params_doc);
     return tools::impact_of(params_doc.root(), conn, cache, db.root.string());
@@ -214,6 +227,10 @@ static yyjson_val* require_array_field(yyjson_val* obj, const char* key) {
     return arr;
 }
 
+static bool has_field(yyjson_val* obj, const char* key) {
+    return yyjson_obj_get(obj, key) != nullptr;
+}
+
 static yyjson_val* find_item_with_string(yyjson_val* arr, const char* key,
                                          const std::string& value) {
     yyjson_val* item = nullptr;
@@ -224,6 +241,14 @@ static yyjson_val* find_item_with_string(yyjson_val* arr, const char* key,
         if (field && value == field) return item;
     }
     return nullptr;
+}
+
+static double require_confidence(yyjson_val* candidate) {
+    REQUIRE(candidate != nullptr);
+    yyjson_val* confidence = yyjson_obj_get(candidate, "confidence");
+    REQUIRE(confidence != nullptr);
+    REQUIRE(yyjson_is_num(confidence));
+    return yyjson_get_real(confidence);
 }
 
 static void require_callsite_candidate(yyjson_val* candidate, const std::string& callee_text) {
@@ -343,4 +368,116 @@ TEST_CASE("callers_approx uses exact edges for uniquely named symbols",
         REQUIRE(yyjson_is_arr(candidates));
         CHECK(yyjson_arr_size(candidates) == 0);
     }
+}
+
+TEST_CASE("callers_approx candidate results respect max_bytes budget",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-budget", false, 200);
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":500,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"max_bytes\":1200}");
+    INFO("candidate response bytes: " << result.size());
+    CHECK(result.size() < 4096);
+
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* root = doc.root();
+    CHECK(json_get_int(root, "max_bytes", -1) == 1200);
+    CHECK(json_get_bool(root, "budget_exceeded", false));
+    CHECK(json_get_int(root, "total_candidates", -1) > 20);
+
+    auto* candidates = require_array_field(root, "candidate_results");
+    CHECK(yyjson_arr_size(candidates) > 0);
+    CHECK(yyjson_arr_size(candidates) <
+          static_cast<size_t>(json_get_int(root, "total_candidates", 0)));
+}
+
+TEST_CASE("callers_approx candidate confidence rewards matching receiver hints",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-confidence");
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\"}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* matching_receiver = find_item_with_string(candidates, "callee_text", "LinkedMap.set");
+    auto* unrelated_receiver = find_item_with_string(candidates, "callee_text", "unrelated.set");
+    REQUIRE(matching_receiver != nullptr);
+    REQUIRE(unrelated_receiver != nullptr);
+    CHECK(require_confidence(matching_receiver) > require_confidence(unrelated_receiver));
+}
+
+TEST_CASE("callers_approx receiver filter narrows candidates and reports hidden count",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("receiver-filter");
+
+    auto unfiltered_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\"}");
+    auto unfiltered_doc = json_parse(unfiltered_result);
+    REQUIRE(unfiltered_doc);
+    auto* unfiltered_candidates = require_array_field(unfiltered_doc.root(), "candidate_results");
+    REQUIRE(yyjson_arr_size(unfiltered_candidates) >= 3);
+
+    auto filtered_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"receiver\":\"LinkedMap\"}");
+    auto filtered_doc = json_parse(filtered_result);
+    REQUIRE(filtered_doc);
+    auto* root = filtered_doc.root();
+    auto* filtered_candidates = require_array_field(root, "candidate_results");
+
+    CHECK(yyjson_arr_size(filtered_candidates) > 0);
+    CHECK(yyjson_arr_size(filtered_candidates) < yyjson_arr_size(unfiltered_candidates));
+    CHECK(has_field(root, "total"));
+    CHECK(has_field(root, "filtered_hidden"));
+    CHECK(json_get_int(root, "filtered_hidden", -1) > 0);
+
+    yyjson_val* item = nullptr;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(filtered_candidates, &iter);
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        const char* receiver_hint = json_get_str(item, "receiver_hint");
+        REQUIRE(receiver_hint != nullptr);
+        CHECK(std::string(receiver_hint) == "LinkedMap");
+    }
+}
+
+TEST_CASE("callers_approx candidate handles are opt-in",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-include-handles");
+
+    auto lean_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\"}");
+    auto lean_doc = json_parse(lean_result);
+    REQUIRE(lean_doc);
+    auto* lean_candidates = require_array_field(lean_doc.root(), "candidate_results");
+    auto* lean_item = find_item_with_string(lean_candidates, "callee_text", "LinkedMap.set");
+    REQUIRE(lean_item != nullptr);
+    CHECK_FALSE(has_field(lean_item, "node_id"));
+    CHECK_FALSE(has_field(lean_item, "caller_node_id"));
+    CHECK_FALSE(has_field(lean_item, "ref_id"));
+    CHECK_FALSE(has_field(lean_item, "span"));
+
+    auto handles_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true}");
+    auto handles_doc = json_parse(handles_result);
+    REQUIRE(handles_doc);
+    auto* handles_candidates = require_array_field(handles_doc.root(), "candidate_results");
+    auto* handles_item = find_item_with_string(handles_candidates, "callee_text", "LinkedMap.set");
+    REQUIRE(handles_item != nullptr);
+
+    bool has_node_handle = has_field(handles_item, "node_id") ||
+                           has_field(handles_item, "caller_node_id");
+    CHECK(has_node_handle);
+    CHECK(has_field(handles_item, "span"));
 }
