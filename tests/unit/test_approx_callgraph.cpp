@@ -535,6 +535,31 @@ TEST_CASE("callers_approx filters arity mismatches and ranks same-arity patterns
     CHECK(json_get_int(doc.root(), "arity_filtered", 0) >= 2);
 }
 
+TEST_CASE("callers_approx accepts calls omitting optional/defaulted trailing params",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-optional-arity");
+    Connection conn(db.db_path);
+    conn.exec(std::string("UPDATE nodes SET signature = 'set(key: string, value: number, touch: Touch = Touch.None): this' WHERE id = ") +
+             std::to_string(db.ids.linked_set));
+    conn.exec("UPDATE refs SET arg_count = 2, arg_pattern = 'string,number', receiver_type_hint = 'LinkedMap' WHERE name = 'linked.set'");
+    conn.exec("UPDATE refs SET arg_count = 1, arg_pattern = 'string', receiver_type_hint = 'LinkedMap' WHERE name = 'this.set'");
+    conn.exec("UPDATE refs SET arg_count = 4, arg_pattern = 'string,number,number,number', receiver_type_hint = 'LinkedMap' WHERE name = 'LinkedMap.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true,\"receiver\":\"LinkedMap\"}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+
+    CHECK(find_item_with_string(candidates, "callee_text", "linked.set") != nullptr);
+    CHECK(find_item_with_string(candidates, "callee_text", "this.set") == nullptr);
+    CHECK(find_item_with_string(candidates, "callee_text", "LinkedMap.set") == nullptr);
+    CHECK(json_get_int(doc.root(), "candidate_eligible", 0) > 0);
+}
+
 TEST_CASE("callers_approx prefers same-file local receiver type hints",
           "[unit][approx-callgraph]") {
     auto db = make_approx_db("candidate-local-receiver-type");
@@ -558,6 +583,31 @@ TEST_CASE("callers_approx prefers same-file local receiver type hints",
     CHECK(require_confidence(typed_receiver) > require_confidence(unrelated_receiver));
     REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
     CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("receiver_type") != std::string::npos);
+}
+
+TEST_CASE("callers_approx infers target owner from lexical span when containment is flat",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-lexical-owner");
+    Connection conn(db.db_path);
+    conn.exec(std::string("UPDATE nodes SET qualname = 'set' WHERE id = ") +
+             std::to_string(db.ids.linked_set));
+    conn.exec(std::string("DELETE FROM edges WHERE kind = 'contains' AND dst_id = ") +
+             std::to_string(db.ids.linked_set));
+    conn.exec("UPDATE refs SET receiver_type_hint = 'LinkedMap' WHERE name = 'linked.set'");
+    conn.wal_checkpoint();
+
+    auto result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true,\"receiver\":\"LinkedMap\"}");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* candidates = require_array_field(doc.root(), "candidate_results");
+    auto* typed_receiver = find_item_with_string(candidates, "callee_text", "linked.set");
+    REQUIRE(typed_receiver != nullptr);
+    REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
+    CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("receiver_type") != std::string::npos);
+    CHECK(json_get_int(doc.root(), "candidate_eligible", 0) > 0);
 }
 
 TEST_CASE("callers_approx lean mode returns summary buckets and top candidates",

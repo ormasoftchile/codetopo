@@ -340,9 +340,11 @@ struct TargetCallsiteInfo {
     std::string owner_name;
     std::string owner_qualname;
     std::string signature;
+    int64_t file_id = -1;
     std::string file_path;
     int start_line = 0;
     int end_line = 0;
+    int min_param_count = -1;
     int param_count = -1;
     std::string param_pattern;
 };
@@ -797,6 +799,44 @@ static std::string classify_param_shape(std::string param) {
     return "unknown";
 }
 
+static bool has_top_level_char(const std::string& text, char needle) {
+    int paren = 0, angle = 0, brace = 0, bracket = 0;
+    char quote = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char c = text[i];
+        if (quote) {
+            if (c == quote && (i == 0 || text[i - 1] != '\\')) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'' || c == '`') {
+            quote = c;
+            continue;
+        }
+        if (c == '(') ++paren;
+        else if (c == ')' && paren > 0) --paren;
+        else if (c == '<') ++angle;
+        else if (c == '>' && angle > 0) --angle;
+        else if (c == '{') ++brace;
+        else if (c == '}' && brace > 0) --brace;
+        else if (c == '[') ++bracket;
+        else if (c == ']' && bracket > 0) --bracket;
+        else if (c == needle && paren == 0 && angle == 0 && brace == 0 && bracket == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool param_is_optional(const std::string& param) {
+    if (has_top_level_char(param, '=')) return true;
+    size_t colon = param.find(':');
+    size_t limit = colon == std::string::npos ? param.size() : colon;
+    for (size_t i = 0; i < limit; ++i) {
+        if (param[i] == '?') return true;
+    }
+    return false;
+}
+
 static std::string join_pattern_parts(const std::vector<std::string>& parts) {
     std::string out;
     for (const auto& part : parts) {
@@ -808,6 +848,7 @@ static std::string join_pattern_parts(const std::vector<std::string>& parts) {
 
 static bool parse_param_shape_from_text(const std::string& text,
                                         const std::string& target_name,
+                                        int& min_param_count,
                                         int& param_count,
                                         std::string& param_pattern) {
     if (text.empty()) return false;
@@ -837,21 +878,26 @@ static bool parse_param_shape_from_text(const std::string& text,
 
     auto params = split_top_level_commas(text.substr(open + 1, close - open - 1));
     param_count = static_cast<int>(params.size());
+    min_param_count = 0;
     std::vector<std::string> shapes;
     shapes.reserve(params.size());
-    for (auto& p : params) shapes.push_back(classify_param_shape(p));
+    for (auto& p : params) {
+        if (!param_is_optional(p)) ++min_param_count;
+        shapes.push_back(classify_param_shape(p));
+    }
     param_pattern = join_pattern_parts(shapes);
     return true;
 }
 
 static void populate_target_param_shape(TargetCallsiteInfo& target,
                                         const std::string& repo_root) {
-    if (parse_param_shape_from_text(target.signature, target.name,
+    if (parse_param_shape_from_text(target.signature, target.name, target.min_param_count,
                                     target.param_count, target.param_pattern))
         return;
     if (target.file_path.empty() || target.start_line <= 0 || target.end_line <= 0) return;
     auto source = read_source_snippet(repo_root, target.file_path, target.start_line, target.end_line);
-    parse_param_shape_from_text(source, target.name, target.param_count, target.param_pattern);
+    parse_param_shape_from_text(source, target.name, target.min_param_count,
+                                target.param_count, target.param_pattern);
 }
 
 static std::vector<std::string> split_pattern(const std::string& pattern) {
@@ -981,7 +1027,8 @@ static void score_candidate(CallsiteCandidate& row,
 static bool apply_arity_and_pattern_score(CallsiteCandidate& row,
                                           const TargetCallsiteInfo& target) {
     if (target.param_count < 0 || row.arg_count < 0) return true;
-    if (row.arg_count != target.param_count) {
+    int min_param_count = target.min_param_count >= 0 ? target.min_param_count : target.param_count;
+    if (row.arg_count < min_param_count || row.arg_count > target.param_count) {
         row.heuristic = "arity_mismatch_filtered";
         row.why = "call arity does not match the target overload parameter count";
         return false;
@@ -1029,10 +1076,10 @@ static CallsiteCandidateSet collect_callsite_candidates(
 
     TargetCallsiteInfo target;
     auto* target_stmt = cache.get("approx_callsite_target",
-        "SELECT n.name, n.qualname, cn.name, cn.qualname, n.signature, f.path, n.start_line, n.end_line "
+        "SELECT n.name, n.qualname, cn.name, cn.qualname, n.signature, n.file_id, f.path, n.start_line, n.end_line "
         "FROM nodes n "
         "LEFT JOIN edges ce ON ce.dst_id = n.id AND ce.kind = 'contains' "
-        "LEFT JOIN nodes cn ON cn.id = ce.src_id "
+        "LEFT JOIN nodes cn ON cn.id = ce.src_id AND cn.node_type = 'symbol' "
         "LEFT JOIN files f ON f.id = n.file_id "
         "WHERE n.id = ? AND n.node_type = 'symbol' LIMIT 1");
     sqlite3_bind_int64(target_stmt, 1, target_node_id);
@@ -1049,24 +1096,38 @@ static CallsiteCandidateSet collect_callsite_candidates(
     target.owner_qualname = owner_qn_txt ? reinterpret_cast<const char*>(owner_qn_txt) : "";
     auto* sig_txt = sqlite3_column_text(target_stmt, 4);
     target.signature = sig_txt ? reinterpret_cast<const char*>(sig_txt) : "";
-    auto* file_txt = sqlite3_column_text(target_stmt, 5);
+    target.file_id = sqlite3_column_int64(target_stmt, 5);
+    auto* file_txt = sqlite3_column_text(target_stmt, 6);
     target.file_path = file_txt ? reinterpret_cast<const char*>(file_txt) : "";
-    target.start_line = sqlite3_column_int(target_stmt, 6);
-    target.end_line = sqlite3_column_int(target_stmt, 7);
+    target.start_line = sqlite3_column_int(target_stmt, 7);
+    target.end_line = sqlite3_column_int(target_stmt, 8);
     if (target.owner_name.empty()) target.owner_name = trailing_identifier(qualname_owner(target.qualname));
     if (target.owner_qualname.empty()) target.owner_qualname = qualname_owner(target.qualname);
+    if (target.owner_name.empty() && target.file_id > 0 && target.start_line > 0) {
+        auto* owner_stmt = cache.get("approx_callsite_lexical_owner",
+            "SELECT name, qualname FROM nodes "
+            "WHERE file_id = ? AND node_type = 'symbol' "
+            "AND kind IN ('class','struct','interface','type_alias','type','enum') "
+            "AND start_line <= ? AND end_line >= ? "
+            "ORDER BY (end_line - start_line) ASC, start_line DESC LIMIT 1");
+        sqlite3_bind_int64(owner_stmt, 1, target.file_id);
+        sqlite3_bind_int(owner_stmt, 2, target.start_line);
+        sqlite3_bind_int(owner_stmt, 3, target.end_line > 0 ? target.end_line : target.start_line);
+        if (sqlite3_step(owner_stmt) == SQLITE_ROW) {
+            auto* lexical_owner = sqlite3_column_text(owner_stmt, 0);
+            auto* lexical_owner_qn = sqlite3_column_text(owner_stmt, 1);
+            target.owner_name = lexical_owner ? reinterpret_cast<const char*>(lexical_owner) : "";
+            target.owner_qualname = lexical_owner_qn ? reinterpret_cast<const char*>(lexical_owner_qn) : "";
+        }
+    }
     populate_target_param_shape(target, repo_root);
 
     auto like_dot = "%." + target.name;
     auto like_colon = "%::" + target.name;
     auto like_arrow = "%->" + target.name;
-    int64_t query_limit = std::min<int64_t>(
-        5000,
-        std::max<int64_t>({
-            options.receiver_filter.empty() ? limit * 4 : limit * 20,
-            limit,
-            200
-        }));
+    int64_t query_limit = options.receiver_filter.empty()
+        ? std::min<int64_t>(5000, std::max<int64_t>({limit * 4, limit, 200}))
+        : 5000;
 
     auto* count_stmt = cache.get("approx_callsite_candidates_count",
         "SELECT COUNT(*) "
@@ -1095,6 +1156,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
 
     std::vector<CallsiteCandidate> rows;
     std::unordered_set<std::string> seen;
+    std::unordered_map<std::string, ReceiverTypeResolution> receiver_resolution_cache;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CallsiteCandidate row;
         row.ref_id = sqlite3_column_int64(stmt, 0);
@@ -1125,13 +1187,32 @@ static CallsiteCandidateSet collect_callsite_candidates(
                           std::to_string(row.start_col) + ":" + row.callee_text;
         if (!seen.insert(key).second) continue;
 
-        if (!row.receiver_type_hint.empty()) {
-            auto resolved = resolve_receiver_type_hint(row, target, conn, cache);
-            if (resolved.resolved) {
-                row.resolved_receiver_type = resolved.resolved_type;
-                row.receiver_type_resolution_source = resolved.source;
-            } else if (resolved.ambiguous) {
-                row.receiver_type_ambiguous = true;
+        bool raw_receiver_type_matches_target =
+            receiver_owner_match_strength(canonical_type_hint(row.receiver_type_hint), target) !=
+                ReceiverMatchStrength::None;
+        if (!row.receiver_type_hint.empty() &&
+            !(raw_receiver_type_matches_target && !options.receiver_filter.empty())) {
+            bool receiver_filter_can_match =
+                options.receiver_filter.empty() ||
+                receiver_text_matches_name(row.receiver_hint, options.receiver_filter) ||
+                receiver_text_matches_name(row.receiver_type_hint, options.receiver_filter);
+            if (receiver_filter_can_match) {
+                std::string resolution_key = std::to_string(row.file_id) + "\x1f" +
+                                             canonical_type_hint(row.receiver_type_hint);
+                auto cached = receiver_resolution_cache.find(resolution_key);
+                ReceiverTypeResolution resolved;
+                if (cached != receiver_resolution_cache.end()) {
+                    resolved = cached->second;
+                } else {
+                    resolved = resolve_receiver_type_hint(row, target, conn, cache);
+                    receiver_resolution_cache.emplace(std::move(resolution_key), resolved);
+                }
+                if (resolved.resolved) {
+                    row.resolved_receiver_type = resolved.resolved_type;
+                    row.receiver_type_resolution_source = resolved.source;
+                } else if (resolved.ambiguous) {
+                    row.receiver_type_ambiguous = true;
+                }
             }
         }
         score_candidate(row, target, row.caller_name, row.caller_qualname);

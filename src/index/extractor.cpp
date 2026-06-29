@@ -101,21 +101,102 @@ std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
     return normalize_type_hint(line.substr(start, pos - start));
 }
 
+std::string lower_ascii(std::string s);
+
+std::string declaration_name_from_receiver(std::string receiver) {
+    receiver = trim_copy(std::move(receiver));
+    while (!receiver.empty() && (receiver.back() == '!' || receiver.back() == '?'))
+        receiver.pop_back();
+    size_t bracket = receiver.find_last_of(")]}");
+    if (bracket != std::string::npos && bracket + 1 == receiver.size()) return "";
+    size_t pos = receiver.find_last_of(".:");
+    if (pos != std::string::npos && pos + 1 < receiver.size())
+        receiver = receiver.substr(pos + 1);
+    while (!receiver.empty() && (receiver.back() == '!' || receiver.back() == '?'))
+        receiver.pop_back();
+    return is_simple_identifier(receiver) ? receiver : "";
+}
+
+bool declaration_prefix_allows_receiver(std::string before) {
+    before = trim_copy(std::move(before));
+    if (before.empty()) return true;
+    char last = before.back();
+    if (last == '(' || last == ',' || last == '[') return true;
+
+    std::vector<std::string> tokens;
+    std::string token;
+    for (char c : before) {
+        if (is_identifier_char(c)) {
+            token.push_back(c);
+        } else if (!token.empty()) {
+            tokens.push_back(lower_ascii(token));
+            token.clear();
+        }
+    }
+    if (!token.empty()) tokens.push_back(lower_ascii(token));
+    if (tokens.empty()) return true;
+
+    static const std::unordered_set<std::string> allowed = {
+        "const", "let", "var", "public", "private", "protected", "readonly",
+        "static", "declare", "export", "abstract", "override", "accessor"
+    };
+    for (const auto& t : tokens) {
+        if (!allowed.count(t)) return false;
+    }
+    return true;
+}
+
+std::string infer_type_from_new_expression(const std::string& text) {
+    size_t pos = text.find("new");
+    while (pos != std::string::npos) {
+        bool left_ok = (pos == 0) || !is_identifier_char(text[pos - 1]);
+        size_t after_new = pos + 3;
+        bool right_ok = after_new >= text.size() ||
+            std::isspace(static_cast<unsigned char>(text[after_new]));
+        if (left_ok && right_ok) {
+            size_t start = after_new;
+            while (start < text.size() && std::isspace(static_cast<unsigned char>(text[start]))) ++start;
+            size_t end = start;
+            while (end < text.size() &&
+                   (is_identifier_char(text[end]) || text[end] == '.' || text[end] == ':')) {
+                ++end;
+            }
+            auto type = normalize_type_hint(text.substr(start, end - start));
+            if (!type.empty()) return type;
+        }
+        pos = text.find("new", pos + 3);
+    }
+    return "";
+}
+
 std::string infer_type_from_declaration_line(const std::string& line, const std::string& receiver) {
-    size_t pos = line.find(receiver);
+    std::string declared_name = declaration_name_from_receiver(receiver);
+    if (declared_name.empty()) return "";
+
+    size_t pos = line.find(declared_name);
     while (pos != std::string::npos) {
         bool left_ok = (pos == 0) || !is_identifier_char(line[pos - 1]);
-        size_t end = pos + receiver.size();
+        size_t end = pos + declared_name.size();
         bool right_ok = (end >= line.size()) || !is_identifier_char(line[end]);
-        if (left_ok && right_ok) {
+        if (left_ok && right_ok &&
+            declaration_prefix_allows_receiver(line.substr(0, pos))) {
             size_t next = end;
             while (next < line.size() && std::isspace(static_cast<unsigned char>(line[next]))) ++next;
+            if (next < line.size() && line[next] == '?') {
+                ++next;
+                while (next < line.size() && std::isspace(static_cast<unsigned char>(line[next]))) ++next;
+            }
             if (next < line.size() && line[next] == ':') {
                 auto type = read_type_after_colon(line, next);
                 if (!type.empty()) return type;
             }
 
-            if (next >= line.size() || line[next] == '=' || line[next] == ';' ||
+            if (next < line.size() && line[next] == '=') {
+                auto type = infer_type_from_new_expression(line.substr(next + 1));
+                if (!type.empty()) return type;
+            }
+
+            if (next >= line.size() || line[next] == ';' ||
                 line[next] == ',' || line[next] == '(' || line[next] == ')') {
                 size_t before = pos;
                 while (before > 0 && std::isspace(static_cast<unsigned char>(line[before - 1]))) --before;
@@ -137,7 +218,7 @@ std::string infer_type_from_declaration_line(const std::string& line, const std:
                 if (!type.empty() && !keywords.count(type)) return type;
             }
         }
-        pos = line.find(receiver, end);
+        pos = line.find(declared_name, end);
     }
     return "";
 }
@@ -521,7 +602,8 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
 
     std::string receiver_type_hint;
     std::string receiver = receiver_from_callee_text(name);
-    if (is_simple_identifier(receiver) && receiver != "this" && receiver != "self") {
+    std::string declaration_name = declaration_name_from_receiver(receiver);
+    if (!declaration_name.empty() && receiver != "this" && receiver != "self") {
         uint32_t call_start = ts_node_start_byte(node);
         size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
         std::string prefix = source_->substr(window_start, call_start - window_start);

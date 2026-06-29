@@ -14,7 +14,7 @@ namespace codetopo {
 // Schema version 5 = roots table + root_id on files (unified workspace).
 // Schema version 6 = call-ref metadata for approximate callgraph narrowing.
 static constexpr int CURRENT_SCHEMA_VERSION = 6;
-static constexpr const char* INDEXER_VERSION = "1.3.0";
+static constexpr const char* INDEXER_VERSION = "1.4.0";
 
 namespace schema {
 

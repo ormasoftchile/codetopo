@@ -175,6 +175,16 @@ TEST_CASE("TypeScript call refs capture arity, argument pattern, and local recei
 function use() {
   const linked: LinkedMap = new LinkedMap();
   linked.set("a", 1);
+  const inferred = new LinkedMap<string, number>();
+  inferred.set("b", 2);
+}
+
+class Store {
+  private readonly _lru = new LinkedMap<string, number>();
+  use() {
+    this._lru.set("c", 3);
+  }
+}
 })";
 
     auto result = extract_typescript_for_test(source);
@@ -186,4 +196,18 @@ function use() {
     CHECK(it->arg_count == 2);
     CHECK(it->arg_pattern == "string,number");
     CHECK(it->receiver_type_hint == "LinkedMap");
+
+    auto inferred = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "inferred.set";
+        });
+    REQUIRE(inferred != result.refs.end());
+    CHECK(inferred->receiver_type_hint == "LinkedMap");
+
+    auto member = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "this._lru.set";
+        });
+    REQUIRE(member != result.refs.end());
+    CHECK(member->receiver_type_hint == "LinkedMap");
 }
