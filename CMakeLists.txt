@@ -140,6 +140,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
     tests/unit/test_stable_key.cpp
+    tests/unit/test_get_architecture.cpp
     tests/unit/test_file_summary_nodeid.cpp
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
