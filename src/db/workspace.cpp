@@ -291,6 +291,7 @@ static bool attached_table_has_column(sqlite3* db, const char* schema,
 
 WorkspaceDB::WorkspaceDB(const std::string& main_db_path)
     : conn_(main_db_path) {
+    schema::register_custom_functions(conn_.raw());
     ensure_schema();
 }
 
@@ -386,8 +387,8 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
         if (had_nodes) {
             std::string fts_del =
                 "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc) "
-                "SELECT 'delete', id, name, qualname, signature, doc FROM nodes "
-                "WHERE id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
+                "SELECT 'delete', id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
+                "WHERE node_type = 'symbol' AND id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
             conn_.exec(fts_del);
 
             // Delete all nodes in this root's ID range (covers file-type nodes which
@@ -595,8 +596,8 @@ WorkspaceDB::RemoveResult WorkspaceDB::remove_root(const std::string& root_path)
         if (had_nodes) {
             std::string fts_del =
                 "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc) "
-                "SELECT 'delete', id, name, qualname, signature, doc FROM nodes "
-                "WHERE id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
+                "SELECT 'delete', id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
+                "WHERE node_type = 'symbol' AND id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
             conn_.exec(fts_del);
 
             conn_.exec("DELETE FROM nodes WHERE id >= " + std::to_string(offset) +
@@ -783,7 +784,8 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     phase = WorkspaceClock::now();
     std::string fts_sql =
         "INSERT INTO nodes_fts(rowid, name, qualname, signature, doc) "
-        "SELECT id, name, qualname, signature, doc FROM nodes WHERE id >= " +
+        "SELECT id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
+        "WHERE node_type = 'symbol' AND id >= " +
         std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
     conn_.exec(fts_sql);
     log_workspace_phase("nodes_fts", phase, color_output);

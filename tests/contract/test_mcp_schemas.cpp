@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/fts.h"
 #include "db/queries.h"
 #include "mcp/tools.h"
 #include "util/json.h"
@@ -37,7 +38,7 @@ static fs::path create_contract_db() {
     schema::set_kv(conn, "indexer_version", "1.0.0");
     schema::set_kv(conn, "repo_root", tmp.string());
     schema::set_kv(conn, "last_index_time", "2026-03-04T12:00:00Z");
-    conn.exec("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
+    fts::rebuild(conn);
 
     return db_path;
 }

@@ -17,7 +17,8 @@ inline void create_sync_triggers(Connection& conn) {
     conn.exec(R"SQL(
         CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
             INSERT INTO nodes_fts(rowid, name, qualname, signature, doc)
-            VALUES (new.id, new.name, new.qualname, new.signature, new.doc);
+            SELECT new.id, codetopo_camel_split(new.name), new.qualname, new.signature, new.doc
+            WHERE new.node_type = 'symbol';
         END;
     )SQL");
 
@@ -25,7 +26,8 @@ inline void create_sync_triggers(Connection& conn) {
     conn.exec(R"SQL(
         CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
             INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc)
-            VALUES ('delete', old.id, old.name, old.qualname, old.signature, old.doc);
+            SELECT 'delete', old.id, codetopo_camel_split(old.name), old.qualname, old.signature, old.doc
+            WHERE old.node_type = 'symbol';
         END;
     )SQL");
 
@@ -33,9 +35,11 @@ inline void create_sync_triggers(Connection& conn) {
     conn.exec(R"SQL(
         CREATE TRIGGER IF NOT EXISTS nodes_fts_update AFTER UPDATE ON nodes BEGIN
             INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc)
-            VALUES ('delete', old.id, old.name, old.qualname, old.signature, old.doc);
+            SELECT 'delete', old.id, codetopo_camel_split(old.name), old.qualname, old.signature, old.doc
+            WHERE old.node_type = 'symbol';
             INSERT INTO nodes_fts(rowid, name, qualname, signature, doc)
-            VALUES (new.id, new.name, new.qualname, new.signature, new.doc);
+            SELECT new.id, codetopo_camel_split(new.name), new.qualname, new.signature, new.doc
+            WHERE new.node_type = 'symbol';
         END;
     )SQL");
 }
@@ -48,7 +52,11 @@ inline void drop_sync_triggers(Connection& conn) {
 }
 
 inline void rebuild(Connection& conn) {
-    conn.exec("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
+    conn.exec("INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all')");
+    conn.exec(
+        "INSERT INTO nodes_fts(rowid, name, qualname, signature, doc) "
+        "SELECT id, codetopo_camel_split(name), qualname, signature, doc "
+        "FROM nodes WHERE node_type = 'symbol'");
 }
 
 } // namespace fts
