@@ -646,29 +646,62 @@ public:
         // Scan all unresolved refs and resolve, collecting edge tuples in memory
         sqlite3_stmt* ref_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "SELECT id, file_id, kind, name FROM refs WHERE resolved_node_id IS NULL",
+            "SELECT id, file_id, kind, name, containing_node_id FROM refs WHERE resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
         // Edge tuples collected during resolution — avoids expensive SQL join in Step 6
         struct EdgeTuple {
-            int64_t src_id;   // file node id
+            int64_t src_id;   // containing symbol id or file node id fallback
             int64_t dst_id;   // resolved target node id
             const char* kind; // edge kind (static string literal)
         };
         std::vector<EdgeTuple> edge_tuples;
         edge_tuples.reserve(1000000);
+        std::unordered_set<std::string> seen_edge_keys;
+        seen_edge_keys.reserve(1000000);
 
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
         int call_resolved = 0, include_resolved = 0, inherit_resolved = 0;
         std::string name;
         name.reserve(256);  // reuse buffer across iterations
+        auto find_cross_file_symbol = [&](const std::string& ref_name, int64_t ref_file_id) -> const SymbolEntry* {
+            auto it = symbol_map.find(ref_name);
+            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
+                return &it->second;
+            }
+
+            size_t suffix_start = std::string::npos;
+            if (size_t dot_pos = ref_name.rfind('.'); dot_pos != std::string::npos) {
+                suffix_start = dot_pos + 1;
+            }
+            if (size_t scope_pos = ref_name.rfind("::"); scope_pos != std::string::npos &&
+                (suffix_start == std::string::npos || scope_pos + 2 > suffix_start)) {
+                suffix_start = scope_pos + 2;
+            }
+            if (size_t arrow_pos = ref_name.rfind("->"); arrow_pos != std::string::npos &&
+                (suffix_start == std::string::npos || arrow_pos + 2 > suffix_start)) {
+                suffix_start = arrow_pos + 2;
+            }
+            if (suffix_start == std::string::npos || suffix_start >= ref_name.size()) {
+                return nullptr;
+            }
+
+            it = symbol_map.find(ref_name.substr(suffix_start));
+            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
+                return &it->second;
+            }
+            return nullptr;
+        };
 
         while (sqlite3_step(ref_stmt) == SQLITE_ROW) {
             int64_t ref_id = sqlite3_column_int64(ref_stmt, 0);
             int64_t ref_file_id = sqlite3_column_int64(ref_stmt, 1);
             const char* kind_raw = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 2));
             const char* name_raw = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 3));
+            int64_t containing_node_id = sqlite3_column_type(ref_stmt, 4) != SQLITE_NULL
+                ? sqlite3_column_int64(ref_stmt, 4)
+                : -1;
             if (!kind_raw || !name_raw) continue;
 
             std::string_view kind(kind_raw);
@@ -678,9 +711,8 @@ public:
             const char* edge_kind = nullptr;
 
             if (kind == "call") {
-                auto it = symbol_map.find(name);
-                if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
-                    resolved_id = it->second.id;
+                if (const SymbolEntry* symbol = find_cross_file_symbol(name, ref_file_id)) {
+                    resolved_id = symbol->id;
                     resolved = true;
                     edge_kind = "calls";
                     ++call_resolved;
@@ -710,12 +742,20 @@ public:
                 sqlite3_step(update_stmt);
                 ++total_resolved;
 
-                // Edge tuple: file_node → resolved target (kind already set above)
+                // Edge tuple: containing symbol → resolved target, or file-node fallback
                 auto path_it = fileid_to_path.find(ref_file_id);
                 if (path_it != fileid_to_path.end()) {
                     auto fn_it = file_node_map.find(path_it->second);
                     if (fn_it != file_node_map.end()) {
-                        edge_tuples.push_back({fn_it->second, resolved_id, edge_kind});
+                        int64_t src_id = (containing_node_id > 0) ? containing_node_id : fn_it->second;
+                        std::string edge_key = std::to_string(src_id);
+                        edge_key.push_back('|');
+                        edge_key += std::to_string(resolved_id);
+                        edge_key.push_back('|');
+                        edge_key += edge_kind;
+                        if (seen_edge_keys.insert(edge_key).second) {
+                            edge_tuples.push_back({src_id, resolved_id, edge_kind});
+                        }
                     }
                 }
 
@@ -747,8 +787,8 @@ public:
                   << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
-        // R3: Batch edge INSERT using 150-row chunks (no UNIQUE constraint on edges,
-        // so plain INSERT is equivalent to INSERT OR IGNORE here)
+        // R3: Batch edge INSERT using 150-row chunks. edge_tuples is pre-deduped
+        // in memory because edges has no UNIQUE constraint to rely on here.
         const int RESOLVE_EDGE_BATCH = 150;
         const int PARAMS_PER_EDGE = 3;  // src_id, dst_id, kind (confidence+evidence are literals)
 
