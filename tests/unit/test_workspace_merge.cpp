@@ -73,6 +73,9 @@ static void create_source_index(const fs::path& root) {
     conn.exec(
         "INSERT INTO refs(id, file_id, kind, name, start_line, start_col, end_line, end_col, resolved_node_id, evidence, containing_node_id) "
         "VALUES(1, 1, 'call', 'mergedNeedleSymbol', 1, 1, 1, 20, 2, 'test', 2)");
+    conn.exec(
+        "INSERT INTO refs(id, file_id, kind, name, start_line, start_col, end_line, end_col, resolved_node_id, evidence, containing_node_id) "
+        "VALUES(2, 1, 'http_call', '/api/merged-needle', 2, 1, 2, 24, NULL, 'http_client_call', 2)");
     fts::rebuild(conn);
 }
 
@@ -95,6 +98,7 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
     REQUIRE(result.files == 1);
     REQUIRE(result.symbols == 1);
     REQUIRE(result.edges == 2);
+    REQUIRE(result.http_call_refs == 1);
 
     {
         Connection conn(default_db(main_root));
@@ -103,6 +107,7 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes WHERE id = " + std::to_string(offset + 2)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(offset + 1)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM refs WHERE id = " + std::to_string(offset + 1)) == 1);
+        REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM refs WHERE id = " + std::to_string(offset + 2)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM content_fts WHERE content_fts MATCH 'uniqueContentNeedle'") == 0);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM kv WHERE key LIKE 'workspace_content_fts_pending:%'") == 0);
@@ -114,6 +119,7 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
     REQUIRE(second.files == 1);
     REQUIRE(second.symbols == 1);
     REQUIRE(second.edges == 2);
+    REQUIRE(second.http_call_refs == 1);
     {
         Connection conn(default_db(main_root));
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
@@ -127,6 +133,7 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
     REQUIRE(third.files == 1);
     REQUIRE(third.symbols == 1);
     REQUIRE(third.edges == 2);
+    REQUIRE(third.http_call_refs == 1);
     {
         Connection conn(default_db(main_root));
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);

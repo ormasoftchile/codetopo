@@ -1907,6 +1907,497 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
     return doc.to_string();
 }
 
+namespace {
+
+struct ArchitectureFileInfo {
+    int64_t id = -1;
+    std::string raw_path;
+    std::string path;
+    std::vector<std::string> dir_parts;
+    int64_t symbol_count = 0;
+    bool in_scope = false;
+    std::string initial_cluster;
+    std::string cluster;
+};
+
+struct ArchitectureClusterStats {
+    int64_t files = 0;
+    int64_t symbols = 0;
+    int64_t internal_edges = 0;
+    int64_t external_edges = 0;
+    std::unordered_set<std::string> child_dirs;
+};
+
+struct ArchitectureBoundaryStats {
+    int64_t internal_edges = 0;
+    int64_t external_edges = 0;
+};
+
+struct ArchitectureHotspot {
+    std::string name;
+    std::string kind;
+    std::string file;
+    int64_t fan_in = 0;
+};
+
+struct ArchitectureScopedEdge {
+    int64_t src_file_id = -1;
+    int64_t dst_file_id = -1;
+};
+
+struct ArchitectureNodeFile {
+    int64_t file_id = -1;
+};
+
+static std::string architecture_display_path(const std::string& path,
+                                             const std::string& repo_root) {
+    if (!std::filesystem::path(path).is_absolute()) return path;
+
+    std::error_code ec;
+    auto rel = std::filesystem::relative(std::filesystem::path(path),
+                                         std::filesystem::path(repo_root), ec);
+    if (!ec) {
+        auto rel_str = rel.generic_string();
+        if (!rel_str.empty() && !rel_str.starts_with("..")) return rel_str;
+    }
+    return std::filesystem::path(path).generic_string();
+}
+
+static bool architecture_scope_matches(const std::string& raw_path,
+                                       const std::string& scope_prefix,
+                                       bool scope_is_file) {
+    if (scope_prefix.empty()) return true;
+    if (scope_is_file) return raw_path == scope_prefix;
+    return raw_path == scope_prefix
+        || raw_path.starts_with(scope_prefix + "/");
+}
+
+static std::string architecture_join_dir_parts(const std::vector<std::string>& dir_parts,
+                                               size_t end_exclusive) {
+    if (dir_parts.empty() || end_exclusive == 0) return "(root)";
+    end_exclusive = std::min(end_exclusive, dir_parts.size());
+    if (end_exclusive == 0) return "(root)";
+
+    std::string joined;
+    for (size_t i = 0; i < end_exclusive; ++i) {
+        if (!joined.empty()) joined += '/';
+        joined += dir_parts[i];
+    }
+    return joined.empty() ? "(root)" : joined;
+}
+
+static std::string architecture_cluster_name(const ArchitectureFileInfo& file,
+                                             size_t scope_dir_depth,
+                                             size_t depth_after_scope) {
+    if (file.dir_parts.empty()) return "(root)";
+    if (scope_dir_depth >= file.dir_parts.size()) {
+        return architecture_join_dir_parts(file.dir_parts, file.dir_parts.size());
+    }
+    return architecture_join_dir_parts(file.dir_parts,
+                                       std::min(file.dir_parts.size(),
+                                                scope_dir_depth + depth_after_scope));
+}
+
+static std::string architecture_child_dir_after_depth(const ArchitectureFileInfo& file,
+                                                      size_t scope_dir_depth,
+                                                      size_t depth_after_scope) {
+    size_t child_index = scope_dir_depth + depth_after_scope;
+    if (child_index >= file.dir_parts.size()) return "";
+    return file.dir_parts[child_index];
+}
+
+static void architecture_accumulate_cluster_edge(
+    std::unordered_map<std::string, ArchitectureClusterStats>& clusters,
+    const std::string& cluster_name, bool internal) {
+    auto& stats = clusters[cluster_name];
+    if (internal) ++stats.internal_edges;
+    else ++stats.external_edges;
+}
+
+} // namespace
+
+std::string get_architecture(yyjson_val* params, Connection& conn,
+                             QueryCache& /*cache*/, const std::string& repo_root) {
+    int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
+    if (limit > 100) limit = 100;
+    if (limit < 1) limit = 1;
+
+    std::unordered_set<std::string> requested_aspects;
+    if (params) {
+        if (auto* aspects = yyjson_obj_get(params, "aspects")) {
+            if (!yyjson_is_arr(aspects)) {
+                return McpError::invalid_input("'aspects' must be an array").to_json_rpc(0);
+            }
+            static const std::unordered_set<std::string> valid_aspects = {
+                "clusters", "hotspots", "boundaries", "summary"
+            };
+            yyjson_val* aspect = nullptr;
+            size_t idx, max;
+            yyjson_arr_foreach(aspects, idx, max, aspect) {
+                if (!yyjson_is_str(aspect)) {
+                    return McpError::invalid_input("'aspects' entries must be strings").to_json_rpc(0);
+                }
+                std::string value = yyjson_get_str(aspect);
+                if (!valid_aspects.count(value)) {
+                    return McpError::invalid_input("Invalid aspect: " + value).to_json_rpc(0);
+                }
+                requested_aspects.insert(value);
+            }
+        }
+    }
+    auto wants = [&](const char* aspect) {
+        return requested_aspects.empty() || requested_aspects.count(aspect);
+    };
+
+    const char* scope = params ? json_get_str(params, "scope") : nullptr;
+    std::string scope_prefix;
+    bool scope_is_file = false;
+    size_t scope_dir_depth = 0;
+    if (scope && *scope) {
+        scope_prefix = resolve_db_dir_path(conn.raw(), scope, repo_root);
+        if (scope_prefix.empty()) {
+            std::string raw_scope = scope;
+            if (std::filesystem::path(raw_scope).is_absolute() || raw_scope.find("..") != std::string::npos) {
+                return McpError::invalid_input("Invalid 'scope' path").to_json_rpc(0);
+            }
+            while (!raw_scope.empty() && raw_scope.back() == '/') raw_scope.pop_back();
+            scope_prefix = raw_scope;
+        }
+        if (!scope_prefix.empty()) {
+            scope_is_file = !path_has_db_children(conn.raw(), scope_prefix);
+            if (!scope_is_file) {
+                scope_dir_depth =
+                    split_path_components(architecture_display_path(scope_prefix, repo_root)).size();
+            }
+        }
+    }
+
+    std::unordered_map<int64_t, ArchitectureFileInfo> files_by_id;
+    std::unordered_map<std::string, int64_t> file_id_by_raw_path;
+    std::unordered_set<int64_t> in_scope_file_ids;
+    int64_t total_files = 0;
+    int64_t total_symbols = 0;
+
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT f.id, f.path, COUNT(n.id) "
+            "FROM files f "
+            "LEFT JOIN nodes n ON n.file_id = f.id AND n.node_type = 'symbol' "
+            "GROUP BY f.id, f.path "
+            "ORDER BY f.id";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load files for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ArchitectureFileInfo info;
+            info.id = sqlite3_column_int64(stmt, 0);
+            auto* raw = sqlite3_column_text(stmt, 1);
+            info.raw_path = raw ? reinterpret_cast<const char*>(raw) : "";
+            info.path = architecture_display_path(info.raw_path, repo_root);
+            info.dir_parts = split_path_components(std::filesystem::path(info.path).parent_path().generic_string());
+            info.symbol_count = sqlite3_column_int64(stmt, 2);
+            info.in_scope = architecture_scope_matches(info.raw_path, scope_prefix, scope_is_file);
+
+            file_id_by_raw_path.emplace(info.raw_path, info.id);
+            if (info.in_scope) {
+                ++total_files;
+                total_symbols += info.symbol_count;
+                in_scope_file_ids.insert(info.id);
+            }
+            files_by_id.emplace(info.id, std::move(info));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+
+    if (in_scope_file_ids.empty()) {
+        if (wants("summary")) {
+            auto* summary = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_files", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_symbols", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_edges", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "cluster_count", 0);
+            yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
+        }
+        if (wants("clusters")) yyjson_mut_obj_add_val(doc.doc, root, "clusters", doc.new_arr());
+        if (wants("hotspots")) yyjson_mut_obj_add_val(doc.doc, root, "hotspots", doc.new_arr());
+        if (wants("boundaries")) yyjson_mut_obj_add_val(doc.doc, root, "boundaries", doc.new_arr());
+        return doc.to_string();
+    }
+
+    for (auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        file.initial_cluster = architecture_cluster_name(file, scope_dir_depth, 1);
+        file.cluster = file.initial_cluster;
+    }
+
+    std::unordered_map<int64_t, ArchitectureNodeFile> node_files;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT id, file_id, node_type, name FROM nodes";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load nodes for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t node_id = sqlite3_column_int64(stmt, 0);
+            int64_t file_id = sqlite3_column_type(stmt, 1) == SQLITE_NULL
+                ? -1
+                : sqlite3_column_int64(stmt, 1);
+            const char* node_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char* node_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            if (file_id < 0 && node_type && std::strcmp(node_type, "file") == 0 && node_name) {
+                auto it = file_id_by_raw_path.find(node_name);
+                if (it != file_id_by_raw_path.end()) file_id = it->second;
+            }
+            if (file_id >= 0) node_files.emplace(node_id, ArchitectureNodeFile{file_id});
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    std::unordered_map<std::string, ArchitectureClusterStats> initial_clusters;
+    for (const auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        auto& cluster = initial_clusters[file.initial_cluster];
+        ++cluster.files;
+        cluster.symbols += file.symbol_count;
+        auto child_dir = architecture_child_dir_after_depth(file, scope_dir_depth, 1);
+        if (!child_dir.empty()) cluster.child_dirs.insert(child_dir);
+    }
+
+    std::vector<ArchitectureScopedEdge> scoped_edges;
+    int64_t total_edges = 0;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT src_id, dst_id FROM edges "
+            "WHERE kind != 'contains' AND confidence >= 0.5";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load edges for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t src_id = sqlite3_column_int64(stmt, 0);
+            int64_t dst_id = sqlite3_column_int64(stmt, 1);
+            auto src_it = node_files.find(src_id);
+            auto dst_it = node_files.find(dst_id);
+            if (src_it == node_files.end() || dst_it == node_files.end()) continue;
+
+            int64_t src_file_id = src_it->second.file_id;
+            int64_t dst_file_id = dst_it->second.file_id;
+            bool src_in_scope = in_scope_file_ids.count(src_file_id);
+            bool dst_in_scope = in_scope_file_ids.count(dst_file_id);
+            if (!src_in_scope && !dst_in_scope) continue;
+
+            scoped_edges.push_back({src_file_id, dst_file_id});
+            ++total_edges;
+
+            const auto* src_file = files_by_id.count(src_file_id) ? &files_by_id.at(src_file_id) : nullptr;
+            const auto* dst_file = files_by_id.count(dst_file_id) ? &files_by_id.at(dst_file_id) : nullptr;
+            bool same_cluster = src_in_scope && dst_in_scope && src_file && dst_file
+                && src_file->initial_cluster == dst_file->initial_cluster;
+            if (same_cluster && src_file) {
+                architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, true);
+            } else {
+                if (src_in_scope && src_file) {
+                    architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, false);
+                }
+                if (dst_in_scope && dst_file) {
+                    architecture_accumulate_cluster_edge(initial_clusters, dst_file->initial_cluster, false);
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    std::unordered_set<std::string> refined_clusters;
+    for (const auto& [name, stats] : initial_clusters) {
+        double cohesion = (stats.internal_edges + stats.external_edges) > 0
+            ? static_cast<double>(stats.internal_edges)
+                / static_cast<double>(stats.internal_edges + stats.external_edges)
+            : 1.0;
+        if (stats.child_dirs.size() >= 2
+            && (cohesion < 0.80 || stats.files >= 10 || stats.symbols >= 50)) {
+            refined_clusters.insert(name);
+        }
+    }
+
+    for (auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        if (refined_clusters.count(file.initial_cluster)) {
+            file.cluster = architecture_cluster_name(file, scope_dir_depth, 2);
+        }
+    }
+
+    std::unordered_map<std::string, ArchitectureClusterStats> clusters;
+    for (const auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        auto& stats = clusters[file.cluster];
+        ++stats.files;
+        stats.symbols += file.symbol_count;
+    }
+
+    std::unordered_map<int64_t, ArchitectureBoundaryStats> boundaries;
+    for (const auto& edge : scoped_edges) {
+        auto src_it = files_by_id.find(edge.src_file_id);
+        auto dst_it = files_by_id.find(edge.dst_file_id);
+        if (src_it == files_by_id.end() || dst_it == files_by_id.end()) continue;
+
+        const auto& src_file = src_it->second;
+        const auto& dst_file = dst_it->second;
+        bool src_in_scope = src_file.in_scope;
+        bool dst_in_scope = dst_file.in_scope;
+        bool same_cluster = src_in_scope && dst_in_scope && src_file.cluster == dst_file.cluster;
+
+        if (same_cluster) {
+            architecture_accumulate_cluster_edge(clusters, src_file.cluster, true);
+        } else {
+            if (src_in_scope) architecture_accumulate_cluster_edge(clusters, src_file.cluster, false);
+            if (dst_in_scope) architecture_accumulate_cluster_edge(clusters, dst_file.cluster, false);
+        }
+
+        if (src_in_scope) {
+            auto& stats = boundaries[src_file.id];
+            if (same_cluster) ++stats.internal_edges;
+            else ++stats.external_edges;
+        }
+        if (dst_in_scope && (!src_in_scope || src_file.id != dst_file.id)) {
+            auto& stats = boundaries[dst_file.id];
+            if (same_cluster) ++stats.internal_edges;
+            else ++stats.external_edges;
+        }
+    }
+
+    if (wants("summary")) {
+        auto* summary = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_files", total_files);
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_symbols", total_symbols);
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_edges", total_edges);
+        yyjson_mut_obj_add_int(doc.doc, summary, "cluster_count",
+                               static_cast<int64_t>(clusters.size()));
+        yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
+    }
+
+    if (wants("clusters")) {
+        std::vector<std::pair<std::string, ArchitectureClusterStats>> cluster_rows(
+            clusters.begin(), clusters.end());
+        std::sort(cluster_rows.begin(), cluster_rows.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      if (lhs.second.symbols != rhs.second.symbols)
+                          return lhs.second.symbols > rhs.second.symbols;
+                      if (lhs.second.files != rhs.second.files)
+                          return lhs.second.files > rhs.second.files;
+                      return lhs.first < rhs.first;
+                  });
+
+        auto* clusters_arr = doc.new_arr();
+        for (size_t i = 0; i < cluster_rows.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& [name, stats] = cluster_rows[i];
+            auto* item = doc.new_obj();
+            double cohesion = (stats.internal_edges + stats.external_edges) > 0
+                ? static_cast<double>(stats.internal_edges)
+                    / static_cast<double>(stats.internal_edges + stats.external_edges)
+                : 1.0;
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "files", stats.files);
+            yyjson_mut_obj_add_int(doc.doc, item, "symbols", stats.symbols);
+            yyjson_mut_obj_add_int(doc.doc, item, "internal_edges", stats.internal_edges);
+            yyjson_mut_obj_add_int(doc.doc, item, "external_edges", stats.external_edges);
+            yyjson_mut_obj_add_real(doc.doc, item, "cohesion", cohesion);
+            yyjson_mut_arr_append(clusters_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "clusters", clusters_arr);
+    }
+
+    if (wants("hotspots")) {
+        std::vector<ArchitectureHotspot> hotspots;
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in "
+            "FROM edges e "
+            "JOIN nodes n ON e.dst_id = n.id "
+            "JOIN files f ON n.file_id = f.id "
+            "WHERE e.kind = 'calls' AND e.confidence >= 0.5 AND n.node_type = 'symbol' "
+            "GROUP BY n.id "
+            "ORDER BY fan_in DESC, n.name ASC";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to compute architecture hotspots").to_json_rpc(0);
+        }
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t file_id = sqlite3_column_int64(stmt, 0);
+            if (!in_scope_file_ids.count(file_id)) continue;
+            ArchitectureHotspot hotspot;
+            hotspot.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            hotspot.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            hotspot.file = architecture_display_path(
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)), repo_root);
+            hotspot.fan_in = sqlite3_column_int64(stmt, 4);
+            hotspots.push_back(std::move(hotspot));
+        }
+        sqlite3_finalize(stmt);
+
+        auto* hotspots_arr = doc.new_arr();
+        for (size_t i = 0; i < hotspots.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& hotspot = hotspots[i];
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", hotspot.name.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", hotspot.kind.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", hotspot.file.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "fan_in", hotspot.fan_in);
+            yyjson_mut_arr_append(hotspots_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "hotspots", hotspots_arr);
+    }
+
+    if (wants("boundaries")) {
+        std::vector<std::pair<const ArchitectureFileInfo*, ArchitectureBoundaryStats>> rows;
+        rows.reserve(boundaries.size());
+        for (const auto& [file_id, stats] : boundaries) {
+            auto it = files_by_id.find(file_id);
+            if (it == files_by_id.end() || !it->second.in_scope) continue;
+            rows.push_back({&it->second, stats});
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      double lhs_coupling = (lhs.second.internal_edges + lhs.second.external_edges) > 0
+                          ? static_cast<double>(lhs.second.external_edges)
+                              / static_cast<double>(lhs.second.internal_edges + lhs.second.external_edges)
+                          : 0.0;
+                      double rhs_coupling = (rhs.second.internal_edges + rhs.second.external_edges) > 0
+                          ? static_cast<double>(rhs.second.external_edges)
+                              / static_cast<double>(rhs.second.internal_edges + rhs.second.external_edges)
+                          : 0.0;
+                      if (lhs_coupling != rhs_coupling) return lhs_coupling > rhs_coupling;
+                      if (lhs.second.external_edges != rhs.second.external_edges)
+                          return lhs.second.external_edges > rhs.second.external_edges;
+                      return lhs.first->path < rhs.first->path;
+                  });
+
+        auto* boundaries_arr = doc.new_arr();
+        for (size_t i = 0; i < rows.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& [file, stats] = rows[i];
+            double coupling = (stats.internal_edges + stats.external_edges) > 0
+                ? static_cast<double>(stats.external_edges)
+                    / static_cast<double>(stats.internal_edges + stats.external_edges)
+                : 0.0;
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", file->path.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "internal_edges", stats.internal_edges);
+            yyjson_mut_obj_add_int(doc.doc, item, "external_edges", stats.external_edges);
+            yyjson_mut_obj_add_real(doc.doc, item, "coupling", coupling);
+            yyjson_mut_arr_append(boundaries_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "boundaries", boundaries_arr);
+    }
+
+    return doc.to_string();
+}
+
 // T080: file_search — search file paths by GLOB pattern
 std::string file_search(yyjson_val* params, Connection& /*conn*/,
                                 QueryCache& cache, const std::string& /*repo_root*/) {
@@ -5589,6 +6080,91 @@ std::string code_search(yyjson_val* params, Connection& conn,
     return doc.to_string();
 }
 
+std::string list_http_calls(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& /*repo_root*/) {
+    int limit = params ? static_cast<int>(json_get_int(params, "limit", 100)) : 100;
+    if (limit > 500) limit = 500;
+    if (limit < 1) limit = 1;
+
+    int offset = params ? static_cast<int>(json_get_int(params, "offset", 0)) : 0;
+    if (offset < 0) offset = 0;
+
+    const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+
+    std::string count_sql =
+        "SELECT COUNT(*) "
+        "FROM refs r "
+        "JOIN files f ON f.id = r.file_id "
+        "WHERE r.kind = 'http_call'";
+    std::string list_sql =
+        "SELECT f.path, r.name, r.start_line, r.start_col, r.end_line, r.end_col, "
+        "       COALESCE(r.evidence, ''), COALESCE(n.name, ''), COALESCE(n.qualname, '') "
+        "FROM refs r "
+        "JOIN files f ON f.id = r.file_id "
+        "LEFT JOIN nodes n ON n.id = r.containing_node_id "
+        "WHERE r.kind = 'http_call'";
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        count_sql += " AND f.path GLOB ?";
+        list_sql += " AND f.path GLOB ?";
+    }
+    list_sql += " ORDER BY f.path, r.start_line, r.start_col LIMIT ? OFFSET ?";
+
+    auto* count_stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
+                                     ? "list_http_calls_count_glob"
+                                     : "list_http_calls_count",
+                                 count_sql);
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        sqlite3_bind_text(count_stmt, 1, file_pattern, -1, SQLITE_TRANSIENT);
+    }
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+
+    auto* stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
+                               ? "list_http_calls_glob"
+                               : "list_http_calls",
+                           list_sql);
+    int bind_idx = 1;
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        sqlite3_bind_text(stmt, bind_idx++, file_pattern, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(stmt, bind_idx++, limit);
+    sqlite3_bind_int(stmt, bind_idx++, offset);
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* results = doc.new_arr();
+    doc.set_root(root);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto* item = doc.new_obj();
+        auto* path_text = sqlite3_column_text(stmt, 0);
+        auto* url_text = sqlite3_column_text(stmt, 1);
+        auto* evidence_text = sqlite3_column_text(stmt, 6);
+        auto* symbol_name_text = sqlite3_column_text(stmt, 7);
+        auto* symbol_qualname_text = sqlite3_column_text(stmt, 8);
+
+        if (path_text) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", reinterpret_cast<const char*>(path_text));
+        if (url_text) yyjson_mut_obj_add_strcpy(doc.doc, item, "url_path", reinterpret_cast<const char*>(url_text));
+        yyjson_mut_obj_add_int(doc.doc, item, "start_line", sqlite3_column_int(stmt, 2));
+        yyjson_mut_obj_add_int(doc.doc, item, "start_col", sqlite3_column_int(stmt, 3));
+        yyjson_mut_obj_add_int(doc.doc, item, "end_line", sqlite3_column_int(stmt, 4));
+        yyjson_mut_obj_add_int(doc.doc, item, "end_col", sqlite3_column_int(stmt, 5));
+        if (evidence_text && *evidence_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", reinterpret_cast<const char*>(evidence_text));
+        }
+        if (symbol_name_text && *symbol_name_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "containing_symbol", reinterpret_cast<const char*>(symbol_name_text));
+        }
+        if (symbol_qualname_text && *symbol_qualname_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "containing_qualname", reinterpret_cast<const char*>(symbol_qualname_text));
+        }
+        yyjson_mut_arr_append(results, item);
+    }
+
+    add_pagination_fields(doc, root, results, total, offset + limit < total, offset, limit);
+    return doc.to_string();
+}
+
 } // namespace tools
 } // namespace codetopo
 
@@ -5639,6 +6215,7 @@ std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
         yyjson_mut_obj_add_int(doc.doc, root, "file_count", result.files);
         yyjson_mut_obj_add_int(doc.doc, root, "symbol_count", result.symbols);
         yyjson_mut_obj_add_int(doc.doc, root, "edge_count", result.edges);
+        yyjson_mut_obj_add_int(doc.doc, root, "http_call_ref_count", result.http_call_refs);
         yyjson_mut_obj_add_str(doc.doc, root, "status", "added");
         return doc.to_string();
     } catch (const std::exception& e) {

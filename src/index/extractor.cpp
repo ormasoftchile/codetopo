@@ -353,6 +353,127 @@ std::string join_patterns(const std::vector<std::string>& patterns) {
     return out;
 }
 
+bool is_string_literal_node(TSNode node) {
+    if (ts_node_is_null(node)) return false;
+    std::string type = ts_node_type(node);
+    return type == "string" ||
+           type == "string_literal" ||
+           type == "interpreted_string_literal" ||
+           type == "raw_string_literal" ||
+           type == "template_string";
+}
+
+std::string decode_string_literal(TSNode node, const std::string& source) {
+    if (!is_string_literal_node(node)) return "";
+    std::string text = trim_copy(source_text(node, source));
+    if (text.size() < 2) return "";
+
+    char quote = text.front();
+    if ((quote == '"' || quote == '\'' || quote == '`') && text.back() == quote) {
+        if (quote == '`' && text.find("${") != std::string::npos) return "";
+        return text.substr(1, text.size() - 2);
+    }
+    return "";
+}
+
+std::string normalize_http_path(std::string url) {
+    url = trim_copy(std::move(url));
+    if (url.empty()) return "";
+
+    size_t scheme = url.find("://");
+    if (scheme != std::string::npos) {
+        size_t path_pos = url.find('/', scheme + 3);
+        url = path_pos == std::string::npos ? "/" : url.substr(path_pos);
+    } else if (url.rfind("//", 0) == 0) {
+        size_t path_pos = url.find('/', 2);
+        url = path_pos == std::string::npos ? "/" : url.substr(path_pos);
+    }
+
+    size_t query = url.find_first_of("?#");
+    if (query != std::string::npos) url = url.substr(0, query);
+    if (url.empty()) return "";
+    if (url.front() != '/') {
+        if (url.find('/') == std::string::npos) return "";
+        url = "/" + url;
+    }
+    return url;
+}
+
+bool is_http_verb(const std::string& name) {
+    static const std::unordered_set<std::string> verbs = {
+        "get", "post", "put", "delete", "do"
+    };
+    return verbs.count(name) != 0;
+}
+
+bool receiver_looks_like_http_client(const std::string& receiver) {
+    std::string lower = lower_ascii(receiver);
+    if (lower == "http" || lower == "axios" || lower == "fetch") return true;
+    if (lower == "client" || lower == "httpclient") return true;
+    if (lower.find(".client") != std::string::npos) return true;
+    if (lower.find(".http") != std::string::npos) return true;
+    if (lower.size() > 6 && lower.rfind("client") == lower.size() - 6) return true;
+    return false;
+}
+
+bool match_http_call_pattern(const std::string& language,
+                             const std::string& callee_text) {
+    std::string callee = trim_copy(callee_text);
+    if (callee.empty()) return false;
+
+    std::string lower = lower_ascii(callee);
+    if (language == "typescript" || language == "javascript") {
+        if (lower == "fetch") return true;
+
+        size_t dot = lower.rfind('.');
+        if (dot == std::string::npos) return false;
+        std::string receiver = lower.substr(0, dot);
+        std::string method = lower.substr(dot + 1);
+        if (!is_http_verb(method)) return false;
+        if (receiver == "axios" || receiver == "this.http") return true;
+        if (receiver.size() > 5 && receiver.rfind(".http") == receiver.size() - 5) return true;
+        return false;
+    }
+
+    if (language == "go") {
+        size_t dot = lower.rfind('.');
+        if (dot == std::string::npos) return false;
+        std::string receiver = lower.substr(0, dot);
+        std::string method = lower.substr(dot + 1);
+        if (!is_http_verb(method)) return false;
+        return receiver_looks_like_http_client(receiver);
+    }
+
+    return false;
+}
+
+void maybe_add_http_call_ref(ExtractionResult* result,
+                             const std::string& language,
+                             const std::string& callee_text,
+                             TSNode call_node,
+                             const std::string& source,
+                             const std::vector<int>& symbol_stack) {
+    if (!match_http_call_pattern(language, callee_text)) return;
+
+    TSNode args = find_argument_list_node(call_node);
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) return;
+
+    TSNode first_arg = ts_node_named_child(args, 0);
+    std::string literal = decode_string_literal(first_arg, source);
+    std::string path = normalize_http_path(literal);
+    if (path.empty()) return;
+
+    TSPoint start = ts_node_start_point(call_node);
+    TSPoint end = ts_node_end_point(call_node);
+    int containing = symbol_stack.empty() ? -1 : symbol_stack.back();
+    result->refs.push_back({
+        "http_call", path,
+        static_cast<int>(start.row + 1), static_cast<int>(start.column),
+        static_cast<int>(end.row + 1), static_cast<int>(end.column),
+        "http_client_call", containing, -1, "", ""
+    });
+}
+
 bool is_js_export_assignment_target(TSNode node, const std::string& source) {
     if (ts_node_is_null(node) || std::string(ts_node_type(node)) != "member_expression") return false;
     std::string text = source_text(node, source);
@@ -1024,7 +1145,11 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call_expression");
+        if (!ts_node_is_null(func)) {
+            std::string callee = node_text(func);
+            add_call_ref(callee, node, "call_expression");
+            maybe_add_http_call_ref(result_, *language_, callee, node, *source_, symbol_stack_);
+        }
     }
     else if (type == "member_expression") {
         // Check if object is `this`
@@ -1094,7 +1219,11 @@ void Extractor::extract_go(TSNode node, const std::string& type, const std::stri
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call");
+        if (!ts_node_is_null(func)) {
+            std::string callee = node_text(func);
+            add_call_ref(callee, node, "call");
+            maybe_add_http_call_ref(result_, *language_, callee, node, *source_, symbol_stack_);
+        }
     }
     else if (type == "import_declaration") {
         add_ref("include", node_text(node), node, "import");

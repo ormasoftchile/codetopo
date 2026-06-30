@@ -531,13 +531,25 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     if (sqlite3_step(stmt) == SQLITE_ROW) result.edges_total = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
 
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM refs r JOIN files f ON f.id = r.file_id "
+        "WHERE f.root_id = ? AND r.kind = 'http_call'", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, result.root_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.http_call_refs = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    mcp_log("protocol refs: " + std::to_string(result.http_call_refs) +
+            " http_call refs found, cross-root matching pending");
+
     std::ostringstream summary;
     summary << stderr_dim("[workspace]", color_output) << " "
             << stderr_bold_green("✓ done", color_output)
             << " — " << format_with_commas(result.roots_total) << " roots | "
             << format_with_commas(result.files_total) << " files | "
             << format_with_commas(result.symbols_total) << " nodes | "
-            << format_with_commas(result.edges_total) << " edges  ("
+            << format_with_commas(result.edges_total) << " edges | "
+            << format_with_commas(result.http_call_refs) << " http refs  ("
             << stderr_cyan(format_seconds(overall_phase) + "s total", color_output) << ")";
     std::cerr << summary.str() << "\n";
 

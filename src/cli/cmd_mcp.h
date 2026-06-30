@@ -145,6 +145,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Get repository statistics: file count, symbol count, edge count, last index time.",
         R"J({"type":"object","properties":{}})J");
 
+    server.register_tool("get_architecture", tools::get_architecture,
+        "Summarize repository architecture from the indexed graph: clusters, hotspots, boundaries, and overall stats. Uses directory-based clustering with graph-driven cohesion and coupling metrics.",
+        R"J({"type":"object","properties":{"scope":{"type":"string","description":"Optional file or directory prefix to scope the analysis (for example 'src/' or 'src/mcp')"},"aspects":{"type":"array","items":{"type":"string","enum":["clusters","hotspots","boundaries","summary"]},"description":"Sections to return. Omit for all sections."},"limit":{"type":"integer","description":"Max items per section (default 20, max 100)"}}})J");
+
     server.register_tool("file_search", tools::file_search,
         "Search for files by path pattern (GLOB syntax). Use to find files containing a keyword in their path, e.g. '*numa*' finds sosnumap.h. Supports wildcards: * matches any chars, ? matches one char, [abc] matches char class.",
         R"J({"type":"object","properties":{"pattern":{"type":"string","description":"GLOB pattern to match against file paths (e.g. '*numa*', 'Sql/DkTemp/sos/**/*.h')"},"language":{"type":"string","description":"Optional language filter (c, cpp, csharp, etc.)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["pattern"]})J");
@@ -249,6 +253,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Search for arbitrary text patterns across all source file contents. Uses a trigram index for fast substring matching. Default is grep-like: file, line, and matched text with no context duplication; set context_lines to include surrounding lines.",
         R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 50, max 500)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 0, max 5). When context is returned, matched text is not duplicated in a separate text field."},"max_bytes":{"type":"integer","description":"Soft response budget (default 16000, 0 disables, max 100000)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
 
+    server.register_tool("list_http_calls", tools::list_http_calls,
+        "List extracted HTTP client call refs with their URL paths. Use to inspect protocol-aware refs captured during indexing.",
+        R"J({"type":"object","properties":{"file_pattern":{"type":"string","description":"Optional GLOB filter for file paths"},"limit":{"type":"integer","description":"Max results (default 100, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}}})J");
+
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
                                           QueryCache& cache, const std::string& /*root*/) -> std::string {
@@ -351,6 +359,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
     std::unordered_map<std::string, ToolFn> all_tools = {
         {"server_info", tools::server_info},
         {"repo_stats", tools::repo_stats},
+        {"get_architecture", tools::get_architecture},
         {"file_search", tools::file_search},
         {"dir_list", tools::dir_list},
         {"dir_tree", tools::dir_tree},
@@ -375,6 +384,10 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"shortest_path", tools::shortest_path},
         {"find_implementations", tools::find_implementations},
         {"code_search", tools::code_search},
+        {"list_http_calls", tools::list_http_calls},
+        {"workspace_add", tools::workspace_add},
+        {"workspace_remove", tools::workspace_remove},
+        {"workspace_list", tools::workspace_list},
     };
 
     auto it = all_tools.find(tool_name);

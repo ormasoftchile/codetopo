@@ -16,7 +16,8 @@ namespace codetopo {
 // Schema version 6 = call-ref metadata for approximate callgraph narrowing.
 // Schema version 7 = composite dst/kind/confidence edge index for callers_approx.
 // Schema version 8 = contentless symbol FTS with camelCase-aware name indexing.
-static constexpr int CURRENT_SCHEMA_VERSION = 8;
+// Schema version 9 = refs.kind allows protocol refs such as http_call.
+static constexpr int CURRENT_SCHEMA_VERSION = 9;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
@@ -153,7 +154,7 @@ inline void create_tables(Connection& conn) {
         CREATE TABLE IF NOT EXISTS refs (
             id INTEGER PRIMARY KEY,
             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL CHECK(kind IN ('call','type_ref','include','inherit','field_access','other')),
+            kind TEXT NOT NULL CHECK(kind IN ('call','type_ref','include','inherit','field_access','other','http_call')),
             name TEXT NOT NULL,
             start_line INTEGER,
             start_col INTEGER,
@@ -314,6 +315,40 @@ inline void ensure_refs_call_metadata_schema(Connection& conn) {
         conn.exec("ALTER TABLE refs ADD COLUMN receiver_type_hint TEXT");
 }
 
+inline void recreate_refs_table_with_http_call(Connection& conn) {
+    if (!table_exists(conn, "refs")) return;
+    conn.exec("ALTER TABLE refs RENAME TO refs_old");
+    conn.exec(R"SQL(
+        CREATE TABLE refs (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('call','type_ref','include','inherit','field_access','other','http_call')),
+            name TEXT NOT NULL,
+            start_line INTEGER,
+            start_col INTEGER,
+            end_line INTEGER,
+            end_col INTEGER,
+            resolved_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            evidence TEXT,
+            containing_node_id INTEGER REFERENCES nodes(id) ON DELETE SET NULL,
+            arg_count INTEGER,
+            arg_pattern TEXT,
+            receiver_type_hint TEXT
+        );
+    )SQL");
+    conn.exec(
+        "INSERT INTO refs(id, file_id, kind, name, start_line, start_col, end_line, end_col, "
+        "resolved_node_id, evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint) "
+        "SELECT id, file_id, kind, name, start_line, start_col, end_line, end_col, "
+        "resolved_node_id, evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint "
+        "FROM refs_old");
+    conn.exec("DROP TABLE refs_old");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
+}
+
 // Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
 inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
@@ -442,6 +477,12 @@ inline int ensure_schema(Connection& conn) {
         conn.exec("DROP TRIGGER IF EXISTS nodes_fts_update");
         version = 8;
         recreate_nodes_fts = true;
+    }
+
+    // v8→v9: refs.kind allows protocol refs such as http_call.
+    if (version == 8) {
+        recreate_refs_table_with_http_call(conn);
+        version = 9;
     }
 
     if (version == CURRENT_SCHEMA_VERSION) {

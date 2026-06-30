@@ -18,6 +18,10 @@ std::string server_info(yyjson_val* params, Connection& conn,
 std::string repo_stats(yyjson_val* params, Connection& conn,
                        QueryCache& cache, const std::string& repo_root);
 
+// T061b: get_architecture — clusters, hotspots, boundaries, summary
+std::string get_architecture(yyjson_val* params, Connection& conn,
+                             QueryCache& cache, const std::string& repo_root);
+
 // T080: file_search — search file paths by GLOB pattern
 std::string file_search(yyjson_val* params, Connection& conn,
                         QueryCache& cache, const std::string& repo_root);
@@ -126,6 +130,10 @@ std::string source_at(yyjson_val* params, Connection& conn,
 // T093: code_search — search source file contents using trigram FTS index
 std::string code_search(yyjson_val* params, Connection& conn,
                         QueryCache& cache, const std::string& repo_root);
+
+// T095: list_http_calls — list extracted HTTP client call refs
+std::string list_http_calls(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& repo_root);
 
 // Workspace tools — multi-root management
 std::string workspace_add(yyjson_val* params, Connection& conn,
