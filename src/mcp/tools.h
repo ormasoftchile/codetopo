@@ -91,6 +91,10 @@ std::string entrypoints(yyjson_val* params, Connection& conn,
 std::string impact_of(yyjson_val* params, Connection& conn,
                       QueryCache& cache, const std::string& repo_root);
 
+// T094: detect_changes — git diff blast-radius analysis
+std::string detect_changes(yyjson_val* params, Connection& conn,
+                           QueryCache& cache, const std::string& repo_root);
+
 // T086: file_deps — include relationships for a file
 std::string file_deps(yyjson_val* params, Connection& conn,
                       QueryCache& cache, const std::string& repo_root);

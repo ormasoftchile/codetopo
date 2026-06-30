@@ -5,6 +5,7 @@
 
 #include "util/path.h"
 #include "util/git.h"
+#include "util/process.h"
 #include "mcp/error.h"
 #include "db/schema.h"
 #include <sqlite3.h>
@@ -26,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <cctype>
+#include <cstdlib>
 
 namespace codetopo {
 namespace tools {
@@ -1469,6 +1471,114 @@ static std::string resolve_db_path(sqlite3* db, const std::string& path, const s
     }
     sqlite3_finalize(stmt);
     return result;
+}
+
+static bool detect_changes_glob_impl(const char* s, const char* p) {
+    while (*p) {
+        if (*p == '*') {
+            ++p;
+            while (*s) {
+                if (*s == '/') return false;
+                if (detect_changes_glob_impl(s, p)) return true;
+                ++s;
+            }
+            return detect_changes_glob_impl(s, p);
+        }
+        if (*p == '?') {
+            if (!*s || *s == '/') return false;
+            ++s;
+            ++p;
+            continue;
+        }
+        if (*s != *p) return false;
+        ++s;
+        ++p;
+    }
+    return *s == '\0';
+}
+
+static bool detect_changes_glob_match(const std::string& str, const std::string& pattern) {
+    return detect_changes_glob_impl(str.c_str(), pattern.c_str());
+}
+
+static bool detect_changes_glob_match_path(const std::string& path, const std::string& pattern) {
+    auto dstar = pattern.find("**");
+    if (dstar != std::string::npos) {
+        std::string before = (dstar > 0 && pattern[dstar - 1] == '/')
+            ? pattern.substr(0, dstar - 1)
+            : pattern.substr(0, dstar);
+        std::string after = pattern.substr(dstar + 2);
+        if (!after.empty() && after[0] == '/') after = after.substr(1);
+
+        if (before.empty() && after.empty()) return true;
+        if (before.empty()) {
+            for (size_t i = 0; i <= path.size(); ++i) {
+                if (i == 0 || path[i - 1] == '/') {
+                    if (detect_changes_glob_match(path.substr(i), after)) return true;
+                }
+            }
+            return false;
+        }
+        if (after.empty()) return path.find(before) != std::string::npos;
+        for (size_t i = 0; i <= path.size(); ++i) {
+            if (i == 0 || path[i - 1] == '/') {
+                if (detect_changes_glob_match(path.substr(0, i > 0 ? i - 1 : 0), before) &&
+                    detect_changes_glob_match_path(path.substr(i), after)) return true;
+            }
+        }
+        return false;
+    }
+
+    std::string normalized = pattern;
+    if (!normalized.empty() && normalized[0] == '/') normalized = normalized.substr(1);
+    return detect_changes_glob_match(path, normalized);
+}
+
+static bool detect_changes_matches_pattern(const std::string& rel_path, const char* file_pattern) {
+    if (!file_pattern || !*file_pattern) return true;
+    std::string pattern(file_pattern);
+    if (pattern.find('/') == std::string::npos) {
+        return detect_changes_glob_match(std::filesystem::path(rel_path).filename().string(), pattern);
+    }
+    return detect_changes_glob_match_path(rel_path, pattern);
+}
+
+static std::string find_git_executable() {
+    static const char* candidates[] = {
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git"
+    };
+    for (const char* candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) return candidate;
+    }
+    return "/usr/bin/git";
+}
+
+static bool collect_git_changed_files(const std::string& repo_root,
+                                      const std::string& since,
+                                      std::vector<std::string>& changed_files,
+                                      std::string& error) {
+    changed_files.clear();
+    error.clear();
+
+    std::error_code ec;
+    if (!std::filesystem::exists(repo_root, ec) || !std::filesystem::is_directory(repo_root, ec)) {
+        error = "Repository root does not exist: " + repo_root;
+        return false;
+    }
+
+    int rc = spawn_and_read_stdout(find_git_executable(),
+        {"-C", repo_root, "diff", "--name-only", since + "..HEAD"},
+        [&](const std::string& line) {
+            if (!line.empty()) changed_files.push_back(line);
+        });
+    if (rc != 0) {
+        error = "git diff failed for ref '" + since + "'";
+        return false;
+    }
+    return true;
 }
 
 // Resolve a directory-or-file path to the canonical absolute path prefix as stored in the DB.
@@ -4148,6 +4258,261 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     }
     yyjson_mut_obj_add_val(doc.doc, root, "impacted_files", files_arr);
     yyjson_mut_obj_add_bool(doc.doc, root, "truncated", truncated);
+
+    return doc.to_string();
+}
+
+// T094: detect_changes — git diff blast-radius analysis
+std::string detect_changes(yyjson_val* params, Connection& conn,
+                           QueryCache& cache, const std::string& repo_root) {
+    (void)repo_root;
+    if (!params) return McpError::invalid_input("Missing parameters").to_json_rpc(0);
+
+    const char* requested_root = json_get_str(params, "repo_root");
+    const char* since = json_get_str(params, "since");
+    const char* file_pattern = json_get_str(params, "file_pattern");
+    if (!requested_root || !*requested_root)
+        return McpError::invalid_input("Missing 'repo_root'").to_json_rpc(0);
+    if (!since || !*since)
+        return McpError::invalid_input("Missing 'since'").to_json_rpc(0);
+
+    int64_t depth = json_get_int(params, "depth", 2);
+    if (depth < 0) depth = 0;
+    if (depth > 5) depth = 5;
+
+    double min_confidence = json_get_double(params, "min_confidence", 0.5);
+    if (min_confidence < 0.0) min_confidence = 0.0;
+    if (min_confidence > 1.0) min_confidence = 1.0;
+
+    std::vector<std::string> changed_files_raw;
+    std::string git_error;
+    if (!collect_git_changed_files(requested_root, since, changed_files_raw, git_error)) {
+        return McpError::invalid_input(git_error).to_json_rpc(0);
+    }
+
+    std::vector<std::string> changed_files;
+    changed_files.reserve(changed_files_raw.size());
+    for (const auto& rel_path : changed_files_raw) {
+        if (detect_changes_matches_pattern(rel_path, file_pattern))
+            changed_files.push_back(rel_path);
+    }
+
+    struct ChangedFileRow {
+        int64_t id = 0;
+        std::string rel_path;
+        std::string db_path;
+    };
+    std::vector<ChangedFileRow> indexed_files;
+    indexed_files.reserve(changed_files.size());
+    std::unordered_set<int64_t> seen_file_ids;
+    auto* file_stmt = cache.get("detect_changes_file_lookup",
+        "SELECT id, path FROM files WHERE path = ?");
+
+    for (const auto& rel_path : changed_files) {
+        std::string resolved = resolve_db_path(conn.raw(), rel_path, requested_root);
+        if (resolved.empty()) continue;
+        sqlite3_bind_text(file_stmt, 1, resolved.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(file_stmt) != SQLITE_ROW) continue;
+        int64_t file_id = sqlite3_column_int64(file_stmt, 0);
+        if (!seen_file_ids.insert(file_id).second) continue;
+
+        ChangedFileRow row;
+        row.id = file_id;
+        row.rel_path = rel_path;
+        const auto* db_path_txt = sqlite3_column_text(file_stmt, 1);
+        row.db_path = db_path_txt ? reinterpret_cast<const char*>(db_path_txt) : resolved;
+        indexed_files.push_back(std::move(row));
+    }
+
+    struct ChangedSymbolRow {
+        int64_t id = 0;
+        std::string name;
+        std::string kind;
+        std::string qualname;
+        std::string file;
+    };
+    std::vector<ChangedSymbolRow> changed_symbols;
+    std::vector<int64_t> changed_symbol_ids;
+    changed_symbol_ids.reserve(indexed_files.size() * 4);
+    if (!indexed_files.empty()) {
+        std::string sql =
+            "SELECT n.id, n.name, n.kind, n.qualname, f.path "
+            "FROM nodes n JOIN files f ON n.file_id = f.id "
+            "WHERE n.file_id IN (";
+        for (size_t i = 0; i < indexed_files.size(); ++i) {
+            if (i) sql += ", ";
+            sql += "?";
+        }
+        sql += ") AND n.node_type = 'symbol' "
+               "AND n.kind IN ('function', 'method', 'class', 'interface') "
+               "ORDER BY f.path, n.start_line, n.id";
+
+        auto* stmt = cache.get("detect_changes_symbols_" + std::to_string(indexed_files.size()), sql);
+        for (size_t i = 0; i < indexed_files.size(); ++i)
+            sqlite3_bind_int64(stmt, static_cast<int>(i + 1), indexed_files[i].id);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ChangedSymbolRow row;
+            row.id = sqlite3_column_int64(stmt, 0);
+            row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            row.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            if (const auto* qual = sqlite3_column_text(stmt, 3))
+                row.qualname = reinterpret_cast<const char*>(qual);
+            if (const auto* fp = sqlite3_column_text(stmt, 4))
+                row.file = reinterpret_cast<const char*>(fp);
+            changed_symbol_ids.push_back(row.id);
+            changed_symbols.push_back(std::move(row));
+        }
+    }
+
+    struct ImpactedRow {
+        int64_t id = 0;
+        std::string name;
+        std::string kind;
+        std::string qualname;
+        std::string file;
+        int distance = 0;
+        double confidence = 0.0;
+    };
+
+    std::vector<ImpactedRow> impacted_rows;
+    impacted_rows.reserve(128);
+    std::unordered_set<int64_t> visited(changed_symbol_ids.begin(), changed_symbol_ids.end());
+    std::vector<int64_t> frontier = changed_symbol_ids;
+    int max_depth_reached = 0;
+    constexpr size_t kMaxImpacted = 500;
+
+    for (int current_depth = 1;
+         current_depth <= depth && !frontier.empty() && impacted_rows.size() < kMaxImpacted;
+         ++current_depth) {
+        std::string sql =
+            "SELECT e.src_id, n.name, n.kind, n.qualname, f.path, e.confidence "
+            "FROM edges e "
+            "JOIN nodes n ON e.src_id = n.id "
+            "LEFT JOIN files f ON n.file_id = f.id "
+            "WHERE e.dst_id IN (";
+        for (size_t i = 0; i < frontier.size(); ++i) {
+            if (i) sql += ", ";
+            sql += "?";
+        }
+        sql += ") AND e.kind = 'calls' AND e.confidence >= ? "
+               "AND n.node_type = 'symbol'";
+
+        auto* stmt = cache.get("detect_changes_bfs_" + std::to_string(frontier.size()), sql);
+        int bind_index = 1;
+        for (int64_t node_id : frontier) sqlite3_bind_int64(stmt, bind_index++, node_id);
+        sqlite3_bind_double(stmt, bind_index, min_confidence);
+
+        struct PendingImpact {
+            std::string name;
+            std::string kind;
+            std::string qualname;
+            std::string file;
+            double confidence = 0.0;
+        };
+        std::unordered_map<int64_t, PendingImpact> pending;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t src_id = sqlite3_column_int64(stmt, 0);
+            if (visited.count(src_id)) continue;
+
+            double confidence = sqlite3_column_double(stmt, 5);
+            auto it = pending.find(src_id);
+            if (it != pending.end() && it->second.confidence >= confidence) continue;
+
+            PendingImpact row;
+            row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            row.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            if (const auto* qual = sqlite3_column_text(stmt, 3))
+                row.qualname = reinterpret_cast<const char*>(qual);
+            if (const auto* fp = sqlite3_column_text(stmt, 4))
+                row.file = reinterpret_cast<const char*>(fp);
+            row.confidence = confidence;
+            pending[src_id] = std::move(row);
+        }
+
+        std::vector<std::pair<int64_t, PendingImpact>> ordered;
+        ordered.reserve(pending.size());
+        for (auto& entry : pending) ordered.push_back(std::move(entry));
+        std::sort(ordered.begin(), ordered.end(),
+            [](const auto& lhs, const auto& rhs) {
+                if (lhs.second.confidence != rhs.second.confidence)
+                    return lhs.second.confidence > rhs.second.confidence;
+                if (lhs.second.file != rhs.second.file)
+                    return lhs.second.file < rhs.second.file;
+                return lhs.second.name < rhs.second.name;
+            });
+
+        std::vector<int64_t> next_frontier;
+        next_frontier.reserve(ordered.size());
+        for (auto& entry : ordered) {
+            if (impacted_rows.size() >= kMaxImpacted) break;
+            visited.insert(entry.first);
+            next_frontier.push_back(entry.first);
+
+            ImpactedRow row;
+            row.id = entry.first;
+            row.name = std::move(entry.second.name);
+            row.kind = std::move(entry.second.kind);
+            row.qualname = std::move(entry.second.qualname);
+            row.file = std::move(entry.second.file);
+            row.distance = current_depth;
+            row.confidence = entry.second.confidence;
+            impacted_rows.push_back(std::move(row));
+        }
+
+        if (!next_frontier.empty()) max_depth_reached = current_depth;
+        frontier = std::move(next_frontier);
+    }
+
+    std::sort(impacted_rows.begin(), impacted_rows.end(),
+        [](const ImpactedRow& lhs, const ImpactedRow& rhs) {
+            if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+            if (lhs.confidence != rhs.confidence) return lhs.confidence > rhs.confidence;
+            if (lhs.file != rhs.file) return lhs.file < rhs.file;
+            return lhs.name < rhs.name;
+        });
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* changed_files_arr = doc.new_arr();
+    auto* changed_symbols_arr = doc.new_arr();
+    auto* impacted_arr = doc.new_arr();
+    auto* summary = doc.new_obj();
+    doc.set_root(root);
+
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "since", since);
+    for (const auto& path : changed_files)
+        yyjson_mut_arr_add_strcpy(doc.doc, changed_files_arr, path.c_str());
+    yyjson_mut_obj_add_val(doc.doc, root, "changed_files", changed_files_arr);
+
+    for (const auto& symbol : changed_symbols) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", symbol.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", symbol.kind.c_str());
+        if (!symbol.file.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", symbol.file.c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", symbol.id);
+        yyjson_mut_arr_append(changed_symbols_arr, item);
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "changed_symbols", changed_symbols_arr);
+
+    for (const auto& impacted : impacted_rows) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", impacted.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", impacted.kind.c_str());
+        if (!impacted.file.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", impacted.file.c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", impacted.id);
+        yyjson_mut_obj_add_int(doc.doc, item, "distance", impacted.distance);
+        yyjson_mut_obj_add_real(doc.doc, item, "confidence", impacted.confidence);
+        yyjson_mut_arr_append(impacted_arr, item);
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "impacted_symbols", impacted_arr);
+
+    yyjson_mut_obj_add_int(doc.doc, summary, "changed_files", static_cast<int64_t>(changed_files.size()));
+    yyjson_mut_obj_add_int(doc.doc, summary, "changed_symbols", static_cast<int64_t>(changed_symbols.size()));
+    yyjson_mut_obj_add_int(doc.doc, summary, "impacted_symbols", static_cast<int64_t>(impacted_rows.size()));
+    yyjson_mut_obj_add_int(doc.doc, summary, "max_depth_reached", max_depth_reached);
+    yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
 
     return doc.to_string();
 }
