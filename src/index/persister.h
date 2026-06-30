@@ -8,6 +8,8 @@
 #include "util/log.h"
 #include "db/schema.h"
 #include <sqlite3.h>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -525,18 +527,54 @@ public:
         // Disable FK checks — all IDs originate from the DB itself.
         conn_.exec("PRAGMA foreign_keys = OFF");
 
+        auto is_test_or_mock_path = [](const std::string& path) {
+            std::string lower = path;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return lower.find("/test") != std::string::npos ||
+                   lower.find("/mock") != std::string::npos ||
+                   lower.find("/fake") != std::string::npos ||
+                   lower.find("/stub") != std::string::npos ||
+                   lower.find("_test.") != std::string::npos ||
+                   lower.find("_mock.") != std::string::npos ||
+                   lower.find("_fake.") != std::string::npos ||
+                   lower.find("test_") != std::string::npos;
+        };
+
+        // Build file_id → file path early so symbol/include/class lookup can prefer
+        // real implementation files over test/mock/fake/stub variants.
+        std::unordered_map<int64_t, std::string> fileid_to_path;
+        {
+            sqlite3_stmt* stmt = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "SELECT id, path FROM files", -1, &stmt, nullptr);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char* path_raw = sqlite3_column_text(stmt, 1);
+                if (!path_raw) continue;
+                fileid_to_path[sqlite3_column_int64(stmt, 0)] =
+                    reinterpret_cast<const char*>(path_raw);
+            }
+            sqlite3_finalize(stmt);
+        }
+
         // --- Step 1: Build in-memory lookup: name → (node_id, file_id, is_definition) ---
         // Also builds class_map in the same scan (merges former Step 4).
-        // For each symbol name, keep the best candidate (prefer definitions, then lowest id).
+        // For each symbol name, keep the best candidate (prefer non-test/mock paths,
+        // then definitions, then lowest id).
         struct SymbolEntry {
             int64_t id;
             int64_t file_id;
             bool is_definition;
+            bool is_test_or_mock;
         };
         std::unordered_map<std::string, SymbolEntry> symbol_map;
         symbol_map.reserve(2500000);
 
-        struct ClassEntry { int64_t id; bool is_def; };
+        struct ClassEntry {
+            int64_t id;
+            bool is_def;
+            bool is_test_or_mock;
+        };
         std::unordered_map<std::string, ClassEntry> class_map;
 
         {
@@ -555,15 +593,20 @@ public:
 
                 if (!name_raw) continue;
                 std::string name(name_raw);
+                auto path_it = fileid_to_path.find(file_id);
+                const bool is_test_or_mock = path_it != fileid_to_path.end() &&
+                    is_test_or_mock_path(path_it->second);
 
                 auto it = symbol_map.find(name);
                 if (it == symbol_map.end()) {
-                    symbol_map[name] = {id, file_id, is_def};
+                    symbol_map[name] = {id, file_id, is_def, is_test_or_mock};
                 } else {
                     auto& existing = it->second;
-                    if ((!existing.is_definition && is_def) ||
-                        (existing.is_definition == is_def && id < existing.id)) {
-                        existing = {id, file_id, is_def};
+                    if ((existing.is_test_or_mock && !is_test_or_mock) ||
+                        (existing.is_test_or_mock == is_test_or_mock &&
+                         ((!existing.is_definition && is_def) ||
+                          (existing.is_definition == is_def && id < existing.id)))) {
+                        existing = {id, file_id, is_def, is_test_or_mock};
                     }
                 }
 
@@ -573,9 +616,12 @@ public:
                     if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface") {
                         auto cit = class_map.find(name);
                         if (cit == class_map.end()) {
-                            class_map[name] = {id, is_def};
-                        } else if (!cit->second.is_def && is_def) {
-                            cit->second = {id, is_def};
+                            class_map[name] = {id, is_def, is_test_or_mock};
+                        } else if ((cit->second.is_test_or_mock && !is_test_or_mock) ||
+                                  (cit->second.is_test_or_mock == is_test_or_mock &&
+                                   ((!cit->second.is_def && is_def) ||
+                                    (cit->second.is_def == is_def && id < cit->second.id)))) {
+                            cit->second = {id, is_def, is_test_or_mock};
                         }
                     }
                 }
@@ -608,13 +654,20 @@ public:
 
         // --- Step 3: Build include lookup: filename → file node id ---
         // For includes like "foo.h", we match the file node whose path ends with "/foo.h"
-        std::unordered_map<std::string, int64_t> include_map;
+        struct IncludeEntry {
+            int64_t node_id;
+            bool is_test_or_mock;
+        };
+        std::unordered_map<std::string, IncludeEntry> include_map;
         for (const auto& [path, node_id] : file_node_map) {
             auto slash_pos = path.rfind('/');
             std::string basename = (slash_pos != std::string::npos) ? path.substr(slash_pos + 1) : path;
-            // First match wins — for ambiguous includes, any match is fine (confidence=0.7)
-            if (include_map.find(basename) == include_map.end()) {
-                include_map[basename] = node_id;
+            const bool is_test_or_mock = is_test_or_mock_path(path);
+            auto it = include_map.find(basename);
+            if (it == include_map.end()) {
+                include_map[basename] = {node_id, is_test_or_mock};
+            } else if (it->second.is_test_or_mock && !is_test_or_mock) {
+                it->second = {node_id, is_test_or_mock};
             }
         }
 
@@ -629,19 +682,6 @@ public:
         sqlite3_prepare_v2(conn_.raw(),
             "UPDATE refs SET resolved_node_id = ? WHERE id = ?",
             -1, &update_stmt, nullptr);
-
-        // Also need file_id → file path for the file_node_map lookup
-        std::unordered_map<int64_t, std::string> fileid_to_path;
-        {
-            sqlite3_stmt* stmt = nullptr;
-            sqlite3_prepare_v2(conn_.raw(),
-                "SELECT id, path FROM files", -1, &stmt, nullptr);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                fileid_to_path[sqlite3_column_int64(stmt, 0)] =
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            }
-            sqlite3_finalize(stmt);
-        }
 
         // Scan all unresolved refs and resolve, collecting edge tuples in memory
         sqlite3_stmt* ref_stmt = nullptr;
@@ -720,7 +760,7 @@ public:
             } else if (kind == "include") {
                 auto it = include_map.find(name);
                 if (it != include_map.end()) {
-                    resolved_id = it->second;
+                    resolved_id = it->second.node_id;
                     resolved = true;
                     edge_kind = "includes";
                     ++include_resolved;
