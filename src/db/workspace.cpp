@@ -424,7 +424,10 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
         // Maintaining secondary indexes per copied row is expensive for large roots.
         // Drop/rebuild them inside this transaction so crash rollback restores them.
+        log_workspace_line("dropping indexes...", color_output);
+        auto drop_phase = WorkspaceClock::now();
         schema::drop_bulk_indexes(conn_);
+        log_workspace_phase("indexes dropped", drop_phase, color_output);
 
         // Merge from the already-attached src DB
         log_workspace_line("merging from src...", color_output);
@@ -843,6 +846,12 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
             }
 
             if (!best.valid || best.confidence < 0.4) {
+                continue;
+            }
+            // Suppress cross-language edges with no receiver type context —
+            // bare-name matches across language boundaries (e.g. Go ↔ TypeScript)
+            // produce too many false positives (e.g. Reconcile ← reconciler.test.ts).
+            if (!best.same_language && !best.receiver_match) {
                 continue;
             }
 
