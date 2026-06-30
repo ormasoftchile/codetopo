@@ -446,7 +446,7 @@ inline const char* editor_name(Editor e) {
 }
 
 // Config file path for display.
-inline std::string editor_config_display(Editor e, const std::filesystem::path& root) {
+inline std::string editor_config_display(Editor e, const std::filesystem::path& /*root*/) {
     switch (e) {
         case Editor::vscode:   return ".vscode/mcp.json";
         case Editor::cursor:   return ".cursor/mcp.json";

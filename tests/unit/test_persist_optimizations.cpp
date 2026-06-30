@@ -285,7 +285,7 @@ TEST_CASE("OPT-1: Cold index with duplicate path insertion still works", "[persi
         persister.persist_file(file, extraction1, "hash1", "ok");
         // Second persist of same path on cold index should handle gracefully
         // (current implementation may rely on UNIQUE constraints or replace logic)
-        bool success2 = persister.persist_file(file, extraction2, "hash2", "ok");
+        [[maybe_unused]] bool success2 = persister.persist_file(file, extraction2, "hash2", "ok");
         persister.commit_batch();
 
         // Depending on implementation, this could either:

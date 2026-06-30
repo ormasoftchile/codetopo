@@ -233,7 +233,7 @@ public:
 private:
     Connection& conn_;
     std::string repo_root_;
-    int tool_timeout_s_;
+    [[maybe_unused]] int tool_timeout_s_;
     int idle_timeout_s_;
     QueryCache cache_;
     std::chrono::steady_clock::time_point start_time_;

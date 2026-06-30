@@ -442,7 +442,7 @@ int run_index(const Config& config) {
     std::vector<SlotState> slots(num_slots);
 
     // Parse lambda: shared by windowed submission below.
-    auto make_parse_task = [&arena_pool, &large_pool, has_large_pool, arena_size, &config, &slots, &profiler]
+    auto make_parse_task = [&arena_pool, &large_pool, has_large_pool, &config, &slots, &profiler]
         (const ScannedFile& file, int slot) -> ParsedFile {
         ParsedFile result;
         result.file = file;
@@ -679,7 +679,6 @@ int run_index(const Config& config) {
     });
 
     int next_submit = 0;
-    int next_persist = 0;
     int in_flight = 0;
     int next_slot = 0;
 
@@ -903,8 +902,6 @@ int run_index(const Config& config) {
             persist_item.sentinel = false;
             persist_queue.push(std::move(persist_item));
         }
-
-        next_persist++;
 
         // Progress display using persisted_count (actual SQLite commits)
         {
