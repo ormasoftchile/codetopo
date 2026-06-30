@@ -5,8 +5,11 @@
 #include "index/scanner.h"
 #include "util/hash.h"
 #include "util/git.h"
+#include "util/log.h"
 #include "db/schema.h"
 #include <sqlite3.h>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -524,18 +527,54 @@ public:
         // Disable FK checks — all IDs originate from the DB itself.
         conn_.exec("PRAGMA foreign_keys = OFF");
 
+        auto is_test_or_mock_path = [](const std::string& path) {
+            std::string lower = path;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return lower.find("/test") != std::string::npos ||
+                   lower.find("/mock") != std::string::npos ||
+                   lower.find("/fake") != std::string::npos ||
+                   lower.find("/stub") != std::string::npos ||
+                   lower.find("_test.") != std::string::npos ||
+                   lower.find("_mock.") != std::string::npos ||
+                   lower.find("_fake.") != std::string::npos ||
+                   lower.find("test_") != std::string::npos;
+        };
+
+        // Build file_id → file path early so symbol/include/class lookup can prefer
+        // real implementation files over test/mock/fake/stub variants.
+        std::unordered_map<int64_t, std::string> fileid_to_path;
+        {
+            sqlite3_stmt* stmt = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "SELECT id, path FROM files", -1, &stmt, nullptr);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char* path_raw = sqlite3_column_text(stmt, 1);
+                if (!path_raw) continue;
+                fileid_to_path[sqlite3_column_int64(stmt, 0)] =
+                    reinterpret_cast<const char*>(path_raw);
+            }
+            sqlite3_finalize(stmt);
+        }
+
         // --- Step 1: Build in-memory lookup: name → (node_id, file_id, is_definition) ---
         // Also builds class_map in the same scan (merges former Step 4).
-        // For each symbol name, keep the best candidate (prefer definitions, then lowest id).
+        // For each symbol name, keep the best candidate (prefer non-test/mock paths,
+        // then definitions, then lowest id).
         struct SymbolEntry {
             int64_t id;
             int64_t file_id;
             bool is_definition;
+            bool is_test_or_mock;
         };
         std::unordered_map<std::string, SymbolEntry> symbol_map;
         symbol_map.reserve(2500000);
 
-        struct ClassEntry { int64_t id; bool is_def; };
+        struct ClassEntry {
+            int64_t id;
+            bool is_def;
+            bool is_test_or_mock;
+        };
         std::unordered_map<std::string, ClassEntry> class_map;
 
         {
@@ -554,15 +593,20 @@ public:
 
                 if (!name_raw) continue;
                 std::string name(name_raw);
+                auto path_it = fileid_to_path.find(file_id);
+                const bool is_test_or_mock = path_it != fileid_to_path.end() &&
+                    is_test_or_mock_path(path_it->second);
 
                 auto it = symbol_map.find(name);
                 if (it == symbol_map.end()) {
-                    symbol_map[name] = {id, file_id, is_def};
+                    symbol_map[name] = {id, file_id, is_def, is_test_or_mock};
                 } else {
                     auto& existing = it->second;
-                    if ((!existing.is_definition && is_def) ||
-                        (existing.is_definition == is_def && id < existing.id)) {
-                        existing = {id, file_id, is_def};
+                    if ((existing.is_test_or_mock && !is_test_or_mock) ||
+                        (existing.is_test_or_mock == is_test_or_mock &&
+                         ((!existing.is_definition && is_def) ||
+                          (existing.is_definition == is_def && id < existing.id)))) {
+                        existing = {id, file_id, is_def, is_test_or_mock};
                     }
                 }
 
@@ -572,9 +616,12 @@ public:
                     if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface") {
                         auto cit = class_map.find(name);
                         if (cit == class_map.end()) {
-                            class_map[name] = {id, is_def};
-                        } else if (!cit->second.is_def && is_def) {
-                            cit->second = {id, is_def};
+                            class_map[name] = {id, is_def, is_test_or_mock};
+                        } else if ((cit->second.is_test_or_mock && !is_test_or_mock) ||
+                                  (cit->second.is_test_or_mock == is_test_or_mock &&
+                                   ((!cit->second.is_def && is_def) ||
+                                    (cit->second.is_def == is_def && id < cit->second.id)))) {
+                            cit->second = {id, is_def, is_test_or_mock};
                         }
                     }
                 }
@@ -582,8 +629,12 @@ public:
                 ++loaded;
             }
             sqlite3_finalize(stmt);
-            std::cerr << "  Loaded " << loaded << " symbols into lookup map ("
-                      << symbol_map.size() << " unique names)\n";
+            const bool color_output = stderr_is_tty();
+            std::cerr << "  Loaded " << stderr_cyan(format_with_commas(loaded), color_output)
+                      << " symbols into lookup map ("
+                      << stderr_dim(format_with_commas(static_cast<int64_t>(symbol_map.size())) + " unique names",
+                                     color_output)
+                      << ")\n";
         }
 
         // --- Step 2: Build file-node lookup: file path → file node id ---
@@ -603,20 +654,28 @@ public:
 
         // --- Step 3: Build include lookup: filename → file node id ---
         // For includes like "foo.h", we match the file node whose path ends with "/foo.h"
-        std::unordered_map<std::string, int64_t> include_map;
+        struct IncludeEntry {
+            int64_t node_id;
+            bool is_test_or_mock;
+        };
+        std::unordered_map<std::string, IncludeEntry> include_map;
         for (const auto& [path, node_id] : file_node_map) {
             auto slash_pos = path.rfind('/');
             std::string basename = (slash_pos != std::string::npos) ? path.substr(slash_pos + 1) : path;
-            // First match wins — for ambiguous includes, any match is fine (confidence=0.7)
-            if (include_map.find(basename) == include_map.end()) {
-                include_map[basename] = node_id;
+            const bool is_test_or_mock = is_test_or_mock_path(path);
+            auto it = include_map.find(basename);
+            if (it == include_map.end()) {
+                include_map[basename] = {node_id, is_test_or_mock};
+            } else if (it->second.is_test_or_mock && !is_test_or_mock) {
+                it->second = {node_id, is_test_or_mock};
             }
         }
 
         // --- Step 4: (merged into Step 1 above) ---
 
         // --- Step 5: Read all unresolved refs, resolve in memory, batch-update ---
-        std::cerr << "  Resolving refs in memory...\n";
+        const bool color_output = stderr_is_tty();
+        std::cerr << "  " << stderr_bold("Resolving refs in memory...", color_output) << "\n";
 
         // Prepare the UPDATE statement (by rowid — fastest possible)
         sqlite3_stmt* update_stmt = nullptr;
@@ -624,45 +683,65 @@ public:
             "UPDATE refs SET resolved_node_id = ? WHERE id = ?",
             -1, &update_stmt, nullptr);
 
-        // Also need file_id → file path for the file_node_map lookup
-        std::unordered_map<int64_t, std::string> fileid_to_path;
-        {
-            sqlite3_stmt* stmt = nullptr;
-            sqlite3_prepare_v2(conn_.raw(),
-                "SELECT id, path FROM files", -1, &stmt, nullptr);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                fileid_to_path[sqlite3_column_int64(stmt, 0)] =
-                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-            }
-            sqlite3_finalize(stmt);
-        }
-
         // Scan all unresolved refs and resolve, collecting edge tuples in memory
         sqlite3_stmt* ref_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "SELECT id, file_id, kind, name FROM refs WHERE resolved_node_id IS NULL",
+            "SELECT id, file_id, kind, name, containing_node_id FROM refs WHERE resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
         // Edge tuples collected during resolution — avoids expensive SQL join in Step 6
         struct EdgeTuple {
-            int64_t src_id;   // file node id
+            int64_t src_id;   // containing symbol id or file node id fallback
             int64_t dst_id;   // resolved target node id
             const char* kind; // edge kind (static string literal)
         };
         std::vector<EdgeTuple> edge_tuples;
         edge_tuples.reserve(1000000);
+        std::unordered_set<std::string> seen_edge_keys;
+        seen_edge_keys.reserve(1000000);
 
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
         int call_resolved = 0, include_resolved = 0, inherit_resolved = 0;
         std::string name;
         name.reserve(256);  // reuse buffer across iterations
+        auto find_cross_file_symbol = [&](const std::string& ref_name, int64_t ref_file_id) -> const SymbolEntry* {
+            auto it = symbol_map.find(ref_name);
+            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
+                return &it->second;
+            }
+
+            size_t suffix_start = std::string::npos;
+            if (size_t dot_pos = ref_name.rfind('.'); dot_pos != std::string::npos) {
+                suffix_start = dot_pos + 1;
+            }
+            if (size_t scope_pos = ref_name.rfind("::"); scope_pos != std::string::npos &&
+                (suffix_start == std::string::npos || scope_pos + 2 > suffix_start)) {
+                suffix_start = scope_pos + 2;
+            }
+            if (size_t arrow_pos = ref_name.rfind("->"); arrow_pos != std::string::npos &&
+                (suffix_start == std::string::npos || arrow_pos + 2 > suffix_start)) {
+                suffix_start = arrow_pos + 2;
+            }
+            if (suffix_start == std::string::npos || suffix_start >= ref_name.size()) {
+                return nullptr;
+            }
+
+            it = symbol_map.find(ref_name.substr(suffix_start));
+            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
+                return &it->second;
+            }
+            return nullptr;
+        };
 
         while (sqlite3_step(ref_stmt) == SQLITE_ROW) {
             int64_t ref_id = sqlite3_column_int64(ref_stmt, 0);
             int64_t ref_file_id = sqlite3_column_int64(ref_stmt, 1);
             const char* kind_raw = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 2));
             const char* name_raw = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 3));
+            int64_t containing_node_id = sqlite3_column_type(ref_stmt, 4) != SQLITE_NULL
+                ? sqlite3_column_int64(ref_stmt, 4)
+                : -1;
             if (!kind_raw || !name_raw) continue;
 
             std::string_view kind(kind_raw);
@@ -672,9 +751,8 @@ public:
             const char* edge_kind = nullptr;
 
             if (kind == "call") {
-                auto it = symbol_map.find(name);
-                if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
-                    resolved_id = it->second.id;
+                if (const SymbolEntry* symbol = find_cross_file_symbol(name, ref_file_id)) {
+                    resolved_id = symbol->id;
                     resolved = true;
                     edge_kind = "calls";
                     ++call_resolved;
@@ -682,7 +760,7 @@ public:
             } else if (kind == "include") {
                 auto it = include_map.find(name);
                 if (it != include_map.end()) {
-                    resolved_id = it->second;
+                    resolved_id = it->second.node_id;
                     resolved = true;
                     edge_kind = "includes";
                     ++include_resolved;
@@ -704,12 +782,20 @@ public:
                 sqlite3_step(update_stmt);
                 ++total_resolved;
 
-                // Edge tuple: file_node → resolved target (kind already set above)
+                // Edge tuple: containing symbol → resolved target, or file-node fallback
                 auto path_it = fileid_to_path.find(ref_file_id);
                 if (path_it != fileid_to_path.end()) {
                     auto fn_it = file_node_map.find(path_it->second);
                     if (fn_it != file_node_map.end()) {
-                        edge_tuples.push_back({fn_it->second, resolved_id, edge_kind});
+                        int64_t src_id = (containing_node_id > 0) ? containing_node_id : fn_it->second;
+                        std::string edge_key = std::to_string(src_id);
+                        edge_key.push_back('|');
+                        edge_key += std::to_string(resolved_id);
+                        edge_key.push_back('|');
+                        edge_key += edge_kind;
+                        if (seen_edge_keys.insert(edge_key).second) {
+                            edge_tuples.push_back({src_id, resolved_id, edge_kind});
+                        }
                     }
                 }
 
@@ -725,22 +811,24 @@ public:
         sqlite3_finalize(ref_stmt);
         sqlite3_finalize(update_stmt);
 
-        std::cerr << "  Resolved " << call_resolved << " call, "
-                  << include_resolved << " include, "
-                  << inherit_resolved << " inherit refs\n";
+        std::cerr << "  Resolved "
+                  << stderr_cyan(format_with_commas(call_resolved), color_output) << " call, "
+                  << stderr_cyan(format_with_commas(include_resolved), color_output) << " include, "
+                  << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit refs\n";
 
         // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
         // Without a unique constraint, re-runs would accumulate duplicate edges.
         // Delete only resolver-created edges (confidence=0.7, name-match evidence).
         if (!cold_index_) {
-            std::cerr << "  Clearing old cross-ref edges...\n";
+            std::cerr << "  " << stderr_bold("Clearing old cross-ref edges...", color_output) << "\n";
             conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
         }
-        std::cerr << "  Inserting " << edge_tuples.size() << " edges...\n";
+        std::cerr << "  Inserting " << stderr_cyan(format_with_commas(static_cast<int64_t>(edge_tuples.size())), color_output)
+                  << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
-        // R3: Batch edge INSERT using 150-row chunks (no UNIQUE constraint on edges,
-        // so plain INSERT is equivalent to INSERT OR IGNORE here)
+        // R3: Batch edge INSERT using 150-row chunks. edge_tuples is pre-deduped
+        // in memory because edges has no UNIQUE constraint to rely on here.
         const int RESOLVE_EDGE_BATCH = 150;
         const int PARAMS_PER_EDGE = 3;  // src_id, dst_id, kind (confidence+evidence are literals)
 
@@ -797,7 +885,8 @@ public:
         conn_.exec("COMMIT");
         sqlite3_finalize(batch_edge_stmt);
         sqlite3_finalize(single_edge_stmt);
-        std::cerr << "  Created " << edges_created << " edges\n";
+        std::cerr << "  Created " << stderr_cyan(format_with_commas(edges_created), color_output)
+                  << " edges\n";
 
         conn_.exec("PRAGMA foreign_keys = ON");
         return {total_resolved, edges_created};

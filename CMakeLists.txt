@@ -150,6 +150,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_arena_lifetime.cpp
     tests/unit/test_lean_listing.cpp
     tests/unit/test_approx_callgraph.cpp
+    tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
 )
 

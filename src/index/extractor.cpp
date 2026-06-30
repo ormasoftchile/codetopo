@@ -101,6 +101,28 @@ std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
     return normalize_type_hint(line.substr(start, pos - start));
 }
 
+size_t skip_inline_whitespace(const std::string& text, size_t pos) {
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    return pos;
+}
+
+size_t previous_significant_char(const std::string& text, size_t pos) {
+    while (pos > 0) {
+        --pos;
+        if (!std::isspace(static_cast<unsigned char>(text[pos]))) return pos;
+    }
+    return std::string::npos;
+}
+
+size_t declaration_context_start(const std::string& text, size_t pos) {
+    while (pos > 0) {
+        char c = text[pos - 1];
+        if (c == '\n' || c == '\r' || c == ';' || c == '{' || c == '}') break;
+        --pos;
+    }
+    return pos;
+}
+
 std::string lower_ascii(std::string s);
 
 std::string declaration_name_from_receiver(std::string receiver) {
@@ -169,56 +191,74 @@ std::string infer_type_from_new_expression(const std::string& text) {
     return "";
 }
 
-std::string infer_type_from_declaration_line(const std::string& line, const std::string& receiver) {
+std::string infer_type_from_destructured_annotation(const std::string& text,
+                                                    const std::string& declared_name,
+                                                    size_t name_end) {
+    size_t after_name = skip_inline_whitespace(text, name_end);
+    if (after_name >= text.size() || (text[after_name] != ',' && text[after_name] != '}')) return "";
+
+    size_t close_brace = text.find('}', after_name);
+    if (close_brace == std::string::npos) return "";
+    size_t colon = skip_inline_whitespace(text, close_brace + 1);
+    if (colon >= text.size() || text[colon] != ':') return "";
+
+    size_t type_literal = skip_inline_whitespace(text, colon + 1);
+    if (type_literal >= text.size() || text[type_literal] != '{') return "";
+
+    size_t prop = text.find(declared_name, type_literal + 1);
+    while (prop != std::string::npos) {
+        bool left_ok = (prop == 0) || !is_identifier_char(text[prop - 1]);
+        size_t prop_end = prop + declared_name.size();
+        bool right_ok = (prop_end >= text.size()) || !is_identifier_char(text[prop_end]);
+        if (left_ok && right_ok) {
+            size_t prop_colon = skip_inline_whitespace(text, prop_end);
+            if (prop_colon < text.size() && text[prop_colon] == ':') {
+                auto type = read_type_after_colon(text, prop_colon);
+                if (!type.empty()) return type;
+            }
+        }
+        prop = text.find(declared_name, prop_end);
+    }
+    return "";
+}
+
+std::string infer_type_from_declaration_text(const std::string& text, const std::string& receiver) {
     std::string declared_name = declaration_name_from_receiver(receiver);
     if (declared_name.empty()) return "";
 
-    size_t pos = line.find(declared_name);
+    size_t pos = text.find(declared_name);
     while (pos != std::string::npos) {
-        bool left_ok = (pos == 0) || !is_identifier_char(line[pos - 1]);
+        bool left_ok = (pos == 0) || !is_identifier_char(text[pos - 1]);
         size_t end = pos + declared_name.size();
-        bool right_ok = (end >= line.size()) || !is_identifier_char(line[end]);
-        if (left_ok && right_ok &&
-            declaration_prefix_allows_receiver(line.substr(0, pos))) {
-            size_t next = end;
-            while (next < line.size() && std::isspace(static_cast<unsigned char>(line[next]))) ++next;
-            if (next < line.size() && line[next] == '?') {
-                ++next;
-                while (next < line.size() && std::isspace(static_cast<unsigned char>(line[next]))) ++next;
-            }
-            if (next < line.size() && line[next] == ':') {
-                auto type = read_type_after_colon(line, next);
-                if (!type.empty()) return type;
+        bool right_ok = (end >= text.size()) || !is_identifier_char(text[end]);
+        if (left_ok && right_ok) {
+            size_t context_start = declaration_context_start(text, pos);
+            std::string before = text.substr(context_start, pos - context_start);
+            bool prefix_allowed = declaration_prefix_allows_receiver(before);
+            size_t prev_sig = previous_significant_char(text, pos);
+            bool empty_prefix_has_anchor =
+                prev_sig != std::string::npos &&
+                (text[prev_sig] == '(' || text[prev_sig] == ',' || text[prev_sig] == '[');
+
+            if (prefix_allowed && (!trim_copy(before).empty() || empty_prefix_has_anchor)) {
+                size_t next = skip_inline_whitespace(text, end);
+                if (next < text.size() && text[next] == '?') {
+                    next = skip_inline_whitespace(text, next + 1);
+                }
+                if (next < text.size() && text[next] == ':') {
+                    auto type = read_type_after_colon(text, next);
+                    if (!type.empty()) return type;
+                }
+                if (next < text.size() && text[next] == '=') {
+                    auto type = infer_type_from_new_expression(text.substr(next + 1));
+                    if (!type.empty()) return type;
+                }
             }
 
-            if (next < line.size() && line[next] == '=') {
-                auto type = infer_type_from_new_expression(line.substr(next + 1));
-                if (!type.empty()) return type;
-            }
-
-            if (next >= line.size() || line[next] == ';' ||
-                line[next] == ',' || line[next] == '(' || line[next] == ')') {
-                size_t before = pos;
-                while (before > 0 && std::isspace(static_cast<unsigned char>(line[before - 1]))) --before;
-                while (before > 0 && (line[before - 1] == '*' || line[before - 1] == '&' ||
-                                      std::isspace(static_cast<unsigned char>(line[before - 1])))) {
-                    --before;
-                }
-                size_t start = before;
-                while (start > 0) {
-                    char c = line[start - 1];
-                    if (!(is_identifier_char(c) || c == ':' || c == '.' || c == '<' || c == '>' || c == ',')) break;
-                    --start;
-                }
-                auto type = normalize_type_hint(line.substr(start, before - start));
-                static const std::unordered_set<std::string> keywords = {
-                    "const", "let", "var", "auto", "return", "new", "this", "public",
-                    "private", "protected", "static", "final"
-                };
-                if (!type.empty() && !keywords.count(type)) return type;
-            }
+            auto destructured = infer_type_from_destructured_annotation(text, declared_name, end);
+            if (!destructured.empty()) return destructured;
         }
-        pos = line.find(declared_name, end);
+        pos = text.find(declared_name, end);
     }
     return "";
 }
@@ -607,12 +647,7 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
         uint32_t call_start = ts_node_start_byte(node);
         size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
         std::string prefix = source_->substr(window_start, call_start - window_start);
-        std::istringstream lines(prefix);
-        std::string line;
-        while (std::getline(lines, line)) {
-            auto type_hint = infer_type_from_declaration_line(line, receiver);
-            if (!type_hint.empty()) receiver_type_hint = type_hint;
-        }
+        receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
     }
 
     add_ref("call", name, node, evidence, arg_count, arg_pattern, receiver_type_hint);
@@ -1013,7 +1048,7 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
 }
 
-void Extractor::extract_go(TSNode node, const std::string& type, const std::string& parent_qn) {
+void Extractor::extract_go(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
     if (type == "function_declaration") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);
@@ -1210,7 +1245,7 @@ void Extractor::extract_java(TSNode node, const std::string& type, const std::st
     }
 }
 
-void Extractor::extract_bash(TSNode node, const std::string& type, const std::string& parent_qn) {
+void Extractor::extract_bash(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
     if (type == "function_definition") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);
@@ -1232,7 +1267,7 @@ void Extractor::extract_bash(TSNode node, const std::string& type, const std::st
     }
 }
 
-void Extractor::extract_sql(TSNode node, const std::string& type, const std::string& parent_qn) {
+void Extractor::extract_sql(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
     if (type == "create_function_statement") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);

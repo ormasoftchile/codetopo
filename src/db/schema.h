@@ -3,6 +3,7 @@
 #include "db/connection.h"
 #include "index/scanner.h"
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <ctime>
 #include <vector>
@@ -14,10 +15,87 @@ namespace codetopo {
 // Schema version 5 = roots table + root_id on files (unified workspace).
 // Schema version 6 = call-ref metadata for approximate callgraph narrowing.
 // Schema version 7 = composite dst/kind/confidence edge index for callers_approx.
-static constexpr int CURRENT_SCHEMA_VERSION = 7;
+// Schema version 8 = contentless symbol FTS with camelCase-aware name indexing.
+static constexpr int CURRENT_SCHEMA_VERSION = 8;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
+
+inline bool is_ascii_upper(unsigned char c) {
+    return c >= 'A' && c <= 'Z';
+}
+
+inline bool is_ascii_lower(unsigned char c) {
+    return c >= 'a' && c <= 'z';
+}
+
+inline std::string camel_split_identifier(std::string_view value) {
+    if (value.empty()) return {};
+
+    std::string split;
+    split.reserve(value.size() + value.size() / 4);
+    split.push_back(value.front());
+
+    bool changed = false;
+    for (size_t i = 1; i < value.size(); ++i) {
+        unsigned char prev = static_cast<unsigned char>(value[i - 1]);
+        unsigned char curr = static_cast<unsigned char>(value[i]);
+        unsigned char next = (i + 1 < value.size())
+            ? static_cast<unsigned char>(value[i + 1])
+            : 0;
+        bool split_before =
+            (is_ascii_lower(prev) && is_ascii_upper(curr)) ||
+            (is_ascii_upper(prev) && is_ascii_upper(curr) && next != 0 && is_ascii_lower(next));
+        if (split_before) {
+            split.push_back(' ');
+            changed = true;
+        }
+        split.push_back(static_cast<char>(curr));
+    }
+
+    if (!changed) return std::string(value);
+
+    std::string result;
+    result.reserve(value.size() + 1 + split.size());
+    result.append(value.data(), value.size());
+    result.push_back(' ');
+    result.append(split);
+    return result;
+}
+
+inline void sqlite_codetopo_camel_split(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+    if (argc != 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        sqlite3_result_null(ctx);
+        return;
+    }
+
+    const unsigned char* text = sqlite3_value_text(argv[0]);
+    if (!text) {
+        sqlite3_result_null(ctx);
+        return;
+    }
+
+    std::string result = camel_split_identifier(
+        std::string_view(reinterpret_cast<const char*>(text)));
+    sqlite3_result_text(ctx, result.c_str(), static_cast<int>(result.size()), SQLITE_TRANSIENT);
+}
+
+inline void register_custom_functions(sqlite3* db) {
+    if (!db) return;
+    int rc = sqlite3_create_function_v2(
+        db,
+        "codetopo_camel_split",
+        1,
+        SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_INNOCUOUS,
+        nullptr,
+        sqlite_codetopo_camel_split,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (rc != SQLITE_OK) {
+        throw std::runtime_error("SQLite function registration failed: codetopo_camel_split");
+    }
+}
 
 inline void create_tables(Connection& conn) {
     // roots table: extra workspace roots merged into this DB.
@@ -130,7 +208,8 @@ inline void create_fts(Connection& conn) {
     conn.exec(R"SQL(
         CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
             name, qualname, signature, doc,
-            content='nodes', content_rowid='id'
+            content='',
+            tokenize='unicode61 remove_diacritics 2'
         );
     )SQL");
 }
@@ -273,7 +352,9 @@ inline void rebuild_indexes(Connection& conn) {
 
 // Initialize or verify schema. Returns exit code (0=ok, 3=mismatch).
 inline int ensure_schema(Connection& conn) {
+    register_custom_functions(conn.raw());
     int version = get_schema_version(conn);
+    bool recreate_nodes_fts = false;
 
     if (version == 0) {
         // Fresh DB
@@ -353,7 +434,24 @@ inline int ensure_schema(Connection& conn) {
         version = 7;
     }
 
+    // v7→v8: switch nodes_fts to contentless and camelCase-aware name indexing.
+    if (version == 7) {
+        conn.exec("DROP TABLE IF EXISTS nodes_fts");
+        conn.exec("DROP TRIGGER IF EXISTS nodes_fts_insert");
+        conn.exec("DROP TRIGGER IF EXISTS nodes_fts_delete");
+        conn.exec("DROP TRIGGER IF EXISTS nodes_fts_update");
+        version = 8;
+        recreate_nodes_fts = true;
+    }
+
     if (version == CURRENT_SCHEMA_VERSION) {
+        if (recreate_nodes_fts) {
+            create_fts(conn);
+            conn.exec(
+                "INSERT INTO nodes_fts(rowid, name, qualname, signature, doc) "
+                "SELECT id, codetopo_camel_split(name), qualname, signature, doc "
+                "FROM nodes WHERE node_type = 'symbol'");
+        }
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         return 0;
     }

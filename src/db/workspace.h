@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <utility>
 
 namespace codetopo {
 
@@ -19,7 +20,16 @@ public:
     // Takes the path to the main index.sqlite (not a separate workspace.sqlite).
     explicit WorkspaceDB(const std::string& main_db_path);
 
-    struct AddResult { int64_t root_id = 0; int64_t files = 0; int64_t symbols = 0; int64_t edges = 0; };
+    struct AddResult {
+        int64_t root_id = 0;
+        int64_t files = 0;
+        int64_t symbols = 0;
+        int64_t edges = 0;
+        int64_t roots_total = 0;
+        int64_t files_total = 0;
+        int64_t symbols_total = 0;
+        int64_t edges_total = 0;
+    };
     struct RemoveResult { int64_t files = 0; int64_t symbols = 0; int64_t edges = 0; };
     struct RootInfo { int64_t id = 0; std::string path; int64_t files = 0; int64_t symbols = 0; int64_t edges = 0; };
 
@@ -38,8 +48,9 @@ public:
 private:
     Connection conn_;
     void ensure_schema();
-    void merge_root_attached(int64_t root_id, const std::string& root_path);
-    void populate_content_fts_for_root(int64_t root_id);
+    void merge_root_attached(int64_t root_id, const std::string& root_path, bool color_output);
+    std::pair<int64_t, int64_t> resolve_workspace_refs(int64_t added_root_id);
+    void populate_content_fts_for_root(int64_t root_id, bool color_output);
     void resume_pending_content_fts();
 };
 

@@ -11,6 +11,7 @@ using namespace codetopo;
 
 TEST_CASE("FTS5 search finds symbols by partial name", "[unit][us1]") {
     auto tmp = fs::temp_directory_path() / "codetopo_fts_test";
+    fs::remove_all(tmp);
     fs::create_directories(tmp);
     auto db_path = tmp / "fts_test.sqlite";
 
@@ -42,6 +43,7 @@ TEST_CASE("FTS5 search finds symbols by partial name", "[unit][us1]") {
 
         insert("calculateDistance", "math::calculateDistance", "function");
         insert("calculateArea", "math::calculateArea", "function");
+        insert("SyncPod", "kube::SyncPod", "function");
         insert("Point", "math::Point", "struct");
         insert("Line", "math::Line", "class");
 
@@ -65,6 +67,26 @@ TEST_CASE("FTS5 search finds symbols by partial name", "[unit][us1]") {
         }
         sqlite3_finalize(stmt);
         REQUIRE(count >= 2);
+
+        // Search for split CamelCase terms — should find SyncPod
+        sqlite3_prepare_v2(conn.raw(),
+            "SELECT COUNT(*) FROM nodes_fts fts "
+            "JOIN nodes n ON n.id = fts.rowid "
+            "WHERE nodes_fts MATCH 'sync AND pod' AND n.name = 'SyncPod'",
+            -1, &stmt, nullptr);
+        bool found_sync_pod = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0;
+        sqlite3_finalize(stmt);
+        REQUIRE(found_sync_pod);
+
+        // Exact CamelCase match should still work
+        sqlite3_prepare_v2(conn.raw(),
+            "SELECT COUNT(*) FROM nodes_fts fts "
+            "JOIN nodes n ON n.id = fts.rowid "
+            "WHERE nodes_fts MATCH 'SyncPod' AND n.name = 'SyncPod'",
+            -1, &stmt, nullptr);
+        bool found_exact = sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_int(stmt, 0) > 0;
+        sqlite3_finalize(stmt);
+        REQUIRE(found_exact);
 
         // Search for "Point" — should find the struct
         sqlite3_prepare_v2(conn.raw(),

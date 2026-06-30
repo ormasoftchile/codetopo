@@ -65,7 +65,7 @@ public:
 private:
     fs::path root_;
     WatchCallback callback_;
-    std::chrono::milliseconds debounce_;
+    [[maybe_unused]] std::chrono::milliseconds debounce_;
     std::atomic<bool> running_;
     std::thread watch_thread_;
 

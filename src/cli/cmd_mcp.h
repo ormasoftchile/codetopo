@@ -213,6 +213,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Compute the blast radius of changing a symbol from exact graph edges. Candidate impact is first-hop only, lean by default, and can be narrowed by receiver with metadata for hidden candidates.",
         R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to analyze"},"depth":{"type":"integer","description":"How many levels of transitive callers to follow (default 2, max 3)"},"max_nodes":{"type":"integer","description":"Max exact impacted nodes and candidate_impacted rows (default 50, max 200)"},"include_candidates":{"type":"boolean","description":"When true, always add candidate_impacted; when false, return exact impact only. Omitted means add candidates only if exact impact is empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_impacted. Default exact_then_candidates."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_impacted (e.g. LinkedMap); response includes candidate_impacted_total and candidate_impacted_filtered_hidden."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_impacted (default 16000, 0 disables, max 100000)."}},"required":["node_id"])J");
 
+    server.register_tool("detect_changes", tools::detect_changes,
+        "Given a git ref, list changed files and symbols, then walk reverse call edges to estimate blast radius for PR review.",
+        R"J({"type":"object","properties":{"repo_root":{"type":"string","description":"Path to the git repository root"},"since":{"type":"string","description":"Git ref to diff against HEAD (branch, SHA, HEAD~N, etc.)"},"file_pattern":{"type":"string","description":"Optional GLOB filter for changed files (e.g. 'src/**/*.go')"},"depth":{"type":"integer","description":"BFS depth for impacted callers (default 2, max 5)"},"min_confidence":{"type":"number","description":"Minimum calls-edge confidence to follow (default 0.5)"}},"required":["repo_root","since"]})J");
+
     server.register_tool("file_deps", tools::file_deps,
         "Get file-level dependencies: which files does a file include/import, and which files include it.",
         R"J({"type":"object","properties":{"file_path":{"type":"string","description":"Relative file path"}},"required":["file_path"])J");
@@ -243,7 +247,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("code_search", tools::code_search,
         "Search for arbitrary text patterns across all source file contents. Uses a trigram index for fast substring matching. Default is grep-like: file, line, and matched text with no context duplication; set context_lines to include surrounding lines.",
-        R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 20, max 100)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 0, max 5). When context is returned, matched text is not duplicated in a separate text field."},"max_bytes":{"type":"integer","description":"Soft response budget (default 16000, 0 disables, max 100000)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 50, max 500)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 0, max 5). When context is returned, matched text is not duplicated in a separate text field."},"max_bytes":{"type":"integer","description":"Soft response budget (default 16000, 0 disables, max 100000)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
 
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
@@ -364,6 +368,7 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"context_by_name", tools::context_by_name},
         {"entrypoints", tools::entrypoints},
         {"impact_of", tools::impact_of},
+        {"detect_changes", tools::detect_changes},
         {"file_deps", tools::file_deps},
         {"method_fields", tools::method_fields},
         {"subgraph", tools::subgraph},
