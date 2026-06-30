@@ -5378,8 +5378,8 @@ std::string code_search(yyjson_val* params, Connection& conn,
         return McpError::invalid_input("Query must be at least 3 characters for content search").to_json_rpc(0);
     }
 
-    int limit = params ? static_cast<int>(json_get_int(params, "limit", 20)) : 20;
-    if (limit > 100) limit = 100;
+    int limit = params ? static_cast<int>(json_get_int(params, "limit", 50)) : 50;
+    if (limit > 500) limit = 500;
     if (limit < 1) limit = 1;
 
     int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 0)) : 0;
