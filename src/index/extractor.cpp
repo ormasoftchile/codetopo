@@ -165,11 +165,11 @@ bool declaration_prefix_allows_receiver(std::string before) {
         if (is_identifier_char(c)) {
             token.push_back(c);
         } else if (!token.empty()) {
-            tokens.push_back(lower_ascii(token));
+            tokens.push_back(token);
             token.clear();
         }
     }
-    if (!token.empty()) tokens.push_back(lower_ascii(token));
+    if (!token.empty()) tokens.push_back(token);
     if (tokens.empty()) return true;
 
     static const std::unordered_set<std::string> allowed = {
@@ -177,7 +177,9 @@ bool declaration_prefix_allows_receiver(std::string before) {
         "static", "declare", "export", "abstract", "override", "accessor"
     };
     for (const auto& t : tokens) {
-        if (!allowed.count(t)) return false;
+        if (allowed.count(lower_ascii(t))) continue;
+        if (!t.empty() && std::isupper(static_cast<unsigned char>(t[0]))) continue;
+        return false;
     }
     return true;
 }
@@ -1211,6 +1213,28 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
         size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
         std::string prefix = source_->substr(window_start, call_start - window_start);
         receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
+        if (receiver_type_hint.empty() && declaration_name[0] != '_') {
+            std::string alt_receiver = receiver;
+            std::string underscored = "_" + declaration_name;
+            size_t last_dot = alt_receiver.rfind('.');
+            if (last_dot != std::string::npos) {
+                alt_receiver = alt_receiver.substr(0, last_dot + 1) + underscored;
+            } else {
+                alt_receiver = underscored;
+            }
+            receiver_type_hint = infer_type_from_declaration_text(prefix, alt_receiver);
+        }
+        if (receiver_type_hint.empty() && declaration_name[0] == '_' && declaration_name.size() > 1) {
+            std::string alt_receiver = receiver;
+            std::string without_underscore = declaration_name.substr(1);
+            size_t last_dot = alt_receiver.rfind('.');
+            if (last_dot != std::string::npos) {
+                alt_receiver = alt_receiver.substr(0, last_dot + 1) + without_underscore;
+            } else {
+                alt_receiver = without_underscore;
+            }
+            receiver_type_hint = infer_type_from_declaration_text(prefix, alt_receiver);
+        }
     }
 
     add_ref("call", name, node, evidence, arg_count, arg_pattern, receiver_type_hint);
