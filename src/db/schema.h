@@ -336,6 +336,7 @@ inline void ensure_refs_call_metadata_schema(Connection& conn) {
 
 inline void recreate_refs_table_with_http_call(Connection& conn) {
     if (!table_exists(conn, "refs")) return;
+    conn.exec("PRAGMA foreign_keys=OFF");
     conn.exec("ALTER TABLE refs RENAME TO refs_old");
     conn.exec(R"SQL(
         CREATE TABLE refs (
@@ -366,6 +367,7 @@ inline void recreate_refs_table_with_http_call(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
+    conn.exec("PRAGMA foreign_keys=ON");
 }
 
 inline void ensure_nodes_fingerprint_schema(Connection& conn) {
