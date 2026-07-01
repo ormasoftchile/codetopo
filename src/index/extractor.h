@@ -18,6 +18,7 @@ struct ExtractedSymbol {
     std::string name;
     std::string qualname;
     std::string signature;
+    std::string fingerprint;
     int start_line = 0;
     int start_col = 0;
     int end_line = 0;
@@ -96,11 +97,14 @@ private:
     std::string find_identifier_recursive(TSNode node, int depth);
     std::string get_callee_name(TSNode func_node);
     std::string extract_leading_comment(TSNode node);
+    std::string compute_fingerprint(TSNode node);
+    void add_javascript_constructor_fallbacks(const std::string& source);
 
     void add_symbol(const std::string& kind, const std::string& name,
                     TSNode node, const std::string& qualname = "",
                     const std::string& signature = "",
-                    const std::string& visibility = "");
+                    const std::string& visibility = "",
+                    TSNode fingerprint_node = TSNode{});
     void add_ref(const std::string& kind, const std::string& name, TSNode node,
                  const std::string& evidence = "", int arg_count = -1,
                  const std::string& arg_pattern = "",

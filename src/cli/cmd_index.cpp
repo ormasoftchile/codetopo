@@ -14,6 +14,7 @@
 #include "index/parser.h"
 #include "index/extractor.h"
 #include "index/persister.h"
+#include "semantic/token_vectors.h"
 #include "util/hash.h"
 #include "util/git.h"
 #include "util/lock.h"
@@ -127,6 +128,57 @@ struct PersistThreadState {
     std::string error_message;  // guarded by fatal_error flag
 };
 
+static void embed_symbols(Connection& conn, const TokenVectorTable& tvt) {
+    if (!tvt.ready()) return;
+
+    sqlite3_stmt* sel = nullptr;
+    sqlite3_stmt* ins = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(),
+            "SELECT id, name FROM nodes "
+            "WHERE node_type='symbol' "
+            "  AND is_definition=1 "
+            "  AND kind IN ('function','method','class','interface','struct','constructor_fn') "
+            "  AND id NOT IN (SELECT node_id FROM node_vectors)",
+            -1, &sel, nullptr) != SQLITE_OK) {
+        if (sel) sqlite3_finalize(sel);
+        return;
+    }
+    if (sqlite3_prepare_v2(conn.raw(),
+            "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES(?,?)",
+            -1, &ins, nullptr) != SQLITE_OK) {
+        sqlite3_finalize(sel);
+        if (ins) sqlite3_finalize(ins);
+        return;
+    }
+
+    int64_t count = 0;
+    conn.exec("BEGIN TRANSACTION");
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(sel, 0);
+        const char* name = reinterpret_cast<const char*>(sqlite3_column_text(sel, 1));
+        if (!name) continue;
+
+        auto emb = tvt.embed(name);
+        if (emb.empty()) continue;
+
+        sqlite3_reset(ins);
+        sqlite3_clear_bindings(ins);
+        sqlite3_bind_int64(ins, 1, id);
+        sqlite3_bind_blob(ins, 2, emb.data(), static_cast<int>(emb.size()), SQLITE_TRANSIENT);
+        if (sqlite3_step(ins) != SQLITE_DONE) continue;
+
+        if (++count % 100000 == 0) {
+            conn.exec("COMMIT");
+            conn.exec("BEGIN TRANSACTION");
+            std::cerr << "  Embedded " << count << " symbols...\n";
+        }
+    }
+    conn.exec("COMMIT");
+    sqlite3_finalize(ins);
+    sqlite3_finalize(sel);
+    std::cerr << "  Symbol embeddings: " << count << " computed\n";
+}
+
 // T045-T050: Full index command implementation with parallel parse.
 int run_index(const Config& config) {
     namespace fs = std::filesystem;
@@ -136,6 +188,11 @@ int run_index(const Config& config) {
 
     auto repo_root = fs::canonical(config.repo_root);
     auto db_path = config.db_path;
+    TokenVectorTable token_vectors;
+    for (const auto& [bin_path, txt_path] :
+         semantic::token_vector_candidate_paths(repo_root.string())) {
+        if (token_vectors.load(bin_path, txt_path)) break;
+    }
 
     // Acquire lock (T014/FR-036)
     auto lock_path = db_path;
@@ -159,6 +216,8 @@ int run_index(const Config& config) {
         std::cerr << "ERROR: Schema version mismatch (exit code 3)\n";
         return 3;
     }
+    schema::ensure_nodes_fingerprint_schema(conn);
+    schema::set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     // FTS triggers created later — after bulk inserts for performance
 
     // Ensure quarantine table exists (additive migration)
@@ -515,6 +574,13 @@ int run_index(const Config& config) {
         // Fresh parser per file — parser reuse (DEC-039 OPT-5) reverted per DEC-038/039.
         // Tree-sitter parsers cache internal buffers from the arena; reusing across
         // arena boundaries causes dangling pointers and heap corruption at high throughput.
+        //
+        // IMPORTANT: Parser is wrapped in a nested scope so ts_parser_delete() runs
+        // while the arena is still active. If set_thread_arena(nullptr) is called first
+        // and ts_parser_delete() then tries to allocate/realloc (e.g. cleanup tables),
+        // ts_arena_malloc returns nullptr → SIGSEGV. The nested scope ensures the
+        // Parser destructor fires before any set_thread_arena(nullptr) call.
+        {
         Parser parser;
         if (!parser.set_language(file.language)) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
@@ -578,6 +644,8 @@ int run_index(const Config& config) {
         // arena-allocated tree internals. Must happen before ArenaLease
         // releases the arena back to the pool (where it gets reset).
         tree = TreeGuard(nullptr);
+
+        } // end Parser scope — ts_parser_delete() runs here, arena still active
 
         // Mark slot idle now that both parse + extract are done.
         slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
@@ -965,6 +1033,12 @@ int run_index(const Config& config) {
 
     // Checkpoint WAL after resolve_refs before building indexes
     conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    if (token_vectors.ready()) {
+        std::cerr << "Computing symbol embeddings...\n";
+        embed_symbols(conn, token_vectors);
+        conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
 
     // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
     if (bulk_mode) {

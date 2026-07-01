@@ -1,10 +1,15 @@
 #include "index/extractor.h"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
+#include <functional>
 #include <fstream>
-#include <sstream>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <regex>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -36,6 +41,15 @@ bool is_nested_function_boundary(const std::string& type) {
            type == "function_declaration" || type == "generator_function" ||
            type == "generator_function_declaration" || type == "method_definition";
 }
+
+static constexpr std::array<uint64_t, 16> kMinHashSeeds = {{
+    0x9e3779b97f4a7c15ULL, 0x6c62272e07bb0142ULL, 0x94d049bb133111ebULL,
+    0xbf58476d1ce4e5b9ULL, 0xd2a98b26625eee7bULL, 0x17f4fce5a5f5f8f0ULL,
+    0x3c6ef372fe94f82bULL, 0x82cbc74a3c965d9eULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL,
+    0x5be0cd19137e2179ULL, 0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
+    0x3956c25bf348b538ULL
+}};
 
 bool starts_with_uppercase_ascii(const std::string& name) {
     return !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) != 0;
@@ -86,7 +100,7 @@ std::string normalize_type_hint(std::string type) {
     return trim_copy(type);
 }
 
-std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
+std::string read_type_after_colon(std::string_view line, size_t colon_pos) {
     size_t pos = colon_pos + 1;
     while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
     size_t start = pos;
@@ -98,15 +112,15 @@ std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
         if (generic_depth == 0 && (c == '=' || c == ';' || c == ',' || c == ')' || c == '{')) break;
         ++pos;
     }
-    return normalize_type_hint(line.substr(start, pos - start));
+    return normalize_type_hint(std::string(line.substr(start, pos - start)));
 }
 
-size_t skip_inline_whitespace(const std::string& text, size_t pos) {
+size_t skip_inline_whitespace(std::string_view text, size_t pos) {
     while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
     return pos;
 }
 
-size_t previous_significant_char(const std::string& text, size_t pos) {
+size_t previous_significant_char(std::string_view text, size_t pos) {
     while (pos > 0) {
         --pos;
         if (!std::isspace(static_cast<unsigned char>(text[pos]))) return pos;
@@ -114,7 +128,7 @@ size_t previous_significant_char(const std::string& text, size_t pos) {
     return std::string::npos;
 }
 
-size_t declaration_context_start(const std::string& text, size_t pos) {
+size_t declaration_context_start(std::string_view text, size_t pos) {
     while (pos > 0) {
         char c = text[pos - 1];
         if (c == '\n' || c == '\r' || c == ';' || c == '{' || c == '}') break;
@@ -151,11 +165,11 @@ bool declaration_prefix_allows_receiver(std::string before) {
         if (is_identifier_char(c)) {
             token.push_back(c);
         } else if (!token.empty()) {
-            tokens.push_back(lower_ascii(token));
+            tokens.push_back(token);
             token.clear();
         }
     }
-    if (!token.empty()) tokens.push_back(lower_ascii(token));
+    if (!token.empty()) tokens.push_back(token);
     if (tokens.empty()) return true;
 
     static const std::unordered_set<std::string> allowed = {
@@ -163,12 +177,14 @@ bool declaration_prefix_allows_receiver(std::string before) {
         "static", "declare", "export", "abstract", "override", "accessor"
     };
     for (const auto& t : tokens) {
-        if (!allowed.count(t)) return false;
+        if (allowed.count(lower_ascii(t))) continue;
+        if (!t.empty() && std::isupper(static_cast<unsigned char>(t[0]))) continue;
+        return false;
     }
     return true;
 }
 
-std::string infer_type_from_new_expression(const std::string& text) {
+std::string infer_type_from_new_expression(std::string_view text) {
     size_t pos = text.find("new");
     while (pos != std::string::npos) {
         bool left_ok = (pos == 0) || !is_identifier_char(text[pos - 1]);
@@ -183,7 +199,7 @@ std::string infer_type_from_new_expression(const std::string& text) {
                    (is_identifier_char(text[end]) || text[end] == '.' || text[end] == ':')) {
                 ++end;
             }
-            auto type = normalize_type_hint(text.substr(start, end - start));
+            auto type = normalize_type_hint(std::string(text.substr(start, end - start)));
             if (!type.empty()) return type;
         }
         pos = text.find("new", pos + 3);
@@ -191,7 +207,7 @@ std::string infer_type_from_new_expression(const std::string& text) {
     return "";
 }
 
-std::string infer_type_from_destructured_annotation(const std::string& text,
+std::string infer_type_from_destructured_annotation(std::string_view text,
                                                     const std::string& declared_name,
                                                     size_t name_end) {
     size_t after_name = skip_inline_whitespace(text, name_end);
@@ -222,7 +238,7 @@ std::string infer_type_from_destructured_annotation(const std::string& text,
     return "";
 }
 
-std::string infer_type_from_declaration_text(const std::string& text, const std::string& receiver) {
+std::string infer_type_from_declaration_text(std::string_view text, const std::string& receiver) {
     std::string declared_name = declaration_name_from_receiver(receiver);
     if (declared_name.empty()) return "";
 
@@ -233,14 +249,14 @@ std::string infer_type_from_declaration_text(const std::string& text, const std:
         bool right_ok = (end >= text.size()) || !is_identifier_char(text[end]);
         if (left_ok && right_ok) {
             size_t context_start = declaration_context_start(text, pos);
-            std::string before = text.substr(context_start, pos - context_start);
-            bool prefix_allowed = declaration_prefix_allows_receiver(before);
+            std::string_view before = text.substr(context_start, pos - context_start);
+            bool prefix_allowed = declaration_prefix_allows_receiver(std::string(before));
             size_t prev_sig = previous_significant_char(text, pos);
             bool empty_prefix_has_anchor =
                 prev_sig != std::string::npos &&
                 (text[prev_sig] == '(' || text[prev_sig] == ',' || text[prev_sig] == '[');
 
-            if (prefix_allowed && (!trim_copy(before).empty() || empty_prefix_has_anchor)) {
+            if (prefix_allowed && (!trim_copy(std::string(before)).empty() || empty_prefix_has_anchor)) {
                 size_t next = skip_inline_whitespace(text, end);
                 if (next < text.size() && text[next] == '?') {
                     next = skip_inline_whitespace(text, next + 1);
@@ -303,6 +319,87 @@ std::string lower_ascii(std::string s) {
     return s;
 }
 
+bool is_function_like_kind(const std::string& kind) {
+    return kind == "function" || kind == "method" || kind == "constructor_fn";
+}
+
+TSNode find_body_by_field(TSNode node) {
+    static constexpr const char* kFields[] = {"body", "consequence"};
+    for (const char* field : kFields) {
+        TSNode body = ts_node_child_by_field_name(node, field, static_cast<uint32_t>(std::strlen(field)));
+        if (!ts_node_is_null(body)) return body;
+    }
+    return TSNode{};
+}
+
+TSNode find_function_body_node(TSNode node) {
+    if (ts_node_is_null(node)) return TSNode{};
+
+    TSNode body = find_body_by_field(node);
+    if (!ts_node_is_null(body)) return body;
+
+    std::string type = ts_node_type(node);
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; ++i) {
+        TSNode child = ts_node_named_child(node, i);
+        if (!ts_node_is_named(child)) continue;
+
+        std::string child_type = ts_node_type(child);
+        if (child_type == "statement_block" || child_type == "compound_statement" ||
+            child_type == "block" || child_type == "body" ||
+            child_type == "declaration_list") {
+            return child;
+        }
+    }
+
+    if (type == "function_expression" || type == "arrow_function") {
+        return node;
+    }
+
+    return TSNode{};
+}
+
+std::string normalize_leaf_type(TSNode node) {
+    std::string type = lower_ascii(ts_node_type(node));
+    if (type.find("identifier") != std::string::npos || type == "shorthand_property_identifier_pattern")
+        return "I";
+    if (type.find("string") != std::string::npos)
+        return "S";
+    if (type.find("number") != std::string::npos || type.find("integer") != std::string::npos ||
+        type.find("float") != std::string::npos)
+        return "N";
+    if (type.find("type") != std::string::npos)
+        return "T";
+    return type.substr(0, std::min<size_t>(4, type.size()));
+}
+
+void collect_leaf_tokens(TSNode node, std::vector<std::string>& tokens) {
+    // Iterative DFS to avoid stack overflow on deeply nested ASTs.
+    // A recursive version crashes on large C# methods with deep generic nesting.
+    struct Frame { TSNode node; uint32_t next_child; };
+    std::vector<Frame> stack;
+    stack.reserve(256);
+    if (!ts_node_is_null(node) && ts_node_is_named(node))
+        stack.push_back({node, 0});
+
+    while (!stack.empty()) {
+        auto& top = stack.back();
+        uint32_t named_count = ts_node_named_child_count(top.node);
+        if (named_count == 0) {
+            tokens.push_back(normalize_leaf_type(top.node));
+            stack.pop_back();
+            continue;
+        }
+        if (top.next_child >= named_count) {
+            stack.pop_back();
+            continue;
+        }
+        TSNode child = ts_node_named_child(top.node, top.next_child++);
+        if (!ts_node_is_null(child) && ts_node_is_named(child))
+            stack.push_back({child, 0});
+    }
+}
+
 std::string classify_argument(TSNode arg, const std::string& source) {
     const char* type = ts_node_type(arg);
     std::string t = type ? type : "";
@@ -353,6 +450,127 @@ std::string join_patterns(const std::vector<std::string>& patterns) {
     return out;
 }
 
+bool is_string_literal_node(TSNode node) {
+    if (ts_node_is_null(node)) return false;
+    std::string type = ts_node_type(node);
+    return type == "string" ||
+           type == "string_literal" ||
+           type == "interpreted_string_literal" ||
+           type == "raw_string_literal" ||
+           type == "template_string";
+}
+
+std::string decode_string_literal(TSNode node, const std::string& source) {
+    if (!is_string_literal_node(node)) return "";
+    std::string text = trim_copy(source_text(node, source));
+    if (text.size() < 2) return "";
+
+    char quote = text.front();
+    if ((quote == '"' || quote == '\'' || quote == '`') && text.back() == quote) {
+        if (quote == '`' && text.find("${") != std::string::npos) return "";
+        return text.substr(1, text.size() - 2);
+    }
+    return "";
+}
+
+std::string normalize_http_path(std::string url) {
+    url = trim_copy(std::move(url));
+    if (url.empty()) return "";
+
+    size_t scheme = url.find("://");
+    if (scheme != std::string::npos) {
+        size_t path_pos = url.find('/', scheme + 3);
+        url = path_pos == std::string::npos ? "/" : url.substr(path_pos);
+    } else if (url.rfind("//", 0) == 0) {
+        size_t path_pos = url.find('/', 2);
+        url = path_pos == std::string::npos ? "/" : url.substr(path_pos);
+    }
+
+    size_t query = url.find_first_of("?#");
+    if (query != std::string::npos) url = url.substr(0, query);
+    if (url.empty()) return "";
+    if (url.front() != '/') {
+        if (url.find('/') == std::string::npos) return "";
+        url = "/" + url;
+    }
+    return url;
+}
+
+bool is_http_verb(const std::string& name) {
+    static const std::unordered_set<std::string> verbs = {
+        "get", "post", "put", "delete", "do"
+    };
+    return verbs.count(name) != 0;
+}
+
+bool receiver_looks_like_http_client(const std::string& receiver) {
+    std::string lower = lower_ascii(receiver);
+    if (lower == "http" || lower == "axios" || lower == "fetch") return true;
+    if (lower == "client" || lower == "httpclient") return true;
+    if (lower.find(".client") != std::string::npos) return true;
+    if (lower.find(".http") != std::string::npos) return true;
+    if (lower.size() > 6 && lower.rfind("client") == lower.size() - 6) return true;
+    return false;
+}
+
+bool match_http_call_pattern(const std::string& language,
+                             const std::string& callee_text) {
+    std::string callee = trim_copy(callee_text);
+    if (callee.empty()) return false;
+
+    std::string lower = lower_ascii(callee);
+    if (language == "typescript" || language == "javascript") {
+        if (lower == "fetch") return true;
+
+        size_t dot = lower.rfind('.');
+        if (dot == std::string::npos) return false;
+        std::string receiver = lower.substr(0, dot);
+        std::string method = lower.substr(dot + 1);
+        if (!is_http_verb(method)) return false;
+        if (receiver == "axios" || receiver == "this.http") return true;
+        if (receiver.size() > 5 && receiver.rfind(".http") == receiver.size() - 5) return true;
+        return false;
+    }
+
+    if (language == "go") {
+        size_t dot = lower.rfind('.');
+        if (dot == std::string::npos) return false;
+        std::string receiver = lower.substr(0, dot);
+        std::string method = lower.substr(dot + 1);
+        if (!is_http_verb(method)) return false;
+        return receiver_looks_like_http_client(receiver);
+    }
+
+    return false;
+}
+
+void maybe_add_http_call_ref(ExtractionResult* result,
+                             const std::string& language,
+                             const std::string& callee_text,
+                             TSNode call_node,
+                             const std::string& source,
+                             const std::vector<int>& symbol_stack) {
+    if (!match_http_call_pattern(language, callee_text)) return;
+
+    TSNode args = find_argument_list_node(call_node);
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) return;
+
+    TSNode first_arg = ts_node_named_child(args, 0);
+    std::string literal = decode_string_literal(first_arg, source);
+    std::string path = normalize_http_path(literal);
+    if (path.empty()) return;
+
+    TSPoint start = ts_node_start_point(call_node);
+    TSPoint end = ts_node_end_point(call_node);
+    int containing = symbol_stack.empty() ? -1 : symbol_stack.back();
+    result->refs.push_back({
+        "http_call", path,
+        static_cast<int>(start.row + 1), static_cast<int>(start.column),
+        static_cast<int>(end.row + 1), static_cast<int>(end.column),
+        "http_client_call", containing, -1, "", ""
+    });
+}
+
 bool is_js_export_assignment_target(TSNode node, const std::string& source) {
     if (ts_node_is_null(node) || std::string(ts_node_type(node)) != "member_expression") return false;
     std::string text = source_text(node, source);
@@ -367,6 +585,17 @@ std::string js_member_property_name(TSNode node, const std::string& source) {
     return source_text(ts_node_named_child(node, count - 1), source);
 }
 
+bool extract_this_member_field(TSNode node, const std::string& source, std::string& field_name) {
+    const char* type = ts_node_type(node);
+    if (!type || std::string(type) != "member_expression") return false;
+
+    TSNode object = ts_node_child_by_field_name(node, "object", 6);
+    if (ts_node_is_null(object) || std::string(ts_node_type(object)) != "this") return false;
+
+    field_name = js_member_property_name(node, source);
+    return !field_name.empty();
+}
+
 bool extract_this_assignment_field(TSNode node, const std::string& source, std::string& field_name) {
     const char* type = ts_node_type(node);
     if (!type || std::string(type) != "assignment_expression") return false;
@@ -374,13 +603,35 @@ bool extract_this_assignment_field(TSNode node, const std::string& source, std::
     TSNode left = ts_node_child_by_field_name(node, "left", 4);
     if (ts_node_is_null(left)) left = ts_node_child(node, 0);
     if (ts_node_is_null(left)) return false;
-    if (std::string(ts_node_type(left)) != "member_expression") return false;
+    return extract_this_member_field(left, source, field_name);
+}
 
-    TSNode object = ts_node_child_by_field_name(left, "object", 6);
-    if (ts_node_is_null(object) || std::string(ts_node_type(object)) != "this") return false;
+bool this_member_looks_assigned_in_source(TSNode node, const std::string& source) {
+    uint32_t pos = ts_node_end_byte(node);
+    while (pos < source.size() && std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+    if (pos >= source.size()) return false;
 
-    field_name = js_member_property_name(left, source);
-    return !field_name.empty();
+    if (source[pos] == '=') {
+        if (pos + 1 < source.size() && (source[pos + 1] == '=' || source[pos + 1] == '>')) return false;
+        return true;
+    }
+
+    if (pos + 1 < source.size()) {
+        switch (source[pos]) {
+            case '+':
+            case '-':
+            case '*':
+            case '/':
+            case '%':
+            case '&':
+            case '|':
+            case '^':
+                return source[pos + 1] == '=';
+            default:
+                break;
+        }
+    }
+    return false;
 }
 
 struct ThisAssignmentMatch {
@@ -390,7 +641,7 @@ struct ThisAssignmentMatch {
 
 std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, const std::string& source) {
     std::vector<ThisAssignmentMatch> matches;
-    TSNode body = ts_node_child_by_field_name(function_node, "body", 4);
+    TSNode body = find_function_body_node(function_node);
     if (ts_node_is_null(body)) return matches;
 
     std::unordered_set<std::string> seen_fields;
@@ -409,6 +660,11 @@ std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, 
         if (extract_this_assignment_field(current, source, field_name) &&
             seen_fields.insert(field_name).second) {
             matches.push_back({field_name, current});
+        } else if (current_type_str == "member_expression" &&
+                   extract_this_member_field(current, source, field_name) &&
+                   this_member_looks_assigned_in_source(current, source) &&
+                   seen_fields.insert(field_name).second) {
+            matches.push_back({field_name, current});
         }
 
         uint32_t count = ts_node_named_child_count(current);
@@ -417,6 +673,165 @@ std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, 
         }
     }
 
+    return matches;
+}
+
+struct LegacyJsConstructorMatch {
+    std::string name;
+    std::string fallback_kind;
+    size_t header_start = 0;
+    size_t body_open = 0;
+    size_t body_close = 0;
+};
+
+TSPoint point_for_offset(const std::string& source, size_t offset) {
+    offset = (std::min)(offset, source.size());
+    TSPoint point{0, 0};
+    for (size_t i = 0; i < offset; ++i) {
+        if (source[i] == '\n') {
+            ++point.row;
+            point.column = 0;
+        } else {
+            ++point.column;
+        }
+    }
+    return point;
+}
+
+bool find_matching_brace(const std::string& source, size_t open_pos, size_t& close_pos) {
+    if (open_pos >= source.size() || source[open_pos] != '{') return false;
+
+    int depth = 0;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_template = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+    bool escaped = false;
+
+    for (size_t i = open_pos; i < source.size(); ++i) {
+        char c = source[i];
+        char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+
+        if (in_line_comment) {
+            if (c == '\n') in_line_comment = false;
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                ++i;
+            }
+            continue;
+        }
+        if (in_single) {
+            if (!escaped && c == '\'') in_single = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+        if (in_double) {
+            if (!escaped && c == '"') in_double = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+        if (in_template) {
+            if (!escaped && c == '`') in_template = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+
+        escaped = false;
+        if (c == '/' && next == '/') {
+            in_line_comment = true;
+            ++i;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            in_block_comment = true;
+            ++i;
+            continue;
+        }
+        if (c == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double = true;
+            continue;
+        }
+        if (c == '`') {
+            in_template = true;
+            continue;
+        }
+        if (c == '{') {
+            ++depth;
+            continue;
+        }
+        if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                close_pos = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+template <typename MatchHandler>
+void for_each_regex_match(const std::string& source, const std::regex& pattern, MatchHandler&& handler) {
+    for (std::sregex_iterator it(source.begin(), source.end(), pattern), end; it != end; ++it) {
+        handler(*it);
+    }
+}
+
+std::vector<LegacyJsConstructorMatch> find_legacy_js_constructor_matches(const std::string& source) {
+    static const std::regex kVarExportCtor(
+        R"((^|[;\n])\s*(?:let|var|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*module\.exports\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kVarCtor(
+        R"((^|[;\n])\s*(?:let|var|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kAssignCtor(
+        R"((^|[;\n])\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kModuleExportCtor(
+        R"((^|[;\n])\s*module\.exports\s*=\s*function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+
+    std::vector<LegacyJsConstructorMatch> matches;
+    std::unordered_set<size_t> seen_headers;
+
+    auto add_matches = [&](const std::regex& pattern, const std::string& fallback_kind, auto&& name_for) {
+        for_each_regex_match(source, pattern, [&](const std::smatch& match) {
+            const size_t start = static_cast<size_t>(match.position(0));
+            const size_t open = start + static_cast<size_t>(match.length(0)) - 1;
+            if (!seen_headers.insert(start).second) return;
+
+            size_t close = 0;
+            if (!find_matching_brace(source, open, close)) return;
+
+            std::string name = name_for(match);
+            matches.push_back({name, fallback_kind, start, open, close});
+        });
+    };
+
+    add_matches(kVarExportCtor, "variable", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kVarCtor, "variable", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kAssignCtor, "", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kModuleExportCtor, "", [](const std::smatch& match) {
+        return match[2].str();
+    });
+
+    std::sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) {
+        return a.header_start < b.header_start;
+    });
     return matches;
 }
 
@@ -441,6 +856,9 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
 
     TSNode root = ts_tree_root_node(tree);
     visit_node(root, "", 0);
+    if (*language_ == "javascript") {
+        add_javascript_constructor_fallbacks(source);
+    }
 
     // Generate stable keys with collision handling
     std::vector<KeyCandidate> candidates;
@@ -464,6 +882,91 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
 }
 
 // --- Extractor private helpers ---
+
+void Extractor::add_javascript_constructor_fallbacks(const std::string& source) {
+    std::unordered_set<std::string> existing_symbols;
+    existing_symbols.reserve(result_->symbols.size() * 2 + 8);
+    for (const auto& symbol : result_->symbols) {
+        existing_symbols.insert(symbol.kind + "\n" + symbol.qualname);
+    }
+
+    auto append_symbol = [&](const std::string& kind,
+                             const std::string& name,
+                             const std::string& qualname,
+                             size_t start_offset,
+                             size_t end_offset) -> int {
+        std::string key = kind + "\n" + qualname;
+        auto [_, inserted] = existing_symbols.insert(key);
+        if (!inserted) return -1;
+
+        TSPoint start = point_for_offset(source, start_offset);
+        TSPoint end = point_for_offset(source, end_offset);
+
+        ExtractedSymbol symbol;
+        symbol.kind = kind;
+        symbol.name = name;
+        symbol.qualname = qualname;
+        symbol.start_line = static_cast<int>(start.row + 1);
+        symbol.start_col = static_cast<int>(start.column);
+        symbol.end_line = static_cast<int>(end.row + 1);
+        symbol.end_col = static_cast<int>(end.column);
+        result_->symbols.push_back(std::move(symbol));
+        return static_cast<int>(result_->symbols.size()) - 1;
+    };
+
+    static const std::regex kThisAssignment(
+        R"(\bthis\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=)",
+        std::regex::ECMAScript);
+
+    for (const auto& match : find_legacy_js_constructor_matches(source)) {
+        std::string body = source.substr(match.body_open + 1, match.body_close - match.body_open - 1);
+        std::vector<std::pair<std::string, std::pair<size_t, size_t>>> fields;
+        std::unordered_set<std::string> seen_fields;
+        for_each_regex_match(body, kThisAssignment, [&](const std::smatch& field_match) {
+            std::string field_name = field_match[1].str();
+            if (!seen_fields.insert(field_name).second) return;
+
+            size_t rel_start = static_cast<size_t>(field_match.position(0));
+            size_t global_start = match.body_open + 1 + rel_start;
+            size_t global_end = global_start + static_cast<size_t>(field_match.length(0));
+            fields.push_back({field_name, {global_start, global_end}});
+        });
+
+        if (fields.empty()) {
+            if (!match.fallback_kind.empty()) {
+                append_symbol(match.fallback_kind, match.name, match.name,
+                              match.header_start, match.body_close + 1);
+            }
+            continue;
+        }
+        if (!starts_with_uppercase_ascii(match.name)) continue;
+
+        int constructor_idx = append_symbol("constructor_fn", match.name, match.name,
+                                            match.header_start, match.body_close + 1);
+        if (constructor_idx < 0) {
+            for (size_t i = 0; i < result_->symbols.size(); ++i) {
+                if (result_->symbols[i].kind == "constructor_fn" &&
+                    result_->symbols[i].qualname == match.name) {
+                    constructor_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (constructor_idx < 0) continue;
+        }
+
+        for (const auto& field : fields) {
+            const std::string& field_name = field.first;
+            std::string qualname = match.name + "._fields." + field_name;
+            int field_idx = append_symbol("field", field_name, qualname,
+                                          field.second.first, field.second.second);
+            if (field_idx >= 0) {
+                result_->edges.push_back({
+                    constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
+                });
+            }
+        }
+    }
+}
 
 std::string Extractor::node_text(TSNode node) {
     uint32_t start = ts_node_start_byte(node);
@@ -569,7 +1072,8 @@ std::string Extractor::extract_leading_comment(TSNode node) {
 void Extractor::add_symbol(const std::string& kind, const std::string& name,
                             TSNode node, const std::string& qualname,
                             const std::string& signature,
-                            const std::string& visibility) {
+                            const std::string& visibility,
+                            TSNode fingerprint_node) {
     if (name.empty()) return;
     if (++symbol_count_ > max_symbols_) {
         result_->truncated = true;
@@ -582,7 +1086,7 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
 
     std::string doc_comment = extract_leading_comment(node);
     std::string sig = signature;
-    if (sig.empty() && (kind == "function" || kind == "method" || kind == "constructor_fn")) {
+    if (sig.empty() && is_function_like_kind(kind)) {
         sig = node_text(node);
         size_t body = sig.find('{');
         if (body != std::string::npos) sig = sig.substr(0, body);
@@ -600,13 +1104,74 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
         sig = collapsed;
     }
 
+    std::string fingerprint;
+    if (is_function_like_kind(kind)) {
+        fingerprint = compute_fingerprint(ts_node_is_null(fingerprint_node) ? node : fingerprint_node);
+    }
+
     result_->symbols.push_back({
         kind, name, qualname.empty() ? name : qualname,
-        sig,
+        sig, fingerprint,
         static_cast<int>(start.row + 1), static_cast<int>(start.column),
         static_cast<int>(end.row + 1), static_cast<int>(end.column),
         true, visibility, doc_comment, ""
     });
+}
+
+std::string Extractor::compute_fingerprint(TSNode node) {
+    TSNode body = find_function_body_node(node);
+    if (ts_node_is_null(body)) return "";
+
+    std::vector<std::string> tokens;
+    collect_leaf_tokens(body, tokens);
+    if (tokens.size() < 30) return "";
+
+    // Use FNV-1a hash with per-seed XOR — zero heap allocations.
+    // Each MinHash value = min over all trigrams of hash(trigram, seed).
+    static constexpr uint32_t FNV_PRIME  = 0x01000193u;
+    static constexpr uint32_t FNV_OFFSET = 0x811c9dc5u;
+
+    auto fnv1a_mix = [](uint32_t h, const char* s, size_t len) -> uint32_t {
+        for (size_t i = 0; i < len; i++) {
+            h ^= static_cast<uint8_t>(s[i]);
+            h *= FNV_PRIME;
+        }
+        return h;
+    };
+
+    std::array<uint32_t, kMinHashSeeds.size()> mins;
+    mins.fill(std::numeric_limits<uint32_t>::max());
+
+    const size_t n = tokens.size();
+    for (size_t i = 0; i + 2 < n; ++i) {
+        const std::string& t0 = tokens[i];
+        const std::string& t1 = tokens[i + 1];
+        const std::string& t2 = tokens[i + 2];
+
+        for (size_t si = 0; si < kMinHashSeeds.size(); ++si) {
+            // Hash: seed bytes → t0 → separator → t1 → separator → t2
+            uint32_t seed32 = static_cast<uint32_t>(kMinHashSeeds[si] & 0xFFFFFFFFu);
+            uint32_t h = FNV_OFFSET ^ seed32;
+            h = fnv1a_mix(h, t0.data(), t0.size());
+            h ^= '|'; h *= FNV_PRIME;
+            h = fnv1a_mix(h, t1.data(), t1.size());
+            h ^= '|'; h *= FNV_PRIME;
+            h = fnv1a_mix(h, t2.data(), t2.size());
+            mins[si] = std::min(mins[si], h);
+        }
+    }
+
+    char buf[kMinHashSeeds.size() * 8 + 1];
+    char* p = buf;
+    for (uint32_t value : mins) {
+        static const char hex[] = "0123456789abcdef";
+        *p++ = hex[(value >> 28) & 0xF]; *p++ = hex[(value >> 24) & 0xF];
+        *p++ = hex[(value >> 20) & 0xF]; *p++ = hex[(value >> 16) & 0xF];
+        *p++ = hex[(value >> 12) & 0xF]; *p++ = hex[(value >>  8) & 0xF];
+        *p++ = hex[(value >>  4) & 0xF]; *p++ = hex[(value >>  0) & 0xF];
+    }
+    *p = '\0';
+    return std::string(buf, kMinHashSeeds.size() * 8);
 }
 
 void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode node,
@@ -645,9 +1210,34 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
     std::string declaration_name = declaration_name_from_receiver(receiver);
     if (!declaration_name.empty() && receiver != "this" && receiver != "self") {
         uint32_t call_start = ts_node_start_byte(node);
-        size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
-        std::string prefix = source_->substr(window_start, call_start - window_start);
+        // 8KB window: type declarations are almost always within 200 lines of the call.
+        // 64KB caused cumulative heap pressure crashing the indexer after ~2400 TS files.
+        static constexpr size_t kReceiverTypeWindow = 8192;
+        size_t window_start = call_start > kReceiverTypeWindow ? call_start - kReceiverTypeWindow : 0;
+        std::string_view prefix(source_->data() + window_start, call_start - window_start);
         receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
+        if (receiver_type_hint.empty() && declaration_name[0] != '_') {
+            std::string alt_receiver = receiver;
+            std::string underscored = "_" + declaration_name;
+            size_t last_dot = alt_receiver.rfind('.');
+            if (last_dot != std::string::npos) {
+                alt_receiver = alt_receiver.substr(0, last_dot + 1) + underscored;
+            } else {
+                alt_receiver = underscored;
+            }
+            receiver_type_hint = infer_type_from_declaration_text(prefix, alt_receiver);
+        }
+        if (receiver_type_hint.empty() && declaration_name[0] == '_' && declaration_name.size() > 1) {
+            std::string alt_receiver = receiver;
+            std::string without_underscore = declaration_name.substr(1);
+            size_t last_dot = alt_receiver.rfind('.');
+            if (last_dot != std::string::npos) {
+                alt_receiver = alt_receiver.substr(0, last_dot + 1) + without_underscore;
+            } else {
+                alt_receiver = without_underscore;
+            }
+            receiver_type_hint = infer_type_from_declaration_text(prefix, alt_receiver);
+        }
     }
 
     add_ref("call", name, node, evidence, arg_count, arg_pattern, receiver_type_hint);
@@ -947,7 +1537,7 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
 
         std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
         int constructor_idx = static_cast<int>(result_->symbols.size());
-        add_symbol("constructor_fn", name, symbol_node, constructor_qn);
+        add_symbol("constructor_fn", name, symbol_node, constructor_qn, "", "", function_node);
         if (static_cast<int>(result_->symbols.size()) <= constructor_idx) return true;
 
         for (const auto& assignment : this_assignments) {
@@ -1024,7 +1614,11 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call_expression");
+        if (!ts_node_is_null(func)) {
+            std::string callee = node_text(func);
+            add_call_ref(callee, node, "call_expression");
+            maybe_add_http_call_ref(result_, *language_, callee, node, *source_, symbol_stack_);
+        }
     }
     else if (type == "member_expression") {
         // Check if object is `this`
@@ -1094,7 +1688,11 @@ void Extractor::extract_go(TSNode node, const std::string& type, const std::stri
     }
     else if (type == "call_expression") {
         auto func = ts_node_child(node, 0);
-        if (!ts_node_is_null(func)) add_call_ref(node_text(func), node, "call");
+        if (!ts_node_is_null(func)) {
+            std::string callee = node_text(func);
+            add_call_ref(callee, node, "call");
+            maybe_add_http_call_ref(result_, *language_, callee, node, *source_, symbol_stack_);
+        }
     }
     else if (type == "import_declaration") {
         add_ref("include", node_text(node), node, "import");

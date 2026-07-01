@@ -66,7 +66,7 @@ ts_grammars_init()
 
 add_ts_grammar(NAME c       REPO tree-sitter/tree-sitter-c       TAG v0.21.0)
 add_ts_grammar(NAME cpp     REPO tree-sitter/tree-sitter-cpp     TAG v0.21.0 SCANNER)
-add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.1 SCANNER V23)
+add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.5 SCANNER V23)
 add_ts_grammar(NAME go      REPO tree-sitter/tree-sitter-go      TAG v0.21.0)
 add_ts_grammar(NAME yaml    REPO tree-sitter-grammars/tree-sitter-yaml TAG v0.6.1 SCANNER C11
     SCANNER_DEPS schema.core.c schema.json.c
@@ -75,11 +75,11 @@ add_ts_grammar(NAME typescript REPO tree-sitter/tree-sitter-typescript TAG v0.23
     SRC_PATH typescript/src
     EXTRA_DOWNLOADS common/scanner.h
     EXTRA_INCLUDE_DIRS "${TS_GRAMMAR_DIR}/typescript/typescript/src")
-add_ts_grammar(NAME javascript REPO tree-sitter/tree-sitter-javascript TAG v0.23.1 SCANNER V23)
+add_ts_grammar(NAME javascript REPO tree-sitter/tree-sitter-javascript TAG v0.23.5 SCANNER V23)
 add_ts_grammar(NAME python  REPO tree-sitter/tree-sitter-python   TAG v0.23.6 SCANNER V23)
 add_ts_grammar(NAME rust    REPO tree-sitter/tree-sitter-rust     TAG v0.23.2 SCANNER V23)
 add_ts_grammar(NAME java    REPO tree-sitter/tree-sitter-java     TAG v0.23.4 V23)
-add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.3 SCANNER V23)
+add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.5 SCANNER V23)
 
 # --- Main executable ---
 set(CODETOPO_SOURCES
@@ -140,6 +140,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
     tests/unit/test_stable_key.cpp
+    tests/unit/test_get_architecture.cpp
     tests/unit/test_file_summary_nodeid.cpp
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
@@ -152,6 +153,8 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_approx_callgraph.cpp
     tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
+    tests/unit/test_trace_tools.cpp
+    tests/unit/test_semantic_search.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests

@@ -7,6 +7,7 @@
 #include "db/schema.h"
 #include "db/fts.h"
 #include "index/supervisor.h"
+#include "semantic/token_vectors.h"
 #include "util/log.h"
 #include "util/repo.h"
 #include <sqlite3.h>
@@ -478,6 +479,54 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
         log_workspace_phase("content_fts", content_phase, color_output, "(disabled; 0 files)");
     }
 
+    // Semantic embeddings — always runs, skips silently if embedding files not found
+    {
+        auto embed_phase = WorkspaceClock::now();
+        TokenVectorTable tvt;
+        for (auto& [bin, txt] : semantic::token_vector_candidate_paths(cfg.repo_root)) {
+            if (tvt.load(bin, txt)) break;
+        }
+        if (tvt.ready()) {
+            log_workspace_line("computing symbol embeddings...", color_output);
+            // Reuse embed_symbols logic inline — embed only new nodes for this root
+            sqlite3_stmt* sel = nullptr;
+            sqlite3_stmt* ins = nullptr;
+            int64_t offset = root_id * static_cast<int64_t>(1000000000LL);
+            std::string sel_sql =
+                "SELECT id, name FROM nodes "
+                "WHERE node_type='symbol' AND is_definition=1 "
+                "  AND kind IN ('function','method','class','interface','struct','constructor_fn') "
+                "  AND id >= " + std::to_string(offset) +
+                "  AND id < " + std::to_string(offset + 1000000000LL) +
+                "  AND id NOT IN (SELECT node_id FROM node_vectors)";
+            sqlite3_prepare_v2(conn_.raw(), sel_sql.c_str(), -1, &sel, nullptr);
+            sqlite3_prepare_v2(conn_.raw(),
+                "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES(?,?)",
+                -1, &ins, nullptr);
+            if (sel && ins) {
+                int64_t embedded = 0;
+                conn_.exec("BEGIN TRANSACTION");
+                while (sqlite3_step(sel) == SQLITE_ROW) {
+                    int64_t id = sqlite3_column_int64(sel, 0);
+                    const char* name = reinterpret_cast<const char*>(sqlite3_column_text(sel, 1));
+                    if (!name) continue;
+                    auto emb = tvt.embed(name);
+                    if (emb.empty()) continue;
+                    sqlite3_reset(ins); sqlite3_clear_bindings(ins);
+                    sqlite3_bind_int64(ins, 1, id);
+                    sqlite3_bind_blob(ins, 2, emb.data(), static_cast<int>(emb.size()), SQLITE_TRANSIENT);
+                    sqlite3_step(ins);
+                    ++embedded;
+                }
+                conn_.exec("COMMIT");
+                log_workspace_phase("symbol embeddings", embed_phase, color_output,
+                    "(" + format_with_commas(embedded) + " symbols)");
+            }
+            if (sel) sqlite3_finalize(sel);
+            if (ins) sqlite3_finalize(ins);
+        }
+    }
+
     // Query stats
     AddResult result;
     result.root_id = 0;
@@ -531,13 +580,25 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     if (sqlite3_step(stmt) == SQLITE_ROW) result.edges_total = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
 
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM refs r JOIN files f ON f.id = r.file_id "
+        "WHERE f.root_id = ? AND r.kind = 'http_call'", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, result.root_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.http_call_refs = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    mcp_log("protocol refs: " + std::to_string(result.http_call_refs) +
+            " http_call refs found, cross-root matching pending");
+
     std::ostringstream summary;
     summary << stderr_dim("[workspace]", color_output) << " "
             << stderr_bold_green("✓ done", color_output)
             << " — " << format_with_commas(result.roots_total) << " roots | "
             << format_with_commas(result.files_total) << " files | "
             << format_with_commas(result.symbols_total) << " nodes | "
-            << format_with_commas(result.edges_total) << " edges  ("
+            << format_with_commas(result.edges_total) << " edges | "
+            << format_with_commas(result.http_call_refs) << " http refs  ("
             << stderr_cyan(format_seconds(overall_phase) + "s total", color_output) << ")";
     std::cerr << summary.str() << "\n";
 
@@ -720,14 +781,17 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     log_workspace_line("copying nodes...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
-    prepare_or_throw(conn_.raw(), &stmt,
+    bool src_has_fingerprint = attached_table_has_column(conn_.raw(), "src", "nodes", "fingerprint");
+    std::string node_sql =
         "INSERT INTO nodes (id, node_type, file_id, kind, name, qualname, signature, "
-        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
+        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, fingerprint, stable_key) "
         "SELECT (? + id), node_type, "
         "CASE WHEN file_id IS NOT NULL THEN (? + file_id) ELSE NULL END, "
         "kind, name, qualname, signature, start_line, start_col, end_line, end_col, "
-        "is_definition, visibility, doc, (? || ':' || stable_key) "
-        "FROM src.nodes");
+        "is_definition, visibility, doc, ";
+    node_sql += src_has_fingerprint ? "fingerprint" : "NULL";
+    node_sql += ", (? || ':' || stable_key) FROM src.nodes";
+    prepare_or_throw(conn_.raw(), &stmt, node_sql);
     sqlite3_bind_int64(stmt, 1, offset);
     sqlite3_bind_int64(stmt, 2, offset);
     std::string root_id_prefix = std::to_string(root_id);

@@ -38,7 +38,7 @@ TEST_CASE("DB remains consistent after partial batch", "[integration][us1]") {
         fa.absolute_path = tmp / "src" / "a.c";
 
         ExtractionResult ea;
-        ea.symbols.push_back({"function", "a", "a", "", 1, 0, 1, 15, true, "", "", ""});
+        ea.symbols.push_back({"function", "a", "a", "", "", 1, 0, 1, 15, true, "", "", ""});
         ea.symbols[0].stable_key = "src/a.c::function::a";
 
         Persister persister(conn);

@@ -38,13 +38,30 @@ macro(ts_grammars_init)
             STATUS _dl_status)
     endif()
 
-    # v0.23 parser.h (needed by C#, TypeScript, JavaScript, Python, Rust, Java, Bash)
+    # v0.23 parser.h — download from tree-sitter v0.25.10 (lib/src/parser.h) which
+    # has TSMapSlice, TSLexerMode, and the expanded TSLanguage struct needed by
+    # grammars v0.23.3+. We append backwards-compat aliases so older grammars
+    # (using TSFieldMapSlice / TSLexMode / .version) still compile.
     file(MAKE_DIRECTORY "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter")
     if(NOT EXISTS "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h")
         file(DOWNLOAD
-            "https://raw.githubusercontent.com/tree-sitter/tree-sitter/refs/tags/v0.23.0/lib/src/parser.h"
+            "https://raw.githubusercontent.com/tree-sitter/tree-sitter/refs/tags/v0.25.10/lib/src/parser.h"
             "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h"
             STATUS _dl_status)
+        # Append backwards-compatibility aliases for old grammar generators
+        file(APPEND "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h" "\n\
+// Backwards-compat aliases for grammars generated before tree-sitter 0.24.\n\
+// TSFieldMapSlice was renamed TSMapSlice; TSLexMode was renamed TSLexerMode;\n\
+// .version field was renamed .abi_version in the TSLanguage struct.\n\
+#ifndef TSFieldMapSlice\n\
+#  define TSFieldMapSlice TSMapSlice\n\
+#endif\n\
+#ifndef TSLexMode\n\
+#  define TSLexMode TSLexerMode\n\
+#endif\n\
+#ifndef version\n\
+#  define version abi_version\n\
+#endif\n")
     endif()
 
     # Tree-sitter include dirs from vcpkg

@@ -6,6 +6,7 @@
 #include "util/path.h"
 #include "util/git.h"
 #include "util/process.h"
+#include "semantic/token_vectors.h"
 #include "mcp/error.h"
 #include "db/schema.h"
 #include <sqlite3.h>
@@ -26,8 +27,10 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <queue>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 
 namespace codetopo {
 namespace tools {
@@ -53,6 +56,33 @@ static bool include_field(const std::unordered_set<std::string>& fields_set,
 
 static size_t cstr_len(const char* s) {
     return s ? std::strlen(s) : 0;
+}
+
+static std::string tool_error_json(const std::string& message);
+
+static TokenVectorTable* get_token_vector_table(const std::string& repo_root) {
+    static std::mutex mu;
+    static std::unique_ptr<TokenVectorTable> table;
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (table && table->ready()) return table.get();
+
+    if (!table) table = std::make_unique<TokenVectorTable>();
+    *table = TokenVectorTable();
+    for (const auto& [bin_path, txt_path] :
+         semantic::token_vector_candidate_paths(repo_root, get_self_executable_path())) {
+        if (table->load(bin_path, txt_path)) break;
+    }
+    return table.get();
+}
+
+static std::string semantic_not_ready_json(const std::string& message) {
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", false);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "error", message.c_str());
+    return doc.to_string();
 }
 
 static constexpr const char* kPublicSymbolSql =
@@ -359,6 +389,34 @@ static std::string lower_copy(std::string s) {
 
 static bool iequals(const std::string& lhs, const std::string& rhs) {
     return lower_copy(lhs) == lower_copy(rhs);
+}
+
+static bool decode_minhash_fingerprint(const char* fingerprint, std::vector<uint32_t>& values) {
+    values.clear();
+    if (!fingerprint) return false;
+    std::string text(fingerprint);
+    if (text.empty() || (text.size() % 8) != 0) return false;
+    values.reserve(text.size() / 8);
+    for (size_t i = 0; i < text.size(); i += 8) {
+        try {
+            values.push_back(static_cast<uint32_t>(std::stoul(text.substr(i, 8), nullptr, 16)));
+        } catch (...) {
+            values.clear();
+            return false;
+        }
+    }
+    return !values.empty();
+}
+
+static double minhash_similarity(const std::vector<uint32_t>& lhs,
+                                 const std::vector<uint32_t>& rhs) {
+    size_t count = std::min(lhs.size(), rhs.size());
+    if (count == 0) return 0.0;
+    size_t matches = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (lhs[i] == rhs[i]) ++matches;
+    }
+    return static_cast<double>(matches) / static_cast<double>(count);
 }
 
 static std::string trailing_identifier(const std::string& text);
@@ -1907,6 +1965,497 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
     return doc.to_string();
 }
 
+namespace {
+
+struct ArchitectureFileInfo {
+    int64_t id = -1;
+    std::string raw_path;
+    std::string path;
+    std::vector<std::string> dir_parts;
+    int64_t symbol_count = 0;
+    bool in_scope = false;
+    std::string initial_cluster;
+    std::string cluster;
+};
+
+struct ArchitectureClusterStats {
+    int64_t files = 0;
+    int64_t symbols = 0;
+    int64_t internal_edges = 0;
+    int64_t external_edges = 0;
+    std::unordered_set<std::string> child_dirs;
+};
+
+struct ArchitectureBoundaryStats {
+    int64_t internal_edges = 0;
+    int64_t external_edges = 0;
+};
+
+struct ArchitectureHotspot {
+    std::string name;
+    std::string kind;
+    std::string file;
+    int64_t fan_in = 0;
+};
+
+struct ArchitectureScopedEdge {
+    int64_t src_file_id = -1;
+    int64_t dst_file_id = -1;
+};
+
+struct ArchitectureNodeFile {
+    int64_t file_id = -1;
+};
+
+static std::string architecture_display_path(const std::string& path,
+                                             const std::string& repo_root) {
+    if (!std::filesystem::path(path).is_absolute()) return path;
+
+    std::error_code ec;
+    auto rel = std::filesystem::relative(std::filesystem::path(path),
+                                         std::filesystem::path(repo_root), ec);
+    if (!ec) {
+        auto rel_str = rel.generic_string();
+        if (!rel_str.empty() && !rel_str.starts_with("..")) return rel_str;
+    }
+    return std::filesystem::path(path).generic_string();
+}
+
+static bool architecture_scope_matches(const std::string& raw_path,
+                                       const std::string& scope_prefix,
+                                       bool scope_is_file) {
+    if (scope_prefix.empty()) return true;
+    if (scope_is_file) return raw_path == scope_prefix;
+    return raw_path == scope_prefix
+        || raw_path.starts_with(scope_prefix + "/");
+}
+
+static std::string architecture_join_dir_parts(const std::vector<std::string>& dir_parts,
+                                               size_t end_exclusive) {
+    if (dir_parts.empty() || end_exclusive == 0) return "(root)";
+    end_exclusive = std::min(end_exclusive, dir_parts.size());
+    if (end_exclusive == 0) return "(root)";
+
+    std::string joined;
+    for (size_t i = 0; i < end_exclusive; ++i) {
+        if (!joined.empty()) joined += '/';
+        joined += dir_parts[i];
+    }
+    return joined.empty() ? "(root)" : joined;
+}
+
+static std::string architecture_cluster_name(const ArchitectureFileInfo& file,
+                                             size_t scope_dir_depth,
+                                             size_t depth_after_scope) {
+    if (file.dir_parts.empty()) return "(root)";
+    if (scope_dir_depth >= file.dir_parts.size()) {
+        return architecture_join_dir_parts(file.dir_parts, file.dir_parts.size());
+    }
+    return architecture_join_dir_parts(file.dir_parts,
+                                       std::min(file.dir_parts.size(),
+                                                scope_dir_depth + depth_after_scope));
+}
+
+static std::string architecture_child_dir_after_depth(const ArchitectureFileInfo& file,
+                                                      size_t scope_dir_depth,
+                                                      size_t depth_after_scope) {
+    size_t child_index = scope_dir_depth + depth_after_scope;
+    if (child_index >= file.dir_parts.size()) return "";
+    return file.dir_parts[child_index];
+}
+
+static void architecture_accumulate_cluster_edge(
+    std::unordered_map<std::string, ArchitectureClusterStats>& clusters,
+    const std::string& cluster_name, bool internal) {
+    auto& stats = clusters[cluster_name];
+    if (internal) ++stats.internal_edges;
+    else ++stats.external_edges;
+}
+
+} // namespace
+
+std::string get_architecture(yyjson_val* params, Connection& conn,
+                             QueryCache& /*cache*/, const std::string& repo_root) {
+    int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
+    if (limit > 100) limit = 100;
+    if (limit < 1) limit = 1;
+
+    std::unordered_set<std::string> requested_aspects;
+    if (params) {
+        if (auto* aspects = yyjson_obj_get(params, "aspects")) {
+            if (!yyjson_is_arr(aspects)) {
+                return McpError::invalid_input("'aspects' must be an array").to_json_rpc(0);
+            }
+            static const std::unordered_set<std::string> valid_aspects = {
+                "clusters", "hotspots", "boundaries", "summary"
+            };
+            yyjson_val* aspect = nullptr;
+            size_t idx, max;
+            yyjson_arr_foreach(aspects, idx, max, aspect) {
+                if (!yyjson_is_str(aspect)) {
+                    return McpError::invalid_input("'aspects' entries must be strings").to_json_rpc(0);
+                }
+                std::string value = yyjson_get_str(aspect);
+                if (!valid_aspects.count(value)) {
+                    return McpError::invalid_input("Invalid aspect: " + value).to_json_rpc(0);
+                }
+                requested_aspects.insert(value);
+            }
+        }
+    }
+    auto wants = [&](const char* aspect) {
+        return requested_aspects.empty() || requested_aspects.count(aspect);
+    };
+
+    const char* scope = params ? json_get_str(params, "scope") : nullptr;
+    std::string scope_prefix;
+    bool scope_is_file = false;
+    size_t scope_dir_depth = 0;
+    if (scope && *scope) {
+        scope_prefix = resolve_db_dir_path(conn.raw(), scope, repo_root);
+        if (scope_prefix.empty()) {
+            std::string raw_scope = scope;
+            if (std::filesystem::path(raw_scope).is_absolute() || raw_scope.find("..") != std::string::npos) {
+                return McpError::invalid_input("Invalid 'scope' path").to_json_rpc(0);
+            }
+            while (!raw_scope.empty() && raw_scope.back() == '/') raw_scope.pop_back();
+            scope_prefix = raw_scope;
+        }
+        if (!scope_prefix.empty()) {
+            scope_is_file = !path_has_db_children(conn.raw(), scope_prefix);
+            if (!scope_is_file) {
+                scope_dir_depth =
+                    split_path_components(architecture_display_path(scope_prefix, repo_root)).size();
+            }
+        }
+    }
+
+    std::unordered_map<int64_t, ArchitectureFileInfo> files_by_id;
+    std::unordered_map<std::string, int64_t> file_id_by_raw_path;
+    std::unordered_set<int64_t> in_scope_file_ids;
+    int64_t total_files = 0;
+    int64_t total_symbols = 0;
+
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT f.id, f.path, COUNT(n.id) "
+            "FROM files f "
+            "LEFT JOIN nodes n ON n.file_id = f.id AND n.node_type = 'symbol' "
+            "GROUP BY f.id, f.path "
+            "ORDER BY f.id";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load files for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            ArchitectureFileInfo info;
+            info.id = sqlite3_column_int64(stmt, 0);
+            auto* raw = sqlite3_column_text(stmt, 1);
+            info.raw_path = raw ? reinterpret_cast<const char*>(raw) : "";
+            info.path = architecture_display_path(info.raw_path, repo_root);
+            info.dir_parts = split_path_components(std::filesystem::path(info.path).parent_path().generic_string());
+            info.symbol_count = sqlite3_column_int64(stmt, 2);
+            info.in_scope = architecture_scope_matches(info.raw_path, scope_prefix, scope_is_file);
+
+            file_id_by_raw_path.emplace(info.raw_path, info.id);
+            if (info.in_scope) {
+                ++total_files;
+                total_symbols += info.symbol_count;
+                in_scope_file_ids.insert(info.id);
+            }
+            files_by_id.emplace(info.id, std::move(info));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+
+    if (in_scope_file_ids.empty()) {
+        if (wants("summary")) {
+            auto* summary = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_files", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_symbols", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "total_edges", 0);
+            yyjson_mut_obj_add_int(doc.doc, summary, "cluster_count", 0);
+            yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
+        }
+        if (wants("clusters")) yyjson_mut_obj_add_val(doc.doc, root, "clusters", doc.new_arr());
+        if (wants("hotspots")) yyjson_mut_obj_add_val(doc.doc, root, "hotspots", doc.new_arr());
+        if (wants("boundaries")) yyjson_mut_obj_add_val(doc.doc, root, "boundaries", doc.new_arr());
+        return doc.to_string();
+    }
+
+    for (auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        file.initial_cluster = architecture_cluster_name(file, scope_dir_depth, 1);
+        file.cluster = file.initial_cluster;
+    }
+
+    std::unordered_map<int64_t, ArchitectureNodeFile> node_files;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT id, file_id, node_type, name FROM nodes";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load nodes for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t node_id = sqlite3_column_int64(stmt, 0);
+            int64_t file_id = sqlite3_column_type(stmt, 1) == SQLITE_NULL
+                ? -1
+                : sqlite3_column_int64(stmt, 1);
+            const char* node_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char* node_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            if (file_id < 0 && node_type && std::strcmp(node_type, "file") == 0 && node_name) {
+                auto it = file_id_by_raw_path.find(node_name);
+                if (it != file_id_by_raw_path.end()) file_id = it->second;
+            }
+            if (file_id >= 0) node_files.emplace(node_id, ArchitectureNodeFile{file_id});
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    std::unordered_map<std::string, ArchitectureClusterStats> initial_clusters;
+    for (const auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        auto& cluster = initial_clusters[file.initial_cluster];
+        ++cluster.files;
+        cluster.symbols += file.symbol_count;
+        auto child_dir = architecture_child_dir_after_depth(file, scope_dir_depth, 1);
+        if (!child_dir.empty()) cluster.child_dirs.insert(child_dir);
+    }
+
+    std::vector<ArchitectureScopedEdge> scoped_edges;
+    int64_t total_edges = 0;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT src_id, dst_id FROM edges "
+            "WHERE kind != 'contains' AND confidence >= 0.5";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load edges for architecture analysis").to_json_rpc(0);
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t src_id = sqlite3_column_int64(stmt, 0);
+            int64_t dst_id = sqlite3_column_int64(stmt, 1);
+            auto src_it = node_files.find(src_id);
+            auto dst_it = node_files.find(dst_id);
+            if (src_it == node_files.end() || dst_it == node_files.end()) continue;
+
+            int64_t src_file_id = src_it->second.file_id;
+            int64_t dst_file_id = dst_it->second.file_id;
+            bool src_in_scope = in_scope_file_ids.count(src_file_id);
+            bool dst_in_scope = in_scope_file_ids.count(dst_file_id);
+            if (!src_in_scope && !dst_in_scope) continue;
+
+            scoped_edges.push_back({src_file_id, dst_file_id});
+            ++total_edges;
+
+            const auto* src_file = files_by_id.count(src_file_id) ? &files_by_id.at(src_file_id) : nullptr;
+            const auto* dst_file = files_by_id.count(dst_file_id) ? &files_by_id.at(dst_file_id) : nullptr;
+            bool same_cluster = src_in_scope && dst_in_scope && src_file && dst_file
+                && src_file->initial_cluster == dst_file->initial_cluster;
+            if (same_cluster && src_file) {
+                architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, true);
+            } else {
+                if (src_in_scope && src_file) {
+                    architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, false);
+                }
+                if (dst_in_scope && dst_file) {
+                    architecture_accumulate_cluster_edge(initial_clusters, dst_file->initial_cluster, false);
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    std::unordered_set<std::string> refined_clusters;
+    for (const auto& [name, stats] : initial_clusters) {
+        double cohesion = (stats.internal_edges + stats.external_edges) > 0
+            ? static_cast<double>(stats.internal_edges)
+                / static_cast<double>(stats.internal_edges + stats.external_edges)
+            : 1.0;
+        if (stats.child_dirs.size() >= 2
+            && (cohesion < 0.80 || stats.files >= 10 || stats.symbols >= 50)) {
+            refined_clusters.insert(name);
+        }
+    }
+
+    for (auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        if (refined_clusters.count(file.initial_cluster)) {
+            file.cluster = architecture_cluster_name(file, scope_dir_depth, 2);
+        }
+    }
+
+    std::unordered_map<std::string, ArchitectureClusterStats> clusters;
+    for (const auto& [_, file] : files_by_id) {
+        if (!file.in_scope) continue;
+        auto& stats = clusters[file.cluster];
+        ++stats.files;
+        stats.symbols += file.symbol_count;
+    }
+
+    std::unordered_map<int64_t, ArchitectureBoundaryStats> boundaries;
+    for (const auto& edge : scoped_edges) {
+        auto src_it = files_by_id.find(edge.src_file_id);
+        auto dst_it = files_by_id.find(edge.dst_file_id);
+        if (src_it == files_by_id.end() || dst_it == files_by_id.end()) continue;
+
+        const auto& src_file = src_it->second;
+        const auto& dst_file = dst_it->second;
+        bool src_in_scope = src_file.in_scope;
+        bool dst_in_scope = dst_file.in_scope;
+        bool same_cluster = src_in_scope && dst_in_scope && src_file.cluster == dst_file.cluster;
+
+        if (same_cluster) {
+            architecture_accumulate_cluster_edge(clusters, src_file.cluster, true);
+        } else {
+            if (src_in_scope) architecture_accumulate_cluster_edge(clusters, src_file.cluster, false);
+            if (dst_in_scope) architecture_accumulate_cluster_edge(clusters, dst_file.cluster, false);
+        }
+
+        if (src_in_scope) {
+            auto& stats = boundaries[src_file.id];
+            if (same_cluster) ++stats.internal_edges;
+            else ++stats.external_edges;
+        }
+        if (dst_in_scope && (!src_in_scope || src_file.id != dst_file.id)) {
+            auto& stats = boundaries[dst_file.id];
+            if (same_cluster) ++stats.internal_edges;
+            else ++stats.external_edges;
+        }
+    }
+
+    if (wants("summary")) {
+        auto* summary = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_files", total_files);
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_symbols", total_symbols);
+        yyjson_mut_obj_add_int(doc.doc, summary, "total_edges", total_edges);
+        yyjson_mut_obj_add_int(doc.doc, summary, "cluster_count",
+                               static_cast<int64_t>(clusters.size()));
+        yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
+    }
+
+    if (wants("clusters")) {
+        std::vector<std::pair<std::string, ArchitectureClusterStats>> cluster_rows(
+            clusters.begin(), clusters.end());
+        std::sort(cluster_rows.begin(), cluster_rows.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      if (lhs.second.symbols != rhs.second.symbols)
+                          return lhs.second.symbols > rhs.second.symbols;
+                      if (lhs.second.files != rhs.second.files)
+                          return lhs.second.files > rhs.second.files;
+                      return lhs.first < rhs.first;
+                  });
+
+        auto* clusters_arr = doc.new_arr();
+        for (size_t i = 0; i < cluster_rows.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& [name, stats] = cluster_rows[i];
+            auto* item = doc.new_obj();
+            double cohesion = (stats.internal_edges + stats.external_edges) > 0
+                ? static_cast<double>(stats.internal_edges)
+                    / static_cast<double>(stats.internal_edges + stats.external_edges)
+                : 1.0;
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "files", stats.files);
+            yyjson_mut_obj_add_int(doc.doc, item, "symbols", stats.symbols);
+            yyjson_mut_obj_add_int(doc.doc, item, "internal_edges", stats.internal_edges);
+            yyjson_mut_obj_add_int(doc.doc, item, "external_edges", stats.external_edges);
+            yyjson_mut_obj_add_real(doc.doc, item, "cohesion", cohesion);
+            yyjson_mut_arr_append(clusters_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "clusters", clusters_arr);
+    }
+
+    if (wants("hotspots")) {
+        std::vector<ArchitectureHotspot> hotspots;
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql =
+            "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in "
+            "FROM edges e "
+            "JOIN nodes n ON e.dst_id = n.id "
+            "JOIN files f ON n.file_id = f.id "
+            "WHERE e.kind = 'calls' AND e.confidence >= 0.5 AND n.node_type = 'symbol' "
+            "GROUP BY n.id "
+            "ORDER BY fan_in DESC, n.name ASC";
+        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to compute architecture hotspots").to_json_rpc(0);
+        }
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t file_id = sqlite3_column_int64(stmt, 0);
+            if (!in_scope_file_ids.count(file_id)) continue;
+            ArchitectureHotspot hotspot;
+            hotspot.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            hotspot.kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            hotspot.file = architecture_display_path(
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)), repo_root);
+            hotspot.fan_in = sqlite3_column_int64(stmt, 4);
+            hotspots.push_back(std::move(hotspot));
+        }
+        sqlite3_finalize(stmt);
+
+        auto* hotspots_arr = doc.new_arr();
+        for (size_t i = 0; i < hotspots.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& hotspot = hotspots[i];
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "name", hotspot.name.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", hotspot.kind.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", hotspot.file.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "fan_in", hotspot.fan_in);
+            yyjson_mut_arr_append(hotspots_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "hotspots", hotspots_arr);
+    }
+
+    if (wants("boundaries")) {
+        std::vector<std::pair<const ArchitectureFileInfo*, ArchitectureBoundaryStats>> rows;
+        rows.reserve(boundaries.size());
+        for (const auto& [file_id, stats] : boundaries) {
+            auto it = files_by_id.find(file_id);
+            if (it == files_by_id.end() || !it->second.in_scope) continue;
+            rows.push_back({&it->second, stats});
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      double lhs_coupling = (lhs.second.internal_edges + lhs.second.external_edges) > 0
+                          ? static_cast<double>(lhs.second.external_edges)
+                              / static_cast<double>(lhs.second.internal_edges + lhs.second.external_edges)
+                          : 0.0;
+                      double rhs_coupling = (rhs.second.internal_edges + rhs.second.external_edges) > 0
+                          ? static_cast<double>(rhs.second.external_edges)
+                              / static_cast<double>(rhs.second.internal_edges + rhs.second.external_edges)
+                          : 0.0;
+                      if (lhs_coupling != rhs_coupling) return lhs_coupling > rhs_coupling;
+                      if (lhs.second.external_edges != rhs.second.external_edges)
+                          return lhs.second.external_edges > rhs.second.external_edges;
+                      return lhs.first->path < rhs.first->path;
+                  });
+
+        auto* boundaries_arr = doc.new_arr();
+        for (size_t i = 0; i < rows.size() && static_cast<int64_t>(i) < limit; ++i) {
+            const auto& [file, stats] = rows[i];
+            double coupling = (stats.internal_edges + stats.external_edges) > 0
+                ? static_cast<double>(stats.external_edges)
+                    / static_cast<double>(stats.internal_edges + stats.external_edges)
+                : 0.0;
+            auto* item = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", file->path.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "internal_edges", stats.internal_edges);
+            yyjson_mut_obj_add_int(doc.doc, item, "external_edges", stats.external_edges);
+            yyjson_mut_obj_add_real(doc.doc, item, "coupling", coupling);
+            yyjson_mut_arr_append(boundaries_arr, item);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "boundaries", boundaries_arr);
+    }
+
+    return doc.to_string();
+}
+
 // T080: file_search — search file paths by GLOB pattern
 std::string file_search(yyjson_val* params, Connection& /*conn*/,
                                 QueryCache& cache, const std::string& /*repo_root*/) {
@@ -2537,6 +3086,221 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    return doc.to_string();
+}
+
+std::string symbol_search_semantic(yyjson_val* params, Connection& conn,
+                                  QueryCache& /*cache*/, const std::string& repo_root) {
+    const char* query = params ? json_get_str(params, "query") : nullptr;
+    if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
+
+    int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
+    if (limit < 1) limit = 1;
+    if (limit > 100) limit = 100;
+
+    double min_similarity = params ? json_get_double(params, "min_similarity", 0.5) : 0.5;
+    if (min_similarity < 0.0 || min_similarity > 1.0) {
+        return McpError::invalid_input("Invalid 'min_similarity': must be between 0.0 and 1.0")
+            .to_json_rpc(0);
+    }
+
+    const char* kind = params ? json_get_str(params, "kind") : nullptr;
+    TokenVectorTable* tvt = get_token_vector_table(repo_root);
+    if (!tvt || !tvt->ready()) {
+        return semantic_not_ready_json(
+            "Embedding table not found. Run tools/gen_token_vectors.py first.");
+    }
+
+    auto query_embedding = tvt->embed(query);
+    if (query_embedding.empty()) {
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        auto* results = doc.new_arr();
+        doc.set_root(root);
+        yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", true);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "query", query);
+        yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+        yyjson_mut_obj_add_int(doc.doc, root, "total_scanned", 0);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "error",
+                                 "Query tokens were not found in the embedding vocabulary.");
+        return doc.to_string();
+    }
+
+    std::string count_sql = "SELECT COUNT(*) FROM node_vectors nv "
+                            "JOIN nodes n ON n.id = nv.node_id";
+    std::string scan_sql =
+        "SELECT nv.node_id, nv.embedding, n.name, n.kind, n.qualname, f.path, n.start_line "
+        "FROM node_vectors nv "
+        "JOIN nodes n ON n.id = nv.node_id "
+        "LEFT JOIN files f ON n.file_id = f.id";
+    if (kind && *kind) {
+        count_sql += " WHERE n.kind = ?";
+        scan_sql += " WHERE n.kind = ?";
+    }
+
+    sqlite3_stmt* count_stmt = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(), count_sql.c_str(), -1, &count_stmt, nullptr) != SQLITE_OK) {
+        return tool_error_json("failed to prepare semantic count query");
+    }
+    if (kind && *kind && count_stmt) sqlite3_bind_text(count_stmt, 1, kind, -1, SQLITE_TRANSIENT);
+    int64_t total_rows = 0;
+    if (count_stmt && sqlite3_step(count_stmt) == SQLITE_ROW) {
+        total_rows = sqlite3_column_int64(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(), scan_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK || !stmt) {
+        if (stmt) sqlite3_finalize(stmt);
+        return tool_error_json("failed to prepare semantic scan query");
+    }
+    if (kind && *kind) sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT);
+
+    struct SemanticResult {
+        int64_t node_id = 0;
+        std::string name;
+        std::string kind;
+        std::string qualname;
+        std::string file;
+        int line = 0;
+        float similarity = 0.0f;
+    };
+    struct DotCandidate {
+        int32_t dot = 0;
+        std::vector<int8_t> embedding;
+        SemanticResult meta;
+    };
+    struct BySimilarityAsc {
+        bool operator()(const SemanticResult& a, const SemanticResult& b) const {
+            return a.similarity > b.similarity;
+        }
+    };
+    struct ByDotAsc {
+        bool operator()(const DotCandidate& a, const DotCandidate& b) const {
+            return a.dot > b.dot;
+        }
+    };
+
+    const bool two_stage = total_rows > 500000;
+    const size_t shortlist_size = static_cast<size_t>((std::max<int64_t>)(200, limit * 4));
+    std::priority_queue<SemanticResult, std::vector<SemanticResult>, BySimilarityAsc> top_results;
+    std::priority_queue<DotCandidate, std::vector<DotCandidate>, ByDotAsc> shortlist;
+    int64_t scanned = 0;
+
+    auto row_to_result = [&](sqlite3_stmt* row) {
+        SemanticResult result;
+        result.node_id = sqlite3_column_int64(row, 0);
+        if (const auto* text = sqlite3_column_text(row, 2))
+            result.name = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 3))
+            result.kind = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 4))
+            result.qualname = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 5))
+            result.file = reinterpret_cast<const char*>(text);
+        result.line = sqlite3_column_int(row, 6);
+        return result;
+    };
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const void* blob_ptr = sqlite3_column_blob(stmt, 1);
+        int blob_size = sqlite3_column_bytes(stmt, 1);
+        if (!blob_ptr || blob_size != TokenVectorTable::DIM) continue;
+
+        const int8_t* embedding = static_cast<const int8_t*>(blob_ptr);
+        ++scanned;
+
+        if (!two_stage) {
+            float similarity = TokenVectorTable::cosine(query_embedding.data(), embedding,
+                                                       TokenVectorTable::DIM);
+            if (similarity < min_similarity) continue;
+            SemanticResult result = row_to_result(stmt);
+            result.similarity = similarity;
+            if (top_results.size() < static_cast<size_t>(limit)) {
+                top_results.push(std::move(result));
+            } else if (similarity > top_results.top().similarity) {
+                top_results.pop();
+                top_results.push(std::move(result));
+            }
+            continue;
+        }
+
+        int32_t dot = 0;
+        for (int i = 0; i < TokenVectorTable::DIM; ++i) {
+            dot += static_cast<int32_t>(query_embedding[i]) * static_cast<int32_t>(embedding[i]);
+        }
+        DotCandidate candidate;
+        candidate.dot = dot;
+        candidate.embedding.assign(embedding, embedding + TokenVectorTable::DIM);
+        candidate.meta = row_to_result(stmt);
+        if (shortlist.size() < shortlist_size) {
+            shortlist.push(std::move(candidate));
+        } else if (dot > shortlist.top().dot) {
+            shortlist.pop();
+            shortlist.push(std::move(candidate));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (two_stage) {
+        std::vector<DotCandidate> candidates;
+        candidates.reserve(shortlist.size());
+        while (!shortlist.empty()) {
+            candidates.push_back(std::move(shortlist.top()));
+            shortlist.pop();
+        }
+        for (auto& candidate : candidates) {
+            candidate.meta.similarity = TokenVectorTable::cosine(
+                query_embedding.data(), candidate.embedding.data(), TokenVectorTable::DIM);
+            if (candidate.meta.similarity < min_similarity) continue;
+            if (top_results.size() < static_cast<size_t>(limit)) {
+                top_results.push(std::move(candidate.meta));
+            } else if (candidate.meta.similarity > top_results.top().similarity) {
+                top_results.pop();
+                top_results.push(std::move(candidate.meta));
+            }
+        }
+    }
+
+    std::vector<SemanticResult> ordered;
+    ordered.reserve(top_results.size());
+    while (!top_results.empty()) {
+        ordered.push_back(std::move(top_results.top()));
+        top_results.pop();
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const SemanticResult& a, const SemanticResult& b) {
+                  if (a.similarity != b.similarity) return a.similarity > b.similarity;
+                  if (a.name != b.name) return a.name < b.name;
+                  if (a.file != b.file) return a.file < b.file;
+                  return a.line < b.line;
+              });
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* results = doc.new_arr();
+    doc.set_root(root);
+    yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", true);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "query", query);
+    yyjson_mut_obj_add_int(doc.doc, root, "total_scanned", scanned);
+
+    for (const auto& result : ordered) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", result.node_id);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", result.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", result.kind.c_str());
+        if (!result.qualname.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", result.qualname.c_str());
+        }
+        if (!result.file.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", result.file.c_str());
+        }
+        yyjson_mut_obj_add_int(doc.doc, item, "line", result.line);
+        yyjson_mut_obj_add_real(doc.doc, item, "similarity", result.similarity);
+        yyjson_mut_arr_append(results, item);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
     return doc.to_string();
 }
 
@@ -4942,6 +5706,112 @@ std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
     return doc.to_string();
 }
 
+// T089b: find_similar — near-duplicate functions via MinHash fingerprints
+std::string find_similar(yyjson_val* params, Connection& conn,
+                         QueryCache& cache, const std::string& /*repo_root*/) {
+    int64_t node_id = resolve_node_id(params, conn, cache);
+    if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
+
+    double threshold = params ? json_get_double(params, "threshold", 0.8) : 0.8;
+    threshold = std::clamp(threshold, 0.0, 1.0);
+    int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
+    limit = std::clamp<int64_t>(limit, 1, 200);
+    static constexpr int64_t kMaxScannedFingerprints = 50000;
+
+    auto* target_stmt = cache.get("find_similar_target",
+        "SELECT n.id, n.name, n.kind, f.path, n.fingerprint "
+        "FROM nodes n "
+        "LEFT JOIN files f ON n.file_id = f.id "
+        "WHERE n.id = ? AND n.node_type = 'symbol'");
+    sqlite3_bind_int64(target_stmt, 1, node_id);
+
+    if (sqlite3_step(target_stmt) != SQLITE_ROW) {
+        return McpError::not_found("Node not found").to_json_rpc(0);
+    }
+
+    const char* target_name = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 1));
+    const char* target_kind = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 2));
+    const char* target_file = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 3));
+    const char* target_fp = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 4));
+
+    std::vector<uint32_t> target_values;
+    if (!decode_minhash_fingerprint(target_fp, target_values)) {
+        return McpError::not_found("Target node does not have a fingerprint").to_json_rpc(0);
+    }
+
+    auto* stmt = cache.get("find_similar_scan",
+        "SELECT n.id, n.name, f.path, n.fingerprint "
+        "FROM nodes n "
+        "LEFT JOIN files f ON n.file_id = f.id "
+        "WHERE n.node_type = 'symbol' AND n.kind = ? "
+        "AND n.fingerprint IS NOT NULL AND n.id != ? "
+        "LIMIT ?");
+    sqlite3_bind_text(stmt, 1, target_kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, node_id);
+    sqlite3_bind_int64(stmt, 3, kMaxScannedFingerprints);
+
+    struct SimilarRow {
+        int64_t node_id = -1;
+        std::string name;
+        std::string file;
+        double similarity = 0.0;
+    };
+
+    std::vector<SimilarRow> matches;
+    matches.reserve(static_cast<size_t>(limit));
+    std::vector<uint32_t> candidate_values;
+    int64_t scanned = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ++scanned;
+        if (!decode_minhash_fingerprint(
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)), candidate_values)) {
+            continue;
+        }
+
+        double similarity = minhash_similarity(target_values, candidate_values);
+        if (similarity < threshold) continue;
+
+        matches.push_back({
+            sqlite3_column_int64(stmt, 0),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
+            similarity
+        });
+    }
+
+    std::sort(matches.begin(), matches.end(), [](const SimilarRow& lhs, const SimilarRow& rhs) {
+        if (lhs.similarity != rhs.similarity) return lhs.similarity > rhs.similarity;
+        if (lhs.name != rhs.name) return lhs.name < rhs.name;
+        return lhs.node_id < rhs.node_id;
+    });
+    if (static_cast<int64_t>(matches.size()) > limit) matches.resize(static_cast<size_t>(limit));
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+
+    auto* target = doc.new_obj();
+    yyjson_mut_obj_add_int(doc.doc, target, "node_id", node_id);
+    yyjson_mut_obj_add_strcpy(doc.doc, target, "name", target_name ? target_name : "");
+    if (target_file) yyjson_mut_obj_add_strcpy(doc.doc, target, "file", target_file);
+    yyjson_mut_obj_add_val(doc.doc, root, "target", target);
+
+    auto* similar = doc.new_arr();
+    for (const auto& row : matches) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", row.node_id);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", row.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "file", row.file.c_str());
+        yyjson_mut_obj_add_real(doc.doc, item, "similarity", row.similarity);
+        yyjson_mut_arr_append(similar, item);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "similar", similar);
+    yyjson_mut_obj_add_int(doc.doc, root, "scanned", scanned);
+    yyjson_mut_obj_add_bool(doc.doc, root, "scan_capped", scanned >= kMaxScannedFingerprints);
+    return doc.to_string();
+}
+
 // T090: method_fields — field accesses and calls made by a method
 std::string method_fields(yyjson_val* params, Connection& conn,
                                   QueryCache& cache, const std::string& /*repo_root*/) {
@@ -5589,6 +6459,435 @@ std::string code_search(yyjson_val* params, Connection& conn,
     return doc.to_string();
 }
 
+
+static std::string tool_error_json(const std::string& message) {
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "error", message.c_str());
+    return doc.to_string();
+}
+
+static std::string current_db_path(Connection& conn) {
+    const char* path = sqlite3_db_filename(conn.raw(), "main");
+    return path ? std::string(path) : std::string();
+}
+
+static std::string escape_like_suffix(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size() * 2 + 1);
+    escaped.push_back('%');
+    for (char ch : value) {
+        if (ch == '\\' || ch == '%' || ch == '_') escaped.push_back('\\');
+        escaped.push_back(ch);
+    }
+    return escaped;
+}
+
+struct TraceNodeResolution {
+    int64_t node_id = -1;
+    std::string name;
+    std::string qualname;
+
+    bool resolved() const { return node_id >= 0; }
+};
+
+static TraceNodeResolution resolve_trace_node(sqlite3_stmt* stmt, const std::string& symbol_name) {
+    TraceNodeResolution resolved;
+    if (symbol_name.empty()) return resolved;
+
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_text(stmt, 1, symbol_name.c_str(), -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        resolved.node_id = sqlite3_column_int64(stmt, 0);
+        if (const auto* text = sqlite3_column_text(stmt, 1)) {
+            resolved.name = reinterpret_cast<const char*>(text);
+        }
+        if (const auto* text = sqlite3_column_text(stmt, 2)) {
+            resolved.qualname = reinterpret_cast<const char*>(text);
+        }
+    }
+    return resolved;
+}
+
+static TraceNodeResolution resolve_trace_node(Connection& /*conn*/, QueryCache& cache,
+                                              const std::string& symbol_name) {
+    auto* stmt = cache.get(
+        "trace_resolve_node",
+        "SELECT id, COALESCE(name, ''), COALESCE(qualname, '') "
+        "FROM nodes "
+        "WHERE node_type = 'symbol' "
+        "AND (name = ?1 OR qualname = ?1 "
+        " OR (length(name) >= length(?1) AND substr(name, -length(?1)) = ?1) "
+        " OR (qualname IS NOT NULL AND length(qualname) >= length(?1) AND substr(qualname, -length(?1)) = ?1)) "
+        "ORDER BY CASE "
+        "  WHEN qualname = ?1 THEN 0 "
+        "  WHEN name = ?1 THEN 1 "
+        "  WHEN qualname IS NOT NULL AND length(qualname) >= length(?1) AND substr(qualname, -length(?1)) = ?1 THEN 2 "
+        "  WHEN length(name) >= length(?1) AND substr(name, -length(?1)) = ?1 THEN 3 "
+        "  ELSE 4 END, "
+        "is_definition DESC, "
+        "CASE WHEN qualname IS NULL THEN 1 ELSE 0 END, "
+        "LENGTH(COALESCE(qualname, name)) ASC, id ASC "
+        "LIMIT 1");
+    return resolve_trace_node(stmt, symbol_name);
+}
+
+static bool resolve_trace_edge(Connection& /*conn*/, QueryCache& cache,
+                               int64_t caller_node_id, int64_t callee_node_id,
+                               double* confidence_out = nullptr) {
+    auto* stmt = cache.get(
+        "trace_resolve_edge",
+        "SELECT confidence FROM edges "
+        "WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls' "
+        "ORDER BY confidence DESC, id ASC LIMIT 1");
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_int64(stmt, 1, caller_node_id);
+    sqlite3_bind_int64(stmt, 2, callee_node_id);
+    if (sqlite3_step(stmt) != SQLITE_ROW) return false;
+    if (confidence_out) *confidence_out = sqlite3_column_double(stmt, 0);
+    return true;
+}
+
+std::string ingest_traces(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& /*repo_root*/) {
+    auto* traces = params ? yyjson_obj_get(params, "traces") : nullptr;
+    if (!traces || !yyjson_is_arr(traces)) {
+        return tool_error_json("missing required parameter: traces");
+    }
+
+    auto db_path = current_db_path(conn);
+    if (db_path.empty()) return tool_error_json("unable to resolve database path");
+
+    const char* source = params ? json_get_str(params, "source") : nullptr;
+
+    try {
+        Connection write_conn(db_path);
+        schema::ensure_schema(write_conn);
+        write_conn.exec("BEGIN IMMEDIATE");
+
+        sqlite3_stmt* upsert_trace = nullptr;
+        sqlite3_stmt* resolve_node = nullptr;
+        sqlite3_stmt* update_edge = nullptr;
+
+        sqlite3_prepare_v2(write_conn.raw(),
+            "INSERT OR REPLACE INTO traces("
+            "id, caller_name, callee_name, call_count, p50_ms, p99_ms, error_rate, source, ingested_at"
+            ") VALUES ("
+            "(SELECT id FROM traces WHERE caller_name = ?1 AND callee_name = ?2 "
+            " AND ((source IS NULL AND ?7 IS NULL) OR source = ?7) LIMIT 1),"
+            "?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))",
+            -1, &upsert_trace, nullptr);
+        sqlite3_prepare_v2(write_conn.raw(),
+            "SELECT id, COALESCE(name, ''), COALESCE(qualname, '') "
+            "FROM nodes "
+            "WHERE node_type = 'symbol' "
+            "AND (name = ?1 OR qualname = ?1 "
+            " OR (length(name) >= length(?1) AND substr(name, -length(?1)) = ?1) "
+            " OR (qualname IS NOT NULL AND length(qualname) >= length(?1) AND substr(qualname, -length(?1)) = ?1)) "
+            "ORDER BY CASE "
+            "  WHEN qualname = ?1 THEN 0 "
+            "  WHEN name = ?1 THEN 1 "
+            "  WHEN qualname IS NOT NULL AND length(qualname) >= length(?1) AND substr(qualname, -length(?1)) = ?1 THEN 2 "
+            "  WHEN length(name) >= length(?1) AND substr(name, -length(?1)) = ?1 THEN 3 "
+            "  ELSE 4 END, "
+            "is_definition DESC, "
+            "CASE WHEN qualname IS NULL THEN 1 ELSE 0 END, "
+            "LENGTH(COALESCE(qualname, name)) ASC, id ASC "
+            "LIMIT 1",
+            -1, &resolve_node, nullptr);
+        sqlite3_prepare_v2(write_conn.raw(),
+            "UPDATE edges SET confidence = MIN(1.0, confidence + ?3) "
+            "WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls'",
+            -1, &update_edge, nullptr);
+
+        if (!upsert_trace || !resolve_node || !update_edge) {
+            throw std::runtime_error("failed to prepare trace ingestion SQL");
+        }
+
+        int ingested = 0;
+        int resolved_edges = 0;
+        int unresolved = 0;
+
+        yyjson_val* trace = nullptr;
+        size_t idx = 0, max = 0;
+        yyjson_arr_foreach(traces, idx, max, trace) {
+            if (!yyjson_is_obj(trace)) {
+                unresolved++;
+                continue;
+            }
+
+            const char* caller = json_get_str(trace, "caller");
+            const char* callee = json_get_str(trace, "callee");
+            if (!caller || !callee || !*caller || !*callee) {
+                unresolved++;
+                continue;
+            }
+
+            int64_t count = json_get_int(trace, "count", 1);
+            if (count < 1) count = 1;
+            double p50_ms = json_get_double(trace, "p50_ms", 0.0);
+            double p99_ms = json_get_double(trace, "p99_ms", 0.0);
+            double error_rate = json_get_double(trace, "error_rate", 0.0);
+
+            sqlite3_reset(upsert_trace);
+            sqlite3_clear_bindings(upsert_trace);
+            sqlite3_bind_text(upsert_trace, 1, caller, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upsert_trace, 2, callee, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(upsert_trace, 3, count);
+            sqlite3_bind_double(upsert_trace, 4, p50_ms);
+            sqlite3_bind_double(upsert_trace, 5, p99_ms);
+            sqlite3_bind_double(upsert_trace, 6, error_rate);
+            if (source) sqlite3_bind_text(upsert_trace, 7, source, -1, SQLITE_TRANSIENT);
+            else sqlite3_bind_null(upsert_trace, 7);
+            if (sqlite3_step(upsert_trace) != SQLITE_DONE) {
+                throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
+            }
+            ingested++;
+
+            auto caller_node = resolve_trace_node(resolve_node, caller);
+            auto callee_node = resolve_trace_node(resolve_node, callee);
+            if (!caller_node.resolved() || !callee_node.resolved()) {
+                unresolved++;
+                continue;
+            }
+
+            double boost = 0.1 * std::log10(static_cast<double>(count));
+            if (boost < 0.0) boost = 0.0;
+
+            sqlite3_reset(update_edge);
+            sqlite3_clear_bindings(update_edge);
+            sqlite3_bind_int64(update_edge, 1, caller_node.node_id);
+            sqlite3_bind_int64(update_edge, 2, callee_node.node_id);
+            sqlite3_bind_double(update_edge, 3, boost);
+            if (sqlite3_step(update_edge) != SQLITE_DONE) {
+                throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
+            }
+            if (sqlite3_changes(write_conn.raw()) > 0) {
+                resolved_edges++;
+            } else {
+                unresolved++;
+            }
+        }
+
+        sqlite3_finalize(update_edge);
+        sqlite3_finalize(resolve_node);
+        sqlite3_finalize(upsert_trace);
+        write_conn.exec("COMMIT");
+        cache.clear();
+
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        doc.set_root(root);
+        yyjson_mut_obj_add_int(doc.doc, root, "ingested", ingested);
+        yyjson_mut_obj_add_int(doc.doc, root, "resolved_edges", resolved_edges);
+        yyjson_mut_obj_add_int(doc.doc, root, "unresolved", unresolved);
+        return doc.to_string();
+    } catch (const std::exception& e) {
+        return tool_error_json(e.what());
+    }
+}
+
+std::string get_traces(yyjson_val* params, Connection& conn,
+                       QueryCache& cache, const std::string& /*repo_root*/) {
+    try {
+        int64_t min_count = params ? json_get_int(params, "min_count", 0) : 0;
+        int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
+        if (limit < 1) limit = 1;
+        if (limit > 500) limit = 500;
+
+        const char* caller = params ? json_get_str(params, "caller") : nullptr;
+        const char* callee = params ? json_get_str(params, "callee") : nullptr;
+
+        auto* stmt = cache.get(
+            "get_traces_query",
+            "SELECT caller_name, callee_name, call_count, p50_ms, p99_ms, error_rate, source, ingested_at "
+            "FROM traces "
+            "WHERE call_count >= ?1 "
+            "AND (?2 IS NULL OR caller_name LIKE ?2 ESCAPE '\\') "
+            "AND (?3 IS NULL OR callee_name LIKE ?3 ESCAPE '\\') "
+            "ORDER BY call_count DESC, ingested_at DESC, caller_name ASC, callee_name ASC LIMIT ?4");
+        sqlite3_bind_int64(stmt, 1, min_count);
+
+        std::string caller_pattern;
+        std::string callee_pattern;
+        if (caller && *caller) {
+            caller_pattern = "%" + std::string(caller) + "%";
+            for (size_t i = 1; i + 1 < caller_pattern.size(); ++i) {
+                if (caller_pattern[i] == '\\' || caller_pattern[i] == '%' || caller_pattern[i] == '_') {
+                    caller_pattern.insert(i, 1, '\\');
+                    ++i;
+                }
+            }
+            sqlite3_bind_text(stmt, 2, caller_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 2);
+        }
+        if (callee && *callee) {
+            callee_pattern = "%" + std::string(callee) + "%";
+            for (size_t i = 1; i + 1 < callee_pattern.size(); ++i) {
+                if (callee_pattern[i] == '\\' || callee_pattern[i] == '%' || callee_pattern[i] == '_') {
+                    callee_pattern.insert(i, 1, '\\');
+                    ++i;
+                }
+            }
+            sqlite3_bind_text(stmt, 3, callee_pattern.c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 3);
+        }
+        sqlite3_bind_int64(stmt, 4, limit);
+
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        auto* results = doc.new_arr();
+        doc.set_root(root);
+        int returned = 0;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char* caller_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            const char* callee_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            auto caller_node = resolve_trace_node(conn, cache, caller_name ? caller_name : "");
+            auto callee_node = resolve_trace_node(conn, cache, callee_name ? callee_name : "");
+
+            double edge_confidence = 0.0;
+            bool edge_resolved = caller_node.resolved() && callee_node.resolved()
+                && resolve_trace_edge(conn, cache, caller_node.node_id, callee_node.node_id, &edge_confidence);
+
+            auto* item = doc.new_obj();
+            if (caller_name) yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", caller_name);
+            if (callee_name) yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_name", callee_name);
+            yyjson_mut_obj_add_int(doc.doc, item, "call_count", sqlite3_column_int64(stmt, 2));
+            if (sqlite3_column_type(stmt, 3) != SQLITE_NULL)
+                yyjson_mut_obj_add_real(doc.doc, item, "p50_ms", sqlite3_column_double(stmt, 3));
+            if (sqlite3_column_type(stmt, 4) != SQLITE_NULL)
+                yyjson_mut_obj_add_real(doc.doc, item, "p99_ms", sqlite3_column_double(stmt, 4));
+            if (sqlite3_column_type(stmt, 5) != SQLITE_NULL)
+                yyjson_mut_obj_add_real(doc.doc, item, "error_rate", sqlite3_column_double(stmt, 5));
+            if (const auto* source_text = sqlite3_column_text(stmt, 6))
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "source", reinterpret_cast<const char*>(source_text));
+            if (const auto* ingested_text = sqlite3_column_text(stmt, 7))
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "ingested_at", reinterpret_cast<const char*>(ingested_text));
+
+            yyjson_mut_obj_add_bool(doc.doc, item, "caller_resolved", caller_node.resolved());
+            yyjson_mut_obj_add_bool(doc.doc, item, "callee_resolved", callee_node.resolved());
+            yyjson_mut_obj_add_bool(doc.doc, item, "edge_resolved", edge_resolved);
+            if (caller_node.resolved()) {
+                yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", caller_node.node_id);
+                if (!caller_node.qualname.empty()) {
+                    yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_qualname", caller_node.qualname.c_str());
+                }
+            }
+            if (callee_node.resolved()) {
+                yyjson_mut_obj_add_int(doc.doc, item, "callee_node_id", callee_node.node_id);
+                if (!callee_node.qualname.empty()) {
+                    yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_qualname", callee_node.qualname.c_str());
+                }
+            }
+            if (edge_resolved) {
+                yyjson_mut_obj_add_real(doc.doc, item, "edge_confidence", edge_confidence);
+            }
+            yyjson_mut_arr_append(results, item);
+            ++returned;
+        }
+
+        yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+        yyjson_mut_obj_add_int(doc.doc, root, "limit", limit);
+        yyjson_mut_obj_add_int(doc.doc, root, "min_count", min_count);
+        yyjson_mut_obj_add_int(doc.doc, root, "returned", returned);
+        return doc.to_string();
+    } catch (const std::exception& e) {
+        return tool_error_json(e.what());
+    }
+}
+
+std::string list_http_calls(yyjson_val* params, Connection& conn,
+                            QueryCache& cache, const std::string& /*repo_root*/) {
+    int limit = params ? static_cast<int>(json_get_int(params, "limit", 100)) : 100;
+    if (limit > 500) limit = 500;
+    if (limit < 1) limit = 1;
+
+    int offset = params ? static_cast<int>(json_get_int(params, "offset", 0)) : 0;
+    if (offset < 0) offset = 0;
+
+    const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+
+    std::string count_sql =
+        "SELECT COUNT(*) "
+        "FROM refs r "
+        "JOIN files f ON f.id = r.file_id "
+        "WHERE r.kind = 'http_call'";
+    std::string list_sql =
+        "SELECT f.path, r.name, r.start_line, r.start_col, r.end_line, r.end_col, "
+        "       COALESCE(r.evidence, ''), COALESCE(n.name, ''), COALESCE(n.qualname, '') "
+        "FROM refs r "
+        "JOIN files f ON f.id = r.file_id "
+        "LEFT JOIN nodes n ON n.id = r.containing_node_id "
+        "WHERE r.kind = 'http_call'";
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        count_sql += " AND f.path GLOB ?";
+        list_sql += " AND f.path GLOB ?";
+    }
+    list_sql += " ORDER BY f.path, r.start_line, r.start_col LIMIT ? OFFSET ?";
+
+    auto* count_stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
+                                     ? "list_http_calls_count_glob"
+                                     : "list_http_calls_count",
+                                 count_sql);
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        sqlite3_bind_text(count_stmt, 1, file_pattern, -1, SQLITE_TRANSIENT);
+    }
+    int64_t total = 0;
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+
+    auto* stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
+                               ? "list_http_calls_glob"
+                               : "list_http_calls",
+                           list_sql);
+    int bind_idx = 1;
+    if (file_pattern && std::strlen(file_pattern) > 0) {
+        sqlite3_bind_text(stmt, bind_idx++, file_pattern, -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(stmt, bind_idx++, limit);
+    sqlite3_bind_int(stmt, bind_idx++, offset);
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* results = doc.new_arr();
+    doc.set_root(root);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto* item = doc.new_obj();
+        auto* path_text = sqlite3_column_text(stmt, 0);
+        auto* url_text = sqlite3_column_text(stmt, 1);
+        auto* evidence_text = sqlite3_column_text(stmt, 6);
+        auto* symbol_name_text = sqlite3_column_text(stmt, 7);
+        auto* symbol_qualname_text = sqlite3_column_text(stmt, 8);
+
+        if (path_text) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", reinterpret_cast<const char*>(path_text));
+        if (url_text) yyjson_mut_obj_add_strcpy(doc.doc, item, "url_path", reinterpret_cast<const char*>(url_text));
+        yyjson_mut_obj_add_int(doc.doc, item, "start_line", sqlite3_column_int(stmt, 2));
+        yyjson_mut_obj_add_int(doc.doc, item, "start_col", sqlite3_column_int(stmt, 3));
+        yyjson_mut_obj_add_int(doc.doc, item, "end_line", sqlite3_column_int(stmt, 4));
+        yyjson_mut_obj_add_int(doc.doc, item, "end_col", sqlite3_column_int(stmt, 5));
+        if (evidence_text && *evidence_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", reinterpret_cast<const char*>(evidence_text));
+        }
+        if (symbol_name_text && *symbol_name_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "containing_symbol", reinterpret_cast<const char*>(symbol_name_text));
+        }
+        if (symbol_qualname_text && *symbol_qualname_text) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "containing_qualname", reinterpret_cast<const char*>(symbol_qualname_text));
+        }
+        yyjson_mut_arr_append(results, item);
+    }
+
+    add_pagination_fields(doc, root, results, total, offset + limit < total, offset, limit);
+    return doc.to_string();
+}
+
 } // namespace tools
 } // namespace codetopo
 
@@ -5639,6 +6938,7 @@ std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
         yyjson_mut_obj_add_int(doc.doc, root, "file_count", result.files);
         yyjson_mut_obj_add_int(doc.doc, root, "symbol_count", result.symbols);
         yyjson_mut_obj_add_int(doc.doc, root, "edge_count", result.edges);
+        yyjson_mut_obj_add_int(doc.doc, root, "http_call_ref_count", result.http_call_refs);
         yyjson_mut_obj_add_str(doc.doc, root, "status", "added");
         return doc.to_string();
     } catch (const std::exception& e) {

@@ -63,7 +63,7 @@ int run_index_supervisor(const Config& config,
     auto progress_path = config.db_path;
     progress_path += ".progress";
 
-    constexpr int MAX_RESTARTS = 10;
+    constexpr int MAX_RESTARTS = 2000;
     int consecutive_crashes = 0;
     int no_progress_crashes = 0;  // consecutive crashes with no progress
 

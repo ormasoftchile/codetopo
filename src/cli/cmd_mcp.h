@@ -145,6 +145,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Get repository statistics: file count, symbol count, edge count, last index time.",
         R"J({"type":"object","properties":{}})J");
 
+    server.register_tool("get_architecture", tools::get_architecture,
+        "Summarize repository architecture from the indexed graph: clusters, hotspots, boundaries, and overall stats. Uses directory-based clustering with graph-driven cohesion and coupling metrics.",
+        R"J({"type":"object","properties":{"scope":{"type":"string","description":"Optional file or directory prefix to scope the analysis (for example 'src/' or 'src/mcp')"},"aspects":{"type":"array","items":{"type":"string","enum":["clusters","hotspots","boundaries","summary"]},"description":"Sections to return. Omit for all sections."},"limit":{"type":"integer","description":"Max items per section (default 20, max 100)"}}})J");
+
     server.register_tool("file_search", tools::file_search,
         "Search for files by path pattern (GLOB syntax). Use to find files containing a keyword in their path, e.g. '*numa*' finds sosnumap.h. Supports wildcards: * matches any chars, ? matches one char, [abc] matches char class.",
         R"J({"type":"object","properties":{"pattern":{"type":"string","description":"GLOB pattern to match against file paths (e.g. '*numa*', 'Sql/DkTemp/sos/**/*.h')"},"language":{"type":"string","description":"Optional language filter (c, cpp, csharp, etc.)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["pattern"]})J");
@@ -160,6 +164,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     server.register_tool("symbol_search", tools::symbol_search,
         "Search for symbols (functions, classes, macros, variables) by name. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns kind, name, file_path, span, and an internal node_id handle for chaining into other tools (context_for, callers_approx, impact_of). Never mention node_id values to the user — refer to symbols by name and file location instead.",
         R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for. Use '*' to list all (combine with kind filter)"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, etc."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict results to specific file paths, e.g. '/Volumes/Projects/kibana/**' or 'src/mcp/*'"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["query"]})J");
+
+    server.register_tool("symbol_search_semantic", tools::symbol_search_semantic,
+        "Search for symbols using semantic similarity. Finds functions/classes related to the query concept even if the exact name doesn't match. Requires embedding table.",
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Natural language or code concept to search for"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, method, etc."},"min_similarity":{"type":"number","description":"Minimum cosine similarity (default 0.5)"},"limit":{"type":"integer","description":"Max results (default 20, max 100)"}},"required":["query"]})J");
 
     server.register_tool("symbol_list", tools::symbol_list,
         "List and filter symbols without full-text search. Default output is listing-safe (kind, name, signature when present, file, start_line) and omits internal handles/spans. Responses include total_candidates, filtered_hidden, and hidden_public_count so kind/min_span filters are never silent; min_span_lines is lossy and public/API-like symbols bypass span pruning.",
@@ -233,6 +241,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Find types that implement or inherit from a given base type/interface. Uses 'inherits' edges in the code graph.",
         R"J({"type":"object","properties":{"symbol":{"type":"string","description":"Name of the base type, interface, or trait to find implementations of"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}},"required":["symbol"]})J");
 
+    server.register_tool("find_similar", tools::find_similar,
+        "Find near-duplicate functions or methods using MinHash fingerprints of normalized AST leaf trigrams.",
+        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the function or method to compare"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"threshold":{"type":"number","description":"Minimum MinHash similarity to return (default 0.8)"},"limit":{"type":"integer","description":"Max results (default 20, max 200)"}}})J");
+
     server.register_tool("method_fields", tools::method_fields,
         "List all 'this.X' field accesses (reads and writes) and outgoing calls made by a method, classified as calls_self (same class) or calls_external. Useful for understanding a TypeScript/JavaScript method's state usage.",
         R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the method symbol to analyze"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}}})J");
@@ -248,6 +260,18 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     server.register_tool("code_search", tools::code_search,
         "Search for arbitrary text patterns across all source file contents. Uses a trigram index for fast substring matching. Default is grep-like: file, line, and matched text with no context duplication; set context_lines to include surrounding lines.",
         R"J({"type":"object","properties":{"query":{"type":"string","description":"Text to search for (minimum 3 characters). Matches arbitrary substrings in source code."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict search to specific file paths (e.g. '*.cpp', 'src/mcp/*')"},"limit":{"type":"integer","description":"Max files to return (default 50, max 500)"},"context_lines":{"type":"integer","description":"Lines of context around each match (default 0, max 5). When context is returned, matched text is not duplicated in a separate text field."},"max_bytes":{"type":"integer","description":"Soft response budget (default 16000, 0 disables, max 100000)"},"case_sensitive":{"type":"boolean","description":"Case-sensitive matching (default false)"}},"required":["query"]})J");
+
+    server.register_tool("list_http_calls", tools::list_http_calls,
+        "List extracted HTTP client call refs with their URL paths. Use to inspect protocol-aware refs captured during indexing.",
+        R"J({"type":"object","properties":{"file_pattern":{"type":"string","description":"Optional GLOB filter for file paths"},"limit":{"type":"integer","description":"Max results (default 100, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}}})J");
+
+    server.register_tool("ingest_traces", tools::ingest_traces,
+        "Ingest observed runtime call traces and boost matching call-graph edge confidence using call counts and latency percentiles.",
+        R"J({"type":"object","properties":{"source":{"type":"string","description":"Origin label for the traces, for example 'otlp' or 'manual'"},"traces":{"type":"array","items":{"type":"object","properties":{"caller":{"type":"string"},"callee":{"type":"string"},"count":{"type":"integer"},"p50_ms":{"type":"number"},"p99_ms":{"type":"number"},"error_rate":{"type":"number"}},"required":["caller","callee"]}}},"required":["traces"]})J");
+
+    server.register_tool("get_traces", tools::get_traces,
+        "Query ingested runtime traces by caller/callee name and minimum call count, with resolution status against indexed symbols and call edges.",
+        R"J({"type":"object","properties":{"caller":{"type":"string","description":"Optional substring filter for caller_name"},"callee":{"type":"string","description":"Optional substring filter for callee_name"},"min_count":{"type":"integer","description":"Minimum call_count filter (default 0)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}}})J");
 
     server.register_tool("reindex",
         [&reindex, &repo_root, &db_path](yyjson_val* /*params*/, Connection& /*conn*/,
@@ -351,10 +375,12 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
     std::unordered_map<std::string, ToolFn> all_tools = {
         {"server_info", tools::server_info},
         {"repo_stats", tools::repo_stats},
+        {"get_architecture", tools::get_architecture},
         {"file_search", tools::file_search},
         {"dir_list", tools::dir_list},
         {"dir_tree", tools::dir_tree},
         {"symbol_search", tools::symbol_search},
+        {"symbol_search_semantic", tools::symbol_search_semantic},
         {"symbol_list", tools::symbol_list},
         {"symbols_in_path", tools::symbols_in_path},
         {"symbol_get", tools::symbol_get},
@@ -374,7 +400,14 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"subgraph", tools::subgraph},
         {"shortest_path", tools::shortest_path},
         {"find_implementations", tools::find_implementations},
+        {"find_similar", tools::find_similar},
         {"code_search", tools::code_search},
+        {"list_http_calls", tools::list_http_calls},
+        {"ingest_traces", tools::ingest_traces},
+        {"get_traces", tools::get_traces},
+        {"workspace_add", tools::workspace_add},
+        {"workspace_remove", tools::workspace_remove},
+        {"workspace_list", tools::workspace_list},
     };
 
     auto it = all_tools.find(tool_name);
