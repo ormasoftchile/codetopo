@@ -561,17 +561,17 @@ public:
             sqlite3_finalize(stmt);
         }
 
-        // --- Step 1: Build in-memory lookup: name → (node_id, file_id, is_definition) ---
+        // --- Step 1: Build in-memory lookup: name → candidate symbols ---
         // Also builds class_map in the same scan (merges former Step 4).
-        // For each symbol name, keep the best candidate (prefer non-test/mock paths,
-        // then definitions, then lowest id).
+        // Keep up to 50 candidates per name, sorted to prefer non-test definitions
+        // first so later resolution can use position as a quality signal.
         struct SymbolEntry {
             int64_t id;
             int64_t file_id;
             bool is_definition;
             bool is_test_or_mock;
         };
-        std::unordered_map<std::string, SymbolEntry> symbol_map;
+        std::unordered_map<std::string, std::vector<SymbolEntry>> symbol_map;
         symbol_map.reserve(2500000);
 
         struct ClassEntry {
@@ -601,17 +601,19 @@ public:
                 const bool is_test_or_mock = path_it != fileid_to_path.end() &&
                     is_test_or_mock_path(path_it->second);
 
-                auto it = symbol_map.find(name);
-                if (it == symbol_map.end()) {
-                    symbol_map[name] = {id, file_id, is_def, is_test_or_mock};
-                } else {
-                    auto& existing = it->second;
-                    if ((existing.is_test_or_mock && !is_test_or_mock) ||
-                        (existing.is_test_or_mock == is_test_or_mock &&
-                         ((!existing.is_definition && is_def) ||
-                          (existing.is_definition == is_def && id < existing.id)))) {
-                        existing = {id, file_id, is_def, is_test_or_mock};
-                    }
+                auto& entries = symbol_map[name];
+                if (entries.size() < 50) {
+                    entries.push_back({id, file_id, is_def, is_test_or_mock});
+                    std::sort(entries.begin(), entries.end(),
+                        [](const SymbolEntry& a, const SymbolEntry& b) {
+                            if (a.is_test_or_mock != b.is_test_or_mock) {
+                                return !a.is_test_or_mock;
+                            }
+                            if (a.is_definition != b.is_definition) {
+                                return a.is_definition;
+                            }
+                            return a.id < b.id;
+                        });
                 }
 
                 // Build class_map inline (replaces former Step 4 scan)
@@ -690,7 +692,8 @@ public:
         // Scan all unresolved refs and resolve, collecting edge tuples in memory
         sqlite3_stmt* ref_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "SELECT id, file_id, kind, name, containing_node_id FROM refs WHERE resolved_node_id IS NULL",
+            "SELECT id, file_id, kind, name, containing_node_id, receiver_type_hint "
+            "FROM refs WHERE resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
         // Edge tuples collected during resolution — avoids expensive SQL join in Step 6
@@ -698,6 +701,7 @@ public:
             int64_t src_id;   // containing symbol id or file node id fallback
             int64_t dst_id;   // resolved target node id
             const char* kind; // edge kind (static string literal)
+            double confidence = 0.7;
         };
         std::vector<EdgeTuple> edge_tuples;
         edge_tuples.reserve(1000000);
@@ -709,10 +713,44 @@ public:
         int call_resolved = 0, include_resolved = 0, inherit_resolved = 0;
         std::string name;
         name.reserve(256);  // reuse buffer across iterations
-        auto find_cross_file_symbol = [&](const std::string& ref_name, int64_t ref_file_id) -> const SymbolEntry* {
+        auto find_cross_file_symbols = [&](
+            const std::string& ref_name,
+            int64_t ref_file_id,
+            const std::string& receiver_type_hint
+        ) -> std::vector<std::pair<int64_t, double>> {
+            std::vector<std::pair<int64_t, double>> results;
+
+            auto emit_candidates = [&](const std::vector<SymbolEntry>& entries) {
+                for (const auto& sym : entries) {
+                    if (sym.file_id == ref_file_id) continue;
+
+                    double conf = sym.is_definition ? 0.75 : 0.65;
+                    if (sym.is_test_or_mock) conf -= 0.15;
+
+                    if (!receiver_type_hint.empty()) {
+                        auto path_it = fileid_to_path.find(sym.file_id);
+                        if (path_it != fileid_to_path.end()) {
+                            std::string path_lower = path_it->second;
+                            std::string hint_lower = receiver_type_hint;
+                            std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            std::transform(hint_lower.begin(), hint_lower.end(), hint_lower.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            if (path_lower.find(hint_lower) != std::string::npos) {
+                                conf = std::min(conf + 0.20, 0.95);
+                            }
+                        }
+                    }
+
+                    if (conf >= 0.3) {
+                        results.push_back({sym.id, conf});
+                    }
+                }
+            };
+
             auto it = symbol_map.find(ref_name);
-            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
-                return &it->second;
+            if (it != symbol_map.end()) {
+                emit_candidates(it->second);
             }
 
             size_t suffix_start = std::string::npos;
@@ -727,15 +765,33 @@ public:
                 (suffix_start == std::string::npos || arrow_pos + 2 > suffix_start)) {
                 suffix_start = arrow_pos + 2;
             }
-            if (suffix_start == std::string::npos || suffix_start >= ref_name.size()) {
-                return nullptr;
+
+            if (suffix_start != std::string::npos && suffix_start < ref_name.size()) {
+                std::string bare = ref_name.substr(suffix_start);
+                auto it2 = symbol_map.find(bare);
+                if (it2 != symbol_map.end() && it2 != it) {
+                    emit_candidates(it2->second);
+                }
             }
 
-            it = symbol_map.find(ref_name.substr(suffix_start));
-            if (it != symbol_map.end() && it->second.file_id != ref_file_id) {
-                return &it->second;
+            std::unordered_map<int64_t, double> deduped;
+            for (const auto& [nid, conf] : results) {
+                auto dup_it = deduped.find(nid);
+                if (dup_it == deduped.end() || conf > dup_it->second) {
+                    deduped[nid] = conf;
+                }
             }
-            return nullptr;
+
+            results.clear();
+            results.reserve(deduped.size());
+            for (const auto& [nid, conf] : deduped) {
+                results.push_back({nid, conf});
+            }
+
+            std::sort(results.begin(), results.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            return results;
         };
 
         while (sqlite3_step(ref_stmt) == SQLITE_ROW) {
@@ -746,20 +802,57 @@ public:
             int64_t containing_node_id = sqlite3_column_type(ref_stmt, 4) != SQLITE_NULL
                 ? sqlite3_column_int64(ref_stmt, 4)
                 : -1;
+            const char* rth_raw = sqlite3_column_type(ref_stmt, 5) != SQLITE_NULL
+                ? reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 5))
+                : nullptr;
             if (!kind_raw || !name_raw) continue;
 
             std::string_view kind(kind_raw);
             name.assign(name_raw);
+            std::string receiver_type_hint = rth_raw ? rth_raw : "";
             int64_t resolved_id = 0;
             bool resolved = false;
             const char* edge_kind = nullptr;
 
             if (kind == "call") {
-                if (const SymbolEntry* symbol = find_cross_file_symbol(name, ref_file_id)) {
-                    resolved_id = symbol->id;
+                auto candidates = find_cross_file_symbols(name, ref_file_id, receiver_type_hint);
+                if (!candidates.empty()) {
+                    resolved_id = candidates[0].first;
                     resolved = true;
                     edge_kind = "calls";
                     ++call_resolved;
+                    sqlite3_reset(update_stmt);
+                    sqlite3_bind_int64(update_stmt, 1, resolved_id);
+                    sqlite3_bind_int64(update_stmt, 2, ref_id);
+                    sqlite3_step(update_stmt);
+                    ++total_resolved;
+
+                    auto path_it = fileid_to_path.find(ref_file_id);
+                    if (path_it != fileid_to_path.end()) {
+                        auto fn_it = file_node_map.find(path_it->second);
+                        if (fn_it != file_node_map.end()) {
+                            constexpr size_t MAX_EDGES_PER_REF = 10;
+                            int64_t src_id = (containing_node_id > 0) ? containing_node_id : fn_it->second;
+                            for (size_t i = 0; i < std::min(candidates.size(), MAX_EDGES_PER_REF); ++i) {
+                                const auto& [cand_id, cand_conf] = candidates[i];
+                                std::string edge_key = std::to_string(src_id);
+                                edge_key.push_back('|');
+                                edge_key += std::to_string(cand_id);
+                                edge_key.push_back('|');
+                                edge_key += edge_kind;
+                                if (seen_edge_keys.insert(edge_key).second) {
+                                    edge_tuples.push_back({src_id, cand_id, edge_kind, cand_conf});
+                                }
+                            }
+                        }
+                    }
+
+                    if (++batch >= 100000) {
+                        conn_.exec("COMMIT");
+                        conn_.exec("BEGIN TRANSACTION");
+                        batch = 0;
+                    }
+                    continue;
                 }
             } else if (kind == "include") {
                 auto it = include_map.find(name);
@@ -834,13 +927,13 @@ public:
         // R3: Batch edge INSERT using 150-row chunks. edge_tuples is pre-deduped
         // in memory because edges has no UNIQUE constraint to rely on here.
         const int RESOLVE_EDGE_BATCH = 150;
-        const int PARAMS_PER_EDGE = 3;  // src_id, dst_id, kind (confidence+evidence are literals)
+        const int PARAMS_PER_EDGE = 4;  // src_id, dst_id, kind, confidence
 
-        // Prepare batch statement: 150 rows × "(?,?,?,0.7,'name-match')"
+        // Prepare batch statement: 150 rows × "(?,?,?,?, 'name-match')"
         std::string batch_sql = "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) VALUES ";
         for (int i = 0; i < RESOLVE_EDGE_BATCH; ++i) {
             if (i > 0) batch_sql += ",";
-            batch_sql += "(?,?,?,0.7,'name-match')";
+            batch_sql += "(?,?,?,?, 'name-match')";
         }
         sqlite3_stmt* batch_edge_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(), batch_sql.c_str(), -1, &batch_edge_stmt, nullptr);
@@ -849,7 +942,7 @@ public:
         sqlite3_stmt* single_edge_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
             "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-            "VALUES(?, ?, ?, 0.7, 'name-match')",
+            "VALUES(?, ?, ?, ?, 'name-match')",
             -1, &single_edge_stmt, nullptr);
 
         int total_edges = static_cast<int>(edge_tuples.size());
@@ -865,6 +958,7 @@ public:
                 sqlite3_bind_int64(batch_edge_stmt, base + 0, t.src_id);
                 sqlite3_bind_int64(batch_edge_stmt, base + 1, t.dst_id);
                 sqlite3_bind_text(batch_edge_stmt, base + 2, t.kind, -1, SQLITE_STATIC);
+                sqlite3_bind_double(batch_edge_stmt, base + 3, t.confidence);
             }
             sqlite3_step(batch_edge_stmt);
             edges_created += RESOLVE_EDGE_BATCH;
@@ -882,6 +976,7 @@ public:
             sqlite3_bind_int64(single_edge_stmt, 1, t.src_id);
             sqlite3_bind_int64(single_edge_stmt, 2, t.dst_id);
             sqlite3_bind_text(single_edge_stmt, 3, t.kind, -1, SQLITE_STATIC);
+            sqlite3_bind_double(single_edge_stmt, 4, t.confidence);
             sqlite3_step(single_edge_stmt);
             ++edges_created;
         }
