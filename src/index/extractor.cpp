@@ -100,7 +100,7 @@ std::string normalize_type_hint(std::string type) {
     return trim_copy(type);
 }
 
-std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
+std::string read_type_after_colon(std::string_view line, size_t colon_pos) {
     size_t pos = colon_pos + 1;
     while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
     size_t start = pos;
@@ -112,15 +112,15 @@ std::string read_type_after_colon(const std::string& line, size_t colon_pos) {
         if (generic_depth == 0 && (c == '=' || c == ';' || c == ',' || c == ')' || c == '{')) break;
         ++pos;
     }
-    return normalize_type_hint(line.substr(start, pos - start));
+    return normalize_type_hint(std::string(line.substr(start, pos - start)));
 }
 
-size_t skip_inline_whitespace(const std::string& text, size_t pos) {
+size_t skip_inline_whitespace(std::string_view text, size_t pos) {
     while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
     return pos;
 }
 
-size_t previous_significant_char(const std::string& text, size_t pos) {
+size_t previous_significant_char(std::string_view text, size_t pos) {
     while (pos > 0) {
         --pos;
         if (!std::isspace(static_cast<unsigned char>(text[pos]))) return pos;
@@ -128,7 +128,7 @@ size_t previous_significant_char(const std::string& text, size_t pos) {
     return std::string::npos;
 }
 
-size_t declaration_context_start(const std::string& text, size_t pos) {
+size_t declaration_context_start(std::string_view text, size_t pos) {
     while (pos > 0) {
         char c = text[pos - 1];
         if (c == '\n' || c == '\r' || c == ';' || c == '{' || c == '}') break;
@@ -184,7 +184,7 @@ bool declaration_prefix_allows_receiver(std::string before) {
     return true;
 }
 
-std::string infer_type_from_new_expression(const std::string& text) {
+std::string infer_type_from_new_expression(std::string_view text) {
     size_t pos = text.find("new");
     while (pos != std::string::npos) {
         bool left_ok = (pos == 0) || !is_identifier_char(text[pos - 1]);
@@ -199,7 +199,7 @@ std::string infer_type_from_new_expression(const std::string& text) {
                    (is_identifier_char(text[end]) || text[end] == '.' || text[end] == ':')) {
                 ++end;
             }
-            auto type = normalize_type_hint(text.substr(start, end - start));
+            auto type = normalize_type_hint(std::string(text.substr(start, end - start)));
             if (!type.empty()) return type;
         }
         pos = text.find("new", pos + 3);
@@ -207,7 +207,7 @@ std::string infer_type_from_new_expression(const std::string& text) {
     return "";
 }
 
-std::string infer_type_from_destructured_annotation(const std::string& text,
+std::string infer_type_from_destructured_annotation(std::string_view text,
                                                     const std::string& declared_name,
                                                     size_t name_end) {
     size_t after_name = skip_inline_whitespace(text, name_end);
@@ -238,7 +238,7 @@ std::string infer_type_from_destructured_annotation(const std::string& text,
     return "";
 }
 
-std::string infer_type_from_declaration_text(const std::string& text, const std::string& receiver) {
+std::string infer_type_from_declaration_text(std::string_view text, const std::string& receiver) {
     std::string declared_name = declaration_name_from_receiver(receiver);
     if (declared_name.empty()) return "";
 
@@ -249,14 +249,14 @@ std::string infer_type_from_declaration_text(const std::string& text, const std:
         bool right_ok = (end >= text.size()) || !is_identifier_char(text[end]);
         if (left_ok && right_ok) {
             size_t context_start = declaration_context_start(text, pos);
-            std::string before = text.substr(context_start, pos - context_start);
-            bool prefix_allowed = declaration_prefix_allows_receiver(before);
+            std::string_view before = text.substr(context_start, pos - context_start);
+            bool prefix_allowed = declaration_prefix_allows_receiver(std::string(before));
             size_t prev_sig = previous_significant_char(text, pos);
             bool empty_prefix_has_anchor =
                 prev_sig != std::string::npos &&
                 (text[prev_sig] == '(' || text[prev_sig] == ',' || text[prev_sig] == '[');
 
-            if (prefix_allowed && (!trim_copy(before).empty() || empty_prefix_has_anchor)) {
+            if (prefix_allowed && (!trim_copy(std::string(before)).empty() || empty_prefix_has_anchor)) {
                 size_t next = skip_inline_whitespace(text, end);
                 if (next < text.size() && text[next] == '?') {
                     next = skip_inline_whitespace(text, next + 1);
@@ -1210,8 +1210,11 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
     std::string declaration_name = declaration_name_from_receiver(receiver);
     if (!declaration_name.empty() && receiver != "this" && receiver != "self") {
         uint32_t call_start = ts_node_start_byte(node);
-        size_t window_start = call_start > 65536 ? call_start - 65536 : 0;
-        std::string prefix = source_->substr(window_start, call_start - window_start);
+        // 8KB window: type declarations are almost always within 200 lines of the call.
+        // 64KB caused cumulative heap pressure crashing the indexer after ~2400 TS files.
+        static constexpr size_t kReceiverTypeWindow = 8192;
+        size_t window_start = call_start > kReceiverTypeWindow ? call_start - kReceiverTypeWindow : 0;
+        std::string_view prefix(source_->data() + window_start, call_start - window_start);
         receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
         if (receiver_type_hint.empty() && declaration_name[0] != '_') {
             std::string alt_receiver = receiver;

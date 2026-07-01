@@ -574,6 +574,13 @@ int run_index(const Config& config) {
         // Fresh parser per file — parser reuse (DEC-039 OPT-5) reverted per DEC-038/039.
         // Tree-sitter parsers cache internal buffers from the arena; reusing across
         // arena boundaries causes dangling pointers and heap corruption at high throughput.
+        //
+        // IMPORTANT: Parser is wrapped in a nested scope so ts_parser_delete() runs
+        // while the arena is still active. If set_thread_arena(nullptr) is called first
+        // and ts_parser_delete() then tries to allocate/realloc (e.g. cleanup tables),
+        // ts_arena_malloc returns nullptr → SIGSEGV. The nested scope ensures the
+        // Parser destructor fires before any set_thread_arena(nullptr) call.
+        {
         Parser parser;
         if (!parser.set_language(file.language)) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
@@ -637,6 +644,8 @@ int run_index(const Config& config) {
         // arena-allocated tree internals. Must happen before ArenaLease
         // releases the arena back to the pool (where it gets reset).
         tree = TreeGuard(nullptr);
+
+        } // end Parser scope — ts_parser_delete() runs here, arena still active
 
         // Mark slot idle now that both parse + extract are done.
         slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
