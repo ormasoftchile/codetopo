@@ -159,6 +159,8 @@ int run_index(const Config& config) {
         std::cerr << "ERROR: Schema version mismatch (exit code 3)\n";
         return 3;
     }
+    schema::ensure_nodes_fingerprint_schema(conn);
+    schema::set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     // FTS triggers created later — after bulk inserts for performance
 
     // Ensure quarantine table exists (additive migration)

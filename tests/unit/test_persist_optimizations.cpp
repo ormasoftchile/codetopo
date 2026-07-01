@@ -178,6 +178,26 @@ TEST_CASE("OPT-1: Warm index (cold_index=false) still executes DELETE", "[persis
     cleanup(tmp);
 }
 
+TEST_CASE("Persist stores symbol fingerprints when present", "[unit][persist_opt][fingerprint]") {
+    auto tmp = make_test_dir("test_persist_symbol_fingerprint");
+    auto db_path = tmp / "fingerprint.sqlite";
+
+    {
+        Connection conn(db_path);
+        schema::ensure_schema(conn);
+
+        Persister persister(conn);
+        auto file = make_scanned_file("src/fingerprint.cpp");
+        ExtractionResult extraction = make_extraction_with_symbols(1, "fp");
+        extraction.symbols[0].fingerprint = std::string(128, 'a');
+
+        REQUIRE(persister.persist_file(file, extraction, "hash-fp", "ok"));
+        REQUIRE(count_query(conn,
+            "SELECT COUNT(*) FROM nodes WHERE fingerprint = '" + std::string(128, 'a') + "'") == 1);
+    }
+    cleanup(tmp);
+}
+
 TEST_CASE("Force clear truncates main-project index but keeps metadata", "[unit][persist_opt][force]") {
     auto tmp = make_test_dir("test_force_clear_main_only");
     auto db_path = tmp / "force_main.sqlite";

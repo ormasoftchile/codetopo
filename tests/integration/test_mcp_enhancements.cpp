@@ -11,6 +11,7 @@
 // Tests written RED (pre-implementation) — will pass once Booch lands enhancements.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 #include "db/connection.h"
 #include "db/schema.h"
 #include "db/fts.h"
@@ -323,6 +324,62 @@ TEST_CASE("find_implementations: nonexistent symbol returns not_found error",
                           const_cast<Connection&>(conn), cache, repo_root);
         // Implementation returns not_found when base type doesn't exist
         REQUIRE(result.find("not_found") != std::string::npos);
+    }
+    fs::remove_all(db_path.parent_path());
+}
+
+TEST_CASE("find_similar: returns near-duplicate functions sorted by similarity",
+          "[integration][enhance]") {
+    auto [db_path, ids] = create_rich_db();
+    {
+        Connection conn(db_path);
+        conn.exec(
+            "UPDATE nodes SET fingerprint = "
+            "'0000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f00000010' "
+            "WHERE id = " + std::to_string(ids.main_fn));
+        conn.exec(
+            "UPDATE nodes SET fingerprint = "
+            "'0000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f00000010' "
+            "WHERE id = " + std::to_string(ids.helper_fn));
+        conn.exec(
+            "UPDATE nodes SET fingerprint = "
+            "'000000010000000200000003000000040000000500000006000000070000000800000099000000980000000b0000000c0000000d0000000e0000000f00000010' "
+            "WHERE id = " + std::to_string(ids.fetch));
+        conn.exec(
+            "UPDATE nodes SET fingerprint = "
+            "'ffffffffeeeeeeeeddddddddccccccccbbbbbbbbaaaaaaaa99999999888888887777777766666666555555554444444433333333222222221111111100000000' "
+            "WHERE id = " + std::to_string(ids.bark));
+        conn.wal_checkpoint();
+    }
+    {
+        Connection conn(db_path, true);
+        QueryCache cache(conn);
+        auto repo_root = schema::get_kv(const_cast<Connection&>(conn), "repo_root");
+
+        auto params_str = "{\"node_id\": " + std::to_string(ids.main_fn) + ", \"threshold\": 0.8, \"limit\": 5}";
+        auto params_doc = json_parse(params_str);
+
+        auto result = tools::find_similar(params_doc.root(),
+                          const_cast<Connection&>(conn), cache, repo_root);
+        auto doc = json_parse(result);
+        REQUIRE(doc);
+
+        auto* target = yyjson_obj_get(doc.root(), "target");
+        REQUIRE(target != nullptr);
+        CHECK(json_get_int(target, "node_id") == ids.main_fn);
+
+        auto* similar = yyjson_obj_get(doc.root(), "similar");
+        REQUIRE(similar != nullptr);
+        REQUIRE(yyjson_arr_size(similar) == 2);
+
+        auto* first = yyjson_arr_get(similar, 0);
+        auto* second = yyjson_arr_get(similar, 1);
+        REQUIRE(first != nullptr);
+        REQUIRE(second != nullptr);
+        CHECK(std::string(json_get_str(first, "name")) == "helper");
+        CHECK(json_get_double(first, "similarity") == Catch::Approx(1.0));
+        CHECK(std::string(json_get_str(second, "name")) == "fetch");
+        CHECK(json_get_double(second, "similarity") == Catch::Approx(14.0 / 16.0));
     }
     fs::remove_all(db_path.parent_path());
 }

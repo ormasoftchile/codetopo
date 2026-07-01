@@ -1,10 +1,14 @@
 #include "index/extractor.h"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
+#include <functional>
 #include <fstream>
-#include <sstream>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -36,6 +40,15 @@ bool is_nested_function_boundary(const std::string& type) {
            type == "function_declaration" || type == "generator_function" ||
            type == "generator_function_declaration" || type == "method_definition";
 }
+
+static constexpr std::array<uint64_t, 16> kMinHashSeeds = {{
+    0x9e3779b97f4a7c15ULL, 0x6c62272e07bb0142ULL, 0x94d049bb133111ebULL,
+    0xbf58476d1ce4e5b9ULL, 0xd2a98b26625eee7bULL, 0x17f4fce5a5f5f8f0ULL,
+    0x3c6ef372fe94f82bULL, 0x82cbc74a3c965d9eULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL,
+    0x5be0cd19137e2179ULL, 0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
+    0x3956c25bf348b538ULL
+}};
 
 bool starts_with_uppercase_ascii(const std::string& name) {
     return !name.empty() && std::isupper(static_cast<unsigned char>(name[0])) != 0;
@@ -301,6 +314,74 @@ TSNode find_argument_list_node(TSNode call_node) {
 std::string lower_ascii(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+bool is_function_like_kind(const std::string& kind) {
+    return kind == "function" || kind == "method" || kind == "constructor_fn";
+}
+
+TSNode find_body_by_field(TSNode node) {
+    static constexpr const char* kFields[] = {"body", "consequence"};
+    for (const char* field : kFields) {
+        TSNode body = ts_node_child_by_field_name(node, field, static_cast<uint32_t>(std::strlen(field)));
+        if (!ts_node_is_null(body)) return body;
+    }
+    return TSNode{};
+}
+
+TSNode find_function_body_node(TSNode node) {
+    if (ts_node_is_null(node)) return TSNode{};
+
+    TSNode body = find_body_by_field(node);
+    if (!ts_node_is_null(body)) return body;
+
+    std::string type = ts_node_type(node);
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; ++i) {
+        TSNode child = ts_node_named_child(node, i);
+        if (!ts_node_is_named(child)) continue;
+
+        std::string child_type = ts_node_type(child);
+        if (child_type == "statement_block" || child_type == "compound_statement" ||
+            child_type == "block" || child_type == "body" ||
+            child_type == "declaration_list") {
+            return child;
+        }
+    }
+
+    if (type == "function_expression" || type == "arrow_function") {
+        return node;
+    }
+
+    return TSNode{};
+}
+
+std::string normalize_leaf_type(TSNode node) {
+    std::string type = lower_ascii(ts_node_type(node));
+    if (type.find("identifier") != std::string::npos || type == "shorthand_property_identifier_pattern")
+        return "I";
+    if (type.find("string") != std::string::npos)
+        return "S";
+    if (type.find("number") != std::string::npos || type.find("integer") != std::string::npos ||
+        type.find("float") != std::string::npos)
+        return "N";
+    if (type.find("type") != std::string::npos)
+        return "T";
+    return type.substr(0, std::min<size_t>(4, type.size()));
+}
+
+void collect_leaf_tokens(TSNode node, std::vector<std::string>& tokens) {
+    if (ts_node_is_null(node) || !ts_node_is_named(node)) return;
+
+    uint32_t named_count = ts_node_named_child_count(node);
+    if (named_count == 0) {
+        tokens.push_back(normalize_leaf_type(node));
+        return;
+    }
+
+    for (uint32_t i = 0; i < named_count; ++i) {
+        collect_leaf_tokens(ts_node_named_child(node, i), tokens);
+    }
 }
 
 std::string classify_argument(TSNode arg, const std::string& source) {
@@ -690,7 +771,8 @@ std::string Extractor::extract_leading_comment(TSNode node) {
 void Extractor::add_symbol(const std::string& kind, const std::string& name,
                             TSNode node, const std::string& qualname,
                             const std::string& signature,
-                            const std::string& visibility) {
+                            const std::string& visibility,
+                            TSNode fingerprint_node) {
     if (name.empty()) return;
     if (++symbol_count_ > max_symbols_) {
         result_->truncated = true;
@@ -703,7 +785,7 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
 
     std::string doc_comment = extract_leading_comment(node);
     std::string sig = signature;
-    if (sig.empty() && (kind == "function" || kind == "method" || kind == "constructor_fn")) {
+    if (sig.empty() && is_function_like_kind(kind)) {
         sig = node_text(node);
         size_t body = sig.find('{');
         if (body != std::string::npos) sig = sig.substr(0, body);
@@ -721,13 +803,53 @@ void Extractor::add_symbol(const std::string& kind, const std::string& name,
         sig = collapsed;
     }
 
+    std::string fingerprint;
+    if (is_function_like_kind(kind)) {
+        fingerprint = compute_fingerprint(ts_node_is_null(fingerprint_node) ? node : fingerprint_node);
+    }
+
     result_->symbols.push_back({
         kind, name, qualname.empty() ? name : qualname,
-        sig,
+        sig, fingerprint,
         static_cast<int>(start.row + 1), static_cast<int>(start.column),
         static_cast<int>(end.row + 1), static_cast<int>(end.column),
         true, visibility, doc_comment, ""
     });
+}
+
+std::string Extractor::compute_fingerprint(TSNode node) {
+    TSNode body = find_function_body_node(node);
+    if (ts_node_is_null(body)) return "";
+
+    std::vector<std::string> tokens;
+    collect_leaf_tokens(body, tokens);
+    if (tokens.size() < 30 || tokens.size() < 3) return "";
+
+    std::vector<std::string> trigrams;
+    trigrams.reserve(tokens.size() - 2);
+    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
+        trigrams.push_back(tokens[i] + "|" + tokens[i + 1] + "|" + tokens[i + 2]);
+    }
+    if (trigrams.empty()) return "";
+
+    std::array<uint32_t, kMinHashSeeds.size()> mins;
+    mins.fill(std::numeric_limits<uint32_t>::max());
+    std::hash<std::string> hasher;
+
+    for (const auto& trigram : trigrams) {
+        for (size_t i = 0; i < kMinHashSeeds.size(); ++i) {
+            uint32_t value = static_cast<uint32_t>(
+                hasher(trigram + std::to_string(kMinHashSeeds[i])) & 0xFFFFFFFFULL);
+            mins[i] = std::min(mins[i], value);
+        }
+    }
+
+    std::ostringstream out;
+    out << std::hex << std::nouppercase << std::setfill('0');
+    for (uint32_t value : mins) {
+        out << std::setw(8) << value;
+    }
+    return out.str();
 }
 
 void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode node,
@@ -1068,7 +1190,7 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
 
         std::string constructor_qn = parent_qn.empty() ? name : parent_qn + "." + name;
         int constructor_idx = static_cast<int>(result_->symbols.size());
-        add_symbol("constructor_fn", name, symbol_node, constructor_qn);
+        add_symbol("constructor_fn", name, symbol_node, constructor_qn, "", "", function_node);
         if (static_cast<int>(result_->symbols.size()) <= constructor_idx) return true;
 
         for (const auto& assignment : this_assignments) {

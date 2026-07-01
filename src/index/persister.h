@@ -280,7 +280,7 @@ public:
                         for (int r = 0; r < SYMBOL_BATCH_SIZE; ++r) {
                             int idx = c * SYMBOL_BATCH_SIZE + r;
                             const auto& sym = extraction.symbols[idx];
-                            int base_param = r * 13 + 1;  // 13 params per symbol
+                            int base_param = r * 14 + 1;  // 14 params per symbol
 
                             sqlite3_bind_int64(stmt_batch_insert_symbol_, base_param + 0, file_id);
                             sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 1, sym.kind.c_str(), -1, SQLITE_STATIC);
@@ -288,16 +288,18 @@ public:
                             sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 3, sym.qualname.c_str(), -1, SQLITE_STATIC);
                             if (sym.signature.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 4);
                             else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 4, sym.signature.c_str(), -1, SQLITE_STATIC);
-                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 5, sym.start_line);
-                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 6, sym.start_col);
-                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 7, sym.end_line);
-                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 8, sym.end_col);
-                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 9, sym.is_definition ? 1 : 0);
-                            if (sym.visibility.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 10);
-                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 10, sym.visibility.c_str(), -1, SQLITE_STATIC);
-                            if (sym.doc.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 11);
-                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 11, sym.doc.c_str(), -1, SQLITE_STATIC);
-                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 12, sym.stable_key.c_str(), -1, SQLITE_STATIC);
+                            if (sym.fingerprint.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 5);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 5, sym.fingerprint.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 6, sym.start_line);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 7, sym.start_col);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 8, sym.end_line);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 9, sym.end_col);
+                            sqlite3_bind_int(stmt_batch_insert_symbol_, base_param + 10, sym.is_definition ? 1 : 0);
+                            if (sym.visibility.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 11);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 11, sym.visibility.c_str(), -1, SQLITE_STATIC);
+                            if (sym.doc.empty()) sqlite3_bind_null(stmt_batch_insert_symbol_, base_param + 12);
+                            else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 12, sym.doc.c_str(), -1, SQLITE_STATIC);
+                            sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 13, sym.stable_key.c_str(), -1, SQLITE_STATIC);
                         }
                         sqlite3_step(stmt_batch_insert_symbol_);
                         // Compute IDs arithmetically: last_insert_rowid is the LAST row's ID
@@ -321,16 +323,18 @@ public:
                     sqlite3_bind_text(stmt_insert_symbol_, 4, sym.qualname.c_str(), -1, SQLITE_STATIC);
                     if (sym.signature.empty()) sqlite3_bind_null(stmt_insert_symbol_, 5);
                     else sqlite3_bind_text(stmt_insert_symbol_, 5, sym.signature.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_int(stmt_insert_symbol_, 6, sym.start_line);
-                    sqlite3_bind_int(stmt_insert_symbol_, 7, sym.start_col);
-                    sqlite3_bind_int(stmt_insert_symbol_, 8, sym.end_line);
-                    sqlite3_bind_int(stmt_insert_symbol_, 9, sym.end_col);
-                    sqlite3_bind_int(stmt_insert_symbol_, 10, sym.is_definition ? 1 : 0);
-                    if (sym.visibility.empty()) sqlite3_bind_null(stmt_insert_symbol_, 11);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 11, sym.visibility.c_str(), -1, SQLITE_STATIC);
-                    if (sym.doc.empty()) sqlite3_bind_null(stmt_insert_symbol_, 12);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 12, sym.doc.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_text(stmt_insert_symbol_, 13, sym.stable_key.c_str(), -1, SQLITE_STATIC);
+                    if (sym.fingerprint.empty()) sqlite3_bind_null(stmt_insert_symbol_, 6);
+                    else sqlite3_bind_text(stmt_insert_symbol_, 6, sym.fingerprint.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_int(stmt_insert_symbol_, 7, sym.start_line);
+                    sqlite3_bind_int(stmt_insert_symbol_, 8, sym.start_col);
+                    sqlite3_bind_int(stmt_insert_symbol_, 9, sym.end_line);
+                    sqlite3_bind_int(stmt_insert_symbol_, 10, sym.end_col);
+                    sqlite3_bind_int(stmt_insert_symbol_, 11, sym.is_definition ? 1 : 0);
+                    if (sym.visibility.empty()) sqlite3_bind_null(stmt_insert_symbol_, 12);
+                    else sqlite3_bind_text(stmt_insert_symbol_, 12, sym.visibility.c_str(), -1, SQLITE_STATIC);
+                    if (sym.doc.empty()) sqlite3_bind_null(stmt_insert_symbol_, 13);
+                    else sqlite3_bind_text(stmt_insert_symbol_, 13, sym.doc.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_bind_text(stmt_insert_symbol_, 14, sym.stable_key.c_str(), -1, SQLITE_STATIC);
 
                     sqlite3_step(stmt_insert_symbol_);
                     symbol_ids.push_back(sqlite3_last_insert_rowid(conn_.raw()));
@@ -935,9 +939,9 @@ private:
             "VALUES('file', NULL, 'file', ?, ?)", -1, &stmt_insert_file_node_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
-            "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
+            "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, fingerprint, "
             "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
-            "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_symbol_, nullptr);
+            "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_symbol_, nullptr);
 
         sqlite3_prepare_v2(conn_.raw(),
             "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id, "
@@ -980,13 +984,13 @@ private:
     void ensure_batch_symbol_stmt() {
         if (stmt_batch_insert_symbol_) return;
 
-        // 100-row batch: 13 params/row * 100 = 1300 params (< 32766 limit)
+        // 100-row batch: 14 params/row * 100 = 1400 params (< 32766 limit)
         const int SYMBOL_BATCH_SIZE = 100;
-        std::string sql = "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, "
+        std::string sql = "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, fingerprint, "
             "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) VALUES ";
         for (int i = 0; i < SYMBOL_BATCH_SIZE; ++i) {
             if (i > 0) sql += ",";
-            sql += "('symbol',?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            sql += "('symbol',?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         }
         sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_symbol_, nullptr);
     }

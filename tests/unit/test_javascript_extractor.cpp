@@ -258,3 +258,29 @@ class Holder {
     REQUIRE(class_field != result.refs.end());
     CHECK(class_field->receiver_type_hint == "SavedObjectsRepository");
 }
+
+TEST_CASE("TypeScript extractor computes MinHash fingerprints for large functions",
+          "[unit][typescript][extractor]") {
+    std::string source = R"(function doWork(items: Item[], prefix: string) {
+  const results: string[] = [];
+  for (const item of items) {
+    const id = item.id;
+    const label = prefix + ":" + item.name;
+    const count = item.count + 1;
+    const active = item.enabled ? "yes" : "no";
+    const payload = { id, label, count, active };
+    if (count > 10) {
+      results.push(JSON.stringify(payload));
+    } else {
+      results.push(label + "-" + String(count));
+    }
+    console.log(id, label, count, active);
+  }
+  return results.join(",");
+})";
+
+    auto result = extract_typescript_for_test(source);
+    auto* fn = find_symbol(result, "function", "doWork");
+    REQUIRE(fn != nullptr);
+    CHECK(fn->fingerprint.size() == 16 * 8);
+}

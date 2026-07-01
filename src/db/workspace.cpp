@@ -732,14 +732,17 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     log_workspace_line("copying nodes...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
-    prepare_or_throw(conn_.raw(), &stmt,
+    bool src_has_fingerprint = attached_table_has_column(conn_.raw(), "src", "nodes", "fingerprint");
+    std::string node_sql =
         "INSERT INTO nodes (id, node_type, file_id, kind, name, qualname, signature, "
-        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
+        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, fingerprint, stable_key) "
         "SELECT (? + id), node_type, "
         "CASE WHEN file_id IS NOT NULL THEN (? + file_id) ELSE NULL END, "
         "kind, name, qualname, signature, start_line, start_col, end_line, end_col, "
-        "is_definition, visibility, doc, (? || ':' || stable_key) "
-        "FROM src.nodes");
+        "is_definition, visibility, doc, ";
+    node_sql += src_has_fingerprint ? "fingerprint" : "NULL";
+    node_sql += ", (? || ':' || stable_key) FROM src.nodes";
+    prepare_or_throw(conn_.raw(), &stmt, node_sql);
     sqlite3_bind_int64(stmt, 1, offset);
     sqlite3_bind_int64(stmt, 2, offset);
     std::string root_id_prefix = std::to_string(root_id);
