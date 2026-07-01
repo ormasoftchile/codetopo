@@ -18,7 +18,8 @@ namespace codetopo {
 // Schema version 8 = contentless symbol FTS with camelCase-aware name indexing.
 // Schema version 9 = refs.kind allows protocol refs such as http_call.
 // Schema version 10 = symbol fingerprints for near-duplicate detection.
-static constexpr int CURRENT_SCHEMA_VERSION = 10;
+// Schema version 11 = semantic symbol embeddings in node_vectors.
+static constexpr int CURRENT_SCHEMA_VERSION = 11;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
@@ -151,6 +152,14 @@ inline void create_tables(Connection& conn) {
         CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname);
         CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type);
         CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL;
+    )SQL");
+
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS node_vectors (
+            node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+            embedding BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_vectors_node ON node_vectors(node_id);
     )SQL");
 
     conn.exec(R"SQL(
@@ -387,6 +396,7 @@ inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_nodes_qualname");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_name_type");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_fingerprint");
+    conn.exec("DROP INDEX IF EXISTS idx_node_vectors_node");
     conn.exec("DROP INDEX IF EXISTS idx_refs_file_id");
     conn.exec("DROP INDEX IF EXISTS idx_refs_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_refs_resolved");
@@ -406,6 +416,7 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_node_vectors_node ON node_vectors(node_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
@@ -524,6 +535,17 @@ inline int ensure_schema(Connection& conn) {
         version = 10;
     }
 
+    // v10→v11: add semantic symbol embedding storage.
+    if (version == 10) {
+        conn.exec(
+            "CREATE TABLE IF NOT EXISTS node_vectors ("
+            "  node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,"
+            "  embedding BLOB NOT NULL"
+            ")");
+        conn.exec("CREATE INDEX IF NOT EXISTS idx_node_vectors_node ON node_vectors(node_id)");
+        version = 11;
+    }
+
     if (version == CURRENT_SCHEMA_VERSION) {
         if (recreate_nodes_fts) {
             create_fts(conn);
@@ -541,6 +563,7 @@ inline int ensure_schema(Connection& conn) {
     conn.exec("DROP TABLE IF EXISTS content_fts_tracker");
     conn.exec("DROP TABLE IF EXISTS content_fts");
     conn.exec("DROP TABLE IF EXISTS nodes_fts");
+    conn.exec("DROP TABLE IF EXISTS node_vectors");
     conn.exec("DROP TABLE IF EXISTS edges");
     conn.exec("DROP TABLE IF EXISTS refs");
     conn.exec("DROP TABLE IF EXISTS nodes");

@@ -6,6 +6,7 @@
 #include "util/path.h"
 #include "util/git.h"
 #include "util/process.h"
+#include "semantic/token_vectors.h"
 #include "mcp/error.h"
 #include "db/schema.h"
 #include <sqlite3.h>
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <queue>
 #include <cctype>
 #include <cstdlib>
 #include <cmath>
@@ -54,6 +56,33 @@ static bool include_field(const std::unordered_set<std::string>& fields_set,
 
 static size_t cstr_len(const char* s) {
     return s ? std::strlen(s) : 0;
+}
+
+static std::string tool_error_json(const std::string& message);
+
+static TokenVectorTable* get_token_vector_table(const std::string& repo_root) {
+    static std::mutex mu;
+    static std::unique_ptr<TokenVectorTable> table;
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (table && table->ready()) return table.get();
+
+    if (!table) table = std::make_unique<TokenVectorTable>();
+    *table = TokenVectorTable();
+    for (const auto& [bin_path, txt_path] :
+         semantic::token_vector_candidate_paths(repo_root, get_self_executable_path())) {
+        if (table->load(bin_path, txt_path)) break;
+    }
+    return table.get();
+}
+
+static std::string semantic_not_ready_json(const std::string& message) {
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", false);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "error", message.c_str());
+    return doc.to_string();
 }
 
 static constexpr const char* kPublicSymbolSql =
@@ -3057,6 +3086,221 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    return doc.to_string();
+}
+
+std::string symbol_search_semantic(yyjson_val* params, Connection& conn,
+                                  QueryCache& /*cache*/, const std::string& repo_root) {
+    const char* query = params ? json_get_str(params, "query") : nullptr;
+    if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
+
+    int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
+    if (limit < 1) limit = 1;
+    if (limit > 100) limit = 100;
+
+    double min_similarity = params ? json_get_double(params, "min_similarity", 0.5) : 0.5;
+    if (min_similarity < 0.0 || min_similarity > 1.0) {
+        return McpError::invalid_input("Invalid 'min_similarity': must be between 0.0 and 1.0")
+            .to_json_rpc(0);
+    }
+
+    const char* kind = params ? json_get_str(params, "kind") : nullptr;
+    TokenVectorTable* tvt = get_token_vector_table(repo_root);
+    if (!tvt || !tvt->ready()) {
+        return semantic_not_ready_json(
+            "Embedding table not found. Run tools/gen_token_vectors.py first.");
+    }
+
+    auto query_embedding = tvt->embed(query);
+    if (query_embedding.empty()) {
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        auto* results = doc.new_arr();
+        doc.set_root(root);
+        yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", true);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "query", query);
+        yyjson_mut_obj_add_val(doc.doc, root, "results", results);
+        yyjson_mut_obj_add_int(doc.doc, root, "total_scanned", 0);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "error",
+                                 "Query tokens were not found in the embedding vocabulary.");
+        return doc.to_string();
+    }
+
+    std::string count_sql = "SELECT COUNT(*) FROM node_vectors nv "
+                            "JOIN nodes n ON n.id = nv.node_id";
+    std::string scan_sql =
+        "SELECT nv.node_id, nv.embedding, n.name, n.kind, n.qualname, f.path, n.start_line "
+        "FROM node_vectors nv "
+        "JOIN nodes n ON n.id = nv.node_id "
+        "LEFT JOIN files f ON n.file_id = f.id";
+    if (kind && *kind) {
+        count_sql += " WHERE n.kind = ?";
+        scan_sql += " WHERE n.kind = ?";
+    }
+
+    sqlite3_stmt* count_stmt = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(), count_sql.c_str(), -1, &count_stmt, nullptr) != SQLITE_OK) {
+        return tool_error_json("failed to prepare semantic count query");
+    }
+    if (kind && *kind && count_stmt) sqlite3_bind_text(count_stmt, 1, kind, -1, SQLITE_TRANSIENT);
+    int64_t total_rows = 0;
+    if (count_stmt && sqlite3_step(count_stmt) == SQLITE_ROW) {
+        total_rows = sqlite3_column_int64(count_stmt, 0);
+    }
+    sqlite3_finalize(count_stmt);
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(conn.raw(), scan_sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK || !stmt) {
+        if (stmt) sqlite3_finalize(stmt);
+        return tool_error_json("failed to prepare semantic scan query");
+    }
+    if (kind && *kind) sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT);
+
+    struct SemanticResult {
+        int64_t node_id = 0;
+        std::string name;
+        std::string kind;
+        std::string qualname;
+        std::string file;
+        int line = 0;
+        float similarity = 0.0f;
+    };
+    struct DotCandidate {
+        int32_t dot = 0;
+        std::vector<int8_t> embedding;
+        SemanticResult meta;
+    };
+    struct BySimilarityAsc {
+        bool operator()(const SemanticResult& a, const SemanticResult& b) const {
+            return a.similarity > b.similarity;
+        }
+    };
+    struct ByDotAsc {
+        bool operator()(const DotCandidate& a, const DotCandidate& b) const {
+            return a.dot > b.dot;
+        }
+    };
+
+    const bool two_stage = total_rows > 500000;
+    const size_t shortlist_size = static_cast<size_t>((std::max<int64_t>)(200, limit * 4));
+    std::priority_queue<SemanticResult, std::vector<SemanticResult>, BySimilarityAsc> top_results;
+    std::priority_queue<DotCandidate, std::vector<DotCandidate>, ByDotAsc> shortlist;
+    int64_t scanned = 0;
+
+    auto row_to_result = [&](sqlite3_stmt* row) {
+        SemanticResult result;
+        result.node_id = sqlite3_column_int64(row, 0);
+        if (const auto* text = sqlite3_column_text(row, 2))
+            result.name = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 3))
+            result.kind = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 4))
+            result.qualname = reinterpret_cast<const char*>(text);
+        if (const auto* text = sqlite3_column_text(row, 5))
+            result.file = reinterpret_cast<const char*>(text);
+        result.line = sqlite3_column_int(row, 6);
+        return result;
+    };
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const void* blob_ptr = sqlite3_column_blob(stmt, 1);
+        int blob_size = sqlite3_column_bytes(stmt, 1);
+        if (!blob_ptr || blob_size != TokenVectorTable::DIM) continue;
+
+        const int8_t* embedding = static_cast<const int8_t*>(blob_ptr);
+        ++scanned;
+
+        if (!two_stage) {
+            float similarity = TokenVectorTable::cosine(query_embedding.data(), embedding,
+                                                       TokenVectorTable::DIM);
+            if (similarity < min_similarity) continue;
+            SemanticResult result = row_to_result(stmt);
+            result.similarity = similarity;
+            if (top_results.size() < static_cast<size_t>(limit)) {
+                top_results.push(std::move(result));
+            } else if (similarity > top_results.top().similarity) {
+                top_results.pop();
+                top_results.push(std::move(result));
+            }
+            continue;
+        }
+
+        int32_t dot = 0;
+        for (int i = 0; i < TokenVectorTable::DIM; ++i) {
+            dot += static_cast<int32_t>(query_embedding[i]) * static_cast<int32_t>(embedding[i]);
+        }
+        DotCandidate candidate;
+        candidate.dot = dot;
+        candidate.embedding.assign(embedding, embedding + TokenVectorTable::DIM);
+        candidate.meta = row_to_result(stmt);
+        if (shortlist.size() < shortlist_size) {
+            shortlist.push(std::move(candidate));
+        } else if (dot > shortlist.top().dot) {
+            shortlist.pop();
+            shortlist.push(std::move(candidate));
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    if (two_stage) {
+        std::vector<DotCandidate> candidates;
+        candidates.reserve(shortlist.size());
+        while (!shortlist.empty()) {
+            candidates.push_back(std::move(shortlist.top()));
+            shortlist.pop();
+        }
+        for (auto& candidate : candidates) {
+            candidate.meta.similarity = TokenVectorTable::cosine(
+                query_embedding.data(), candidate.embedding.data(), TokenVectorTable::DIM);
+            if (candidate.meta.similarity < min_similarity) continue;
+            if (top_results.size() < static_cast<size_t>(limit)) {
+                top_results.push(std::move(candidate.meta));
+            } else if (candidate.meta.similarity > top_results.top().similarity) {
+                top_results.pop();
+                top_results.push(std::move(candidate.meta));
+            }
+        }
+    }
+
+    std::vector<SemanticResult> ordered;
+    ordered.reserve(top_results.size());
+    while (!top_results.empty()) {
+        ordered.push_back(std::move(top_results.top()));
+        top_results.pop();
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const SemanticResult& a, const SemanticResult& b) {
+                  if (a.similarity != b.similarity) return a.similarity > b.similarity;
+                  if (a.name != b.name) return a.name < b.name;
+                  if (a.file != b.file) return a.file < b.file;
+                  return a.line < b.line;
+              });
+
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    auto* results = doc.new_arr();
+    doc.set_root(root);
+    yyjson_mut_obj_add_bool(doc.doc, root, "semantic_ready", true);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "query", query);
+    yyjson_mut_obj_add_int(doc.doc, root, "total_scanned", scanned);
+
+    for (const auto& result : ordered) {
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", result.node_id);
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "name", result.name.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", result.kind.c_str());
+        if (!result.qualname.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", result.qualname.c_str());
+        }
+        if (!result.file.empty()) {
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "file", result.file.c_str());
+        }
+        yyjson_mut_obj_add_int(doc.doc, item, "line", result.line);
+        yyjson_mut_obj_add_real(doc.doc, item, "similarity", result.similarity);
+        yyjson_mut_arr_append(results, item);
+    }
+
+    yyjson_mut_obj_add_val(doc.doc, root, "results", results);
     return doc.to_string();
 }
 

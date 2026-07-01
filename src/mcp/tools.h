@@ -38,6 +38,10 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
 std::string symbol_search(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root);
 
+// T062d: symbol_search_semantic — semantic symbol lookup using token embeddings
+std::string symbol_search_semantic(yyjson_val* params, Connection& conn,
+                                   QueryCache& cache, const std::string& repo_root);
+
 // T062b: symbol_list — list/filter symbols without FTS
 std::string symbol_list(yyjson_val* params, Connection& conn,
                         QueryCache& cache, const std::string& repo_root);
