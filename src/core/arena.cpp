@@ -1,5 +1,6 @@
 #include "core/arena.h"
 #include <tree_sitter/api.h>
+#include <cstdlib>
 
 namespace codetopo {
 
@@ -17,6 +18,9 @@ Arena* get_thread_arena() {
 }
 
 // C-linkage wrappers for ts_set_allocator()
+// IMPORTANT: tree-sitter may call these outside of a parse (e.g. lazy grammar
+// table initialization triggered by new syntax patterns). When no arena is set,
+// fall back to the system allocator so we don't return nullptr and crash.
 static void* ts_arena_malloc(size_t size) {
     if (!t_current_arena) return nullptr;
     return arena_malloc(*t_current_arena, size);

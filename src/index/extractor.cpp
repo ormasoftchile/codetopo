@@ -371,16 +371,29 @@ std::string normalize_leaf_type(TSNode node) {
 }
 
 void collect_leaf_tokens(TSNode node, std::vector<std::string>& tokens) {
-    if (ts_node_is_null(node) || !ts_node_is_named(node)) return;
+    // Iterative DFS to avoid stack overflow on deeply nested ASTs.
+    // A recursive version crashes on large C# methods with deep generic nesting.
+    struct Frame { TSNode node; uint32_t next_child; };
+    std::vector<Frame> stack;
+    stack.reserve(256);
+    if (!ts_node_is_null(node) && ts_node_is_named(node))
+        stack.push_back({node, 0});
 
-    uint32_t named_count = ts_node_named_child_count(node);
-    if (named_count == 0) {
-        tokens.push_back(normalize_leaf_type(node));
-        return;
-    }
-
-    for (uint32_t i = 0; i < named_count; ++i) {
-        collect_leaf_tokens(ts_node_named_child(node, i), tokens);
+    while (!stack.empty()) {
+        auto& top = stack.back();
+        uint32_t named_count = ts_node_named_child_count(top.node);
+        if (named_count == 0) {
+            tokens.push_back(normalize_leaf_type(top.node));
+            stack.pop_back();
+            continue;
+        }
+        if (top.next_child >= named_count) {
+            stack.pop_back();
+            continue;
+        }
+        TSNode child = ts_node_named_child(top.node, top.next_child++);
+        if (!ts_node_is_null(child) && ts_node_is_named(child))
+            stack.push_back({child, 0});
     }
 }
 
@@ -823,33 +836,54 @@ std::string Extractor::compute_fingerprint(TSNode node) {
 
     std::vector<std::string> tokens;
     collect_leaf_tokens(body, tokens);
-    if (tokens.size() < 30 || tokens.size() < 3) return "";
+    if (tokens.size() < 30) return "";
 
-    std::vector<std::string> trigrams;
-    trigrams.reserve(tokens.size() - 2);
-    for (size_t i = 0; i + 2 < tokens.size(); ++i) {
-        trigrams.push_back(tokens[i] + "|" + tokens[i + 1] + "|" + tokens[i + 2]);
-    }
-    if (trigrams.empty()) return "";
+    // Use FNV-1a hash with per-seed XOR — zero heap allocations.
+    // Each MinHash value = min over all trigrams of hash(trigram, seed).
+    static constexpr uint32_t FNV_PRIME  = 0x01000193u;
+    static constexpr uint32_t FNV_OFFSET = 0x811c9dc5u;
+
+    auto fnv1a_mix = [](uint32_t h, const char* s, size_t len) -> uint32_t {
+        for (size_t i = 0; i < len; i++) {
+            h ^= static_cast<uint8_t>(s[i]);
+            h *= FNV_PRIME;
+        }
+        return h;
+    };
 
     std::array<uint32_t, kMinHashSeeds.size()> mins;
     mins.fill(std::numeric_limits<uint32_t>::max());
-    std::hash<std::string> hasher;
 
-    for (const auto& trigram : trigrams) {
-        for (size_t i = 0; i < kMinHashSeeds.size(); ++i) {
-            uint32_t value = static_cast<uint32_t>(
-                hasher(trigram + std::to_string(kMinHashSeeds[i])) & 0xFFFFFFFFULL);
-            mins[i] = std::min(mins[i], value);
+    const size_t n = tokens.size();
+    for (size_t i = 0; i + 2 < n; ++i) {
+        const std::string& t0 = tokens[i];
+        const std::string& t1 = tokens[i + 1];
+        const std::string& t2 = tokens[i + 2];
+
+        for (size_t si = 0; si < kMinHashSeeds.size(); ++si) {
+            // Hash: seed bytes → t0 → separator → t1 → separator → t2
+            uint32_t seed32 = static_cast<uint32_t>(kMinHashSeeds[si] & 0xFFFFFFFFu);
+            uint32_t h = FNV_OFFSET ^ seed32;
+            h = fnv1a_mix(h, t0.data(), t0.size());
+            h ^= '|'; h *= FNV_PRIME;
+            h = fnv1a_mix(h, t1.data(), t1.size());
+            h ^= '|'; h *= FNV_PRIME;
+            h = fnv1a_mix(h, t2.data(), t2.size());
+            mins[si] = std::min(mins[si], h);
         }
     }
 
-    std::ostringstream out;
-    out << std::hex << std::nouppercase << std::setfill('0');
+    char buf[kMinHashSeeds.size() * 8 + 1];
+    char* p = buf;
     for (uint32_t value : mins) {
-        out << std::setw(8) << value;
+        static const char hex[] = "0123456789abcdef";
+        *p++ = hex[(value >> 28) & 0xF]; *p++ = hex[(value >> 24) & 0xF];
+        *p++ = hex[(value >> 20) & 0xF]; *p++ = hex[(value >> 16) & 0xF];
+        *p++ = hex[(value >> 12) & 0xF]; *p++ = hex[(value >>  8) & 0xF];
+        *p++ = hex[(value >>  4) & 0xF]; *p++ = hex[(value >>  0) & 0xF];
     }
-    return out.str();
+    *p = '\0';
+    return std::string(buf, kMinHashSeeds.size() * 8);
 }
 
 void Extractor::add_ref(const std::string& kind, const std::string& name, TSNode node,
