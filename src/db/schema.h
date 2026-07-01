@@ -17,7 +17,8 @@ namespace codetopo {
 // Schema version 7 = composite dst/kind/confidence edge index for callers_approx.
 // Schema version 8 = contentless symbol FTS with camelCase-aware name indexing.
 // Schema version 9 = refs.kind allows protocol refs such as http_call.
-static constexpr int CURRENT_SCHEMA_VERSION = 9;
+// Schema version 10 = symbol fingerprints for near-duplicate detection.
+static constexpr int CURRENT_SCHEMA_VERSION = 10;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
@@ -141,6 +142,7 @@ inline void create_tables(Connection& conn) {
             is_definition INTEGER NOT NULL DEFAULT 1,
             visibility TEXT CHECK(visibility IN ('public','protected','private') OR visibility IS NULL),
             doc TEXT,
+            fingerprint TEXT,
             stable_key TEXT NOT NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key);
@@ -148,6 +150,7 @@ inline void create_tables(Connection& conn) {
         CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name);
         CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname);
         CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type);
+        CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL;
     )SQL");
 
     conn.exec(R"SQL(
@@ -185,6 +188,22 @@ inline void create_tables(Connection& conn) {
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence);
+    )SQL");
+
+    conn.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS traces (
+            id INTEGER PRIMARY KEY,
+            caller_name TEXT NOT NULL,
+            callee_name TEXT NOT NULL,
+            call_count INTEGER NOT NULL DEFAULT 1,
+            p50_ms REAL,
+            p99_ms REAL,
+            error_rate REAL,
+            source TEXT,
+            ingested_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_traces_callee ON traces(callee_name);
+        CREATE INDEX IF NOT EXISTS idx_traces_caller ON traces(caller_name);
     )SQL");
 
     conn.exec(R"SQL(
@@ -349,6 +368,14 @@ inline void recreate_refs_table_with_http_call(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
 }
 
+inline void ensure_nodes_fingerprint_schema(Connection& conn) {
+    if (!table_exists(conn, "nodes")) return;
+    if (!table_has_column(conn, "nodes", "fingerprint")) {
+        conn.exec("ALTER TABLE nodes ADD COLUMN fingerprint TEXT");
+    }
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
+}
+
 // Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
 inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
@@ -357,6 +384,7 @@ inline void drop_bulk_indexes(Connection& conn) {
     conn.exec("DROP INDEX IF EXISTS idx_nodes_type_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_qualname");
     conn.exec("DROP INDEX IF EXISTS idx_nodes_name_type");
+    conn.exec("DROP INDEX IF EXISTS idx_nodes_fingerprint");
     conn.exec("DROP INDEX IF EXISTS idx_refs_file_id");
     conn.exec("DROP INDEX IF EXISTS idx_refs_kind_name");
     conn.exec("DROP INDEX IF EXISTS idx_refs_resolved");
@@ -375,6 +403,7 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
@@ -388,6 +417,7 @@ inline void rebuild_indexes(Connection& conn) {
 // Initialize or verify schema. Returns exit code (0=ok, 3=mismatch).
 inline int ensure_schema(Connection& conn) {
     register_custom_functions(conn.raw());
+    create_tables(conn);
     int version = get_schema_version(conn);
     bool recreate_nodes_fts = false;
 
@@ -401,6 +431,7 @@ inline int ensure_schema(Connection& conn) {
     }
 
     if (version == CURRENT_SCHEMA_VERSION) {
+        ensure_nodes_fingerprint_schema(conn);
         return 0;  // Compatible
     }
 
@@ -483,6 +514,12 @@ inline int ensure_schema(Connection& conn) {
     if (version == 8) {
         recreate_refs_table_with_http_call(conn);
         version = 9;
+    }
+
+    // v9→v10: add MinHash fingerprint column for near-duplicate detection.
+    if (version == 9) {
+        ensure_nodes_fingerprint_schema(conn);
+        version = 10;
     }
 
     if (version == CURRENT_SCHEMA_VERSION) {

@@ -153,6 +153,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_approx_callgraph.cpp
     tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
+    tests/unit/test_trace_tools.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests

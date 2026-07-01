@@ -115,6 +115,10 @@ std::string shortest_path(yyjson_val* params, Connection& conn,
 std::string find_implementations(yyjson_val* params, Connection& conn,
                                  QueryCache& cache, const std::string& repo_root);
 
+// T089b: find_similar — near-duplicate functions via MinHash fingerprints
+std::string find_similar(yyjson_val* params, Connection& conn,
+                         QueryCache& cache, const std::string& repo_root);
+
 // T090: method_fields — field accesses and calls made by a method
 std::string method_fields(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root);
@@ -134,6 +138,12 @@ std::string code_search(yyjson_val* params, Connection& conn,
 // T095: list_http_calls — list extracted HTTP client call refs
 std::string list_http_calls(yyjson_val* params, Connection& conn,
                             QueryCache& cache, const std::string& repo_root);
+
+std::string ingest_traces(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root);
+
+std::string get_traces(yyjson_val* params, Connection& conn,
+                       QueryCache& cache, const std::string& repo_root);
 
 // Workspace tools — multi-root management
 std::string workspace_add(yyjson_val* params, Connection& conn,
