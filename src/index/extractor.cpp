@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <regex>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -582,6 +583,17 @@ std::string js_member_property_name(TSNode node, const std::string& source) {
     return source_text(ts_node_named_child(node, count - 1), source);
 }
 
+bool extract_this_member_field(TSNode node, const std::string& source, std::string& field_name) {
+    const char* type = ts_node_type(node);
+    if (!type || std::string(type) != "member_expression") return false;
+
+    TSNode object = ts_node_child_by_field_name(node, "object", 6);
+    if (ts_node_is_null(object) || std::string(ts_node_type(object)) != "this") return false;
+
+    field_name = js_member_property_name(node, source);
+    return !field_name.empty();
+}
+
 bool extract_this_assignment_field(TSNode node, const std::string& source, std::string& field_name) {
     const char* type = ts_node_type(node);
     if (!type || std::string(type) != "assignment_expression") return false;
@@ -589,13 +601,35 @@ bool extract_this_assignment_field(TSNode node, const std::string& source, std::
     TSNode left = ts_node_child_by_field_name(node, "left", 4);
     if (ts_node_is_null(left)) left = ts_node_child(node, 0);
     if (ts_node_is_null(left)) return false;
-    if (std::string(ts_node_type(left)) != "member_expression") return false;
+    return extract_this_member_field(left, source, field_name);
+}
 
-    TSNode object = ts_node_child_by_field_name(left, "object", 6);
-    if (ts_node_is_null(object) || std::string(ts_node_type(object)) != "this") return false;
+bool this_member_looks_assigned_in_source(TSNode node, const std::string& source) {
+    uint32_t pos = ts_node_end_byte(node);
+    while (pos < source.size() && std::isspace(static_cast<unsigned char>(source[pos]))) ++pos;
+    if (pos >= source.size()) return false;
 
-    field_name = js_member_property_name(left, source);
-    return !field_name.empty();
+    if (source[pos] == '=') {
+        if (pos + 1 < source.size() && (source[pos + 1] == '=' || source[pos + 1] == '>')) return false;
+        return true;
+    }
+
+    if (pos + 1 < source.size()) {
+        switch (source[pos]) {
+            case '+':
+            case '-':
+            case '*':
+            case '/':
+            case '%':
+            case '&':
+            case '|':
+            case '^':
+                return source[pos + 1] == '=';
+            default:
+                break;
+        }
+    }
+    return false;
 }
 
 struct ThisAssignmentMatch {
@@ -605,7 +639,7 @@ struct ThisAssignmentMatch {
 
 std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, const std::string& source) {
     std::vector<ThisAssignmentMatch> matches;
-    TSNode body = ts_node_child_by_field_name(function_node, "body", 4);
+    TSNode body = find_function_body_node(function_node);
     if (ts_node_is_null(body)) return matches;
 
     std::unordered_set<std::string> seen_fields;
@@ -624,6 +658,11 @@ std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, 
         if (extract_this_assignment_field(current, source, field_name) &&
             seen_fields.insert(field_name).second) {
             matches.push_back({field_name, current});
+        } else if (current_type_str == "member_expression" &&
+                   extract_this_member_field(current, source, field_name) &&
+                   this_member_looks_assigned_in_source(current, source) &&
+                   seen_fields.insert(field_name).second) {
+            matches.push_back({field_name, current});
         }
 
         uint32_t count = ts_node_named_child_count(current);
@@ -632,6 +671,165 @@ std::vector<ThisAssignmentMatch> collect_this_assignments(TSNode function_node, 
         }
     }
 
+    return matches;
+}
+
+struct LegacyJsConstructorMatch {
+    std::string name;
+    std::string fallback_kind;
+    size_t header_start = 0;
+    size_t body_open = 0;
+    size_t body_close = 0;
+};
+
+TSPoint point_for_offset(const std::string& source, size_t offset) {
+    offset = (std::min)(offset, source.size());
+    TSPoint point{0, 0};
+    for (size_t i = 0; i < offset; ++i) {
+        if (source[i] == '\n') {
+            ++point.row;
+            point.column = 0;
+        } else {
+            ++point.column;
+        }
+    }
+    return point;
+}
+
+bool find_matching_brace(const std::string& source, size_t open_pos, size_t& close_pos) {
+    if (open_pos >= source.size() || source[open_pos] != '{') return false;
+
+    int depth = 0;
+    bool in_single = false;
+    bool in_double = false;
+    bool in_template = false;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+    bool escaped = false;
+
+    for (size_t i = open_pos; i < source.size(); ++i) {
+        char c = source[i];
+        char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+
+        if (in_line_comment) {
+            if (c == '\n') in_line_comment = false;
+            continue;
+        }
+        if (in_block_comment) {
+            if (c == '*' && next == '/') {
+                in_block_comment = false;
+                ++i;
+            }
+            continue;
+        }
+        if (in_single) {
+            if (!escaped && c == '\'') in_single = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+        if (in_double) {
+            if (!escaped && c == '"') in_double = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+        if (in_template) {
+            if (!escaped && c == '`') in_template = false;
+            escaped = (!escaped && c == '\\');
+            continue;
+        }
+
+        escaped = false;
+        if (c == '/' && next == '/') {
+            in_line_comment = true;
+            ++i;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            in_block_comment = true;
+            ++i;
+            continue;
+        }
+        if (c == '\'') {
+            in_single = true;
+            continue;
+        }
+        if (c == '"') {
+            in_double = true;
+            continue;
+        }
+        if (c == '`') {
+            in_template = true;
+            continue;
+        }
+        if (c == '{') {
+            ++depth;
+            continue;
+        }
+        if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                close_pos = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+template <typename MatchHandler>
+void for_each_regex_match(const std::string& source, const std::regex& pattern, MatchHandler&& handler) {
+    for (std::sregex_iterator it(source.begin(), source.end(), pattern), end; it != end; ++it) {
+        handler(*it);
+    }
+}
+
+std::vector<LegacyJsConstructorMatch> find_legacy_js_constructor_matches(const std::string& source) {
+    static const std::regex kVarExportCtor(
+        R"((^|[;\n])\s*(?:let|var|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*module\.exports\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kVarCtor(
+        R"((^|[;\n])\s*(?:let|var|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kAssignCtor(
+        R"((^|[;\n])\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*function(?:\s+([A-Za-z_$][A-Za-z0-9_$]*))?\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+    static const std::regex kModuleExportCtor(
+        R"((^|[;\n])\s*module\.exports\s*=\s*function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*\{)",
+        std::regex::ECMAScript);
+
+    std::vector<LegacyJsConstructorMatch> matches;
+    std::unordered_set<size_t> seen_headers;
+
+    auto add_matches = [&](const std::regex& pattern, const std::string& fallback_kind, auto&& name_for) {
+        for_each_regex_match(source, pattern, [&](const std::smatch& match) {
+            const size_t start = static_cast<size_t>(match.position(0));
+            const size_t open = start + static_cast<size_t>(match.length(0)) - 1;
+            if (!seen_headers.insert(start).second) return;
+
+            size_t close = 0;
+            if (!find_matching_brace(source, open, close)) return;
+
+            std::string name = name_for(match);
+            matches.push_back({name, fallback_kind, start, open, close});
+        });
+    };
+
+    add_matches(kVarExportCtor, "variable", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kVarCtor, "variable", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kAssignCtor, "", [](const std::smatch& match) {
+        return match[2].str();
+    });
+    add_matches(kModuleExportCtor, "", [](const std::smatch& match) {
+        return match[2].str();
+    });
+
+    std::sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) {
+        return a.header_start < b.header_start;
+    });
     return matches;
 }
 
@@ -656,6 +854,9 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
 
     TSNode root = ts_tree_root_node(tree);
     visit_node(root, "", 0);
+    if (*language_ == "javascript") {
+        add_javascript_constructor_fallbacks(source);
+    }
 
     // Generate stable keys with collision handling
     std::vector<KeyCandidate> candidates;
@@ -679,6 +880,91 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
 }
 
 // --- Extractor private helpers ---
+
+void Extractor::add_javascript_constructor_fallbacks(const std::string& source) {
+    std::unordered_set<std::string> existing_symbols;
+    existing_symbols.reserve(result_->symbols.size() * 2 + 8);
+    for (const auto& symbol : result_->symbols) {
+        existing_symbols.insert(symbol.kind + "\n" + symbol.qualname);
+    }
+
+    auto append_symbol = [&](const std::string& kind,
+                             const std::string& name,
+                             const std::string& qualname,
+                             size_t start_offset,
+                             size_t end_offset) -> int {
+        std::string key = kind + "\n" + qualname;
+        auto [_, inserted] = existing_symbols.insert(key);
+        if (!inserted) return -1;
+
+        TSPoint start = point_for_offset(source, start_offset);
+        TSPoint end = point_for_offset(source, end_offset);
+
+        ExtractedSymbol symbol;
+        symbol.kind = kind;
+        symbol.name = name;
+        symbol.qualname = qualname;
+        symbol.start_line = static_cast<int>(start.row + 1);
+        symbol.start_col = static_cast<int>(start.column);
+        symbol.end_line = static_cast<int>(end.row + 1);
+        symbol.end_col = static_cast<int>(end.column);
+        result_->symbols.push_back(std::move(symbol));
+        return static_cast<int>(result_->symbols.size()) - 1;
+    };
+
+    static const std::regex kThisAssignment(
+        R"(\bthis\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=)",
+        std::regex::ECMAScript);
+
+    for (const auto& match : find_legacy_js_constructor_matches(source)) {
+        std::string body = source.substr(match.body_open + 1, match.body_close - match.body_open - 1);
+        std::vector<std::pair<std::string, std::pair<size_t, size_t>>> fields;
+        std::unordered_set<std::string> seen_fields;
+        for_each_regex_match(body, kThisAssignment, [&](const std::smatch& field_match) {
+            std::string field_name = field_match[1].str();
+            if (!seen_fields.insert(field_name).second) return;
+
+            size_t rel_start = static_cast<size_t>(field_match.position(0));
+            size_t global_start = match.body_open + 1 + rel_start;
+            size_t global_end = global_start + static_cast<size_t>(field_match.length(0));
+            fields.push_back({field_name, {global_start, global_end}});
+        });
+
+        if (fields.empty()) {
+            if (!match.fallback_kind.empty()) {
+                append_symbol(match.fallback_kind, match.name, match.name,
+                              match.header_start, match.body_close + 1);
+            }
+            continue;
+        }
+        if (!starts_with_uppercase_ascii(match.name)) continue;
+
+        int constructor_idx = append_symbol("constructor_fn", match.name, match.name,
+                                            match.header_start, match.body_close + 1);
+        if (constructor_idx < 0) {
+            for (size_t i = 0; i < result_->symbols.size(); ++i) {
+                if (result_->symbols[i].kind == "constructor_fn" &&
+                    result_->symbols[i].qualname == match.name) {
+                    constructor_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (constructor_idx < 0) continue;
+        }
+
+        for (const auto& field : fields) {
+            const std::string& field_name = field.first;
+            std::string qualname = match.name + "._fields." + field_name;
+            int field_idx = append_symbol("field", field_name, qualname,
+                                          field.second.first, field.second.second);
+            if (field_idx >= 0) {
+                result_->edges.push_back({
+                    constructor_idx, field_idx, "", "contains", 1.0, "constructor_field"
+                });
+            }
+        }
+    }
+}
 
 std::string Extractor::node_text(TSNode node) {
     uint32_t start = ts_node_start_byte(node);

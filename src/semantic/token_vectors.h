@@ -3,6 +3,7 @@
 #include "util/process.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -126,7 +127,7 @@ inline std::vector<std::pair<std::string, std::string>> token_vector_candidate_p
 
 class TokenVectorTable {
 public:
-    static constexpr int DIM = 128;
+    static constexpr int DIM = 256;
 
     bool load(const std::string& bin_path, const std::string& txt_path) {
         clear();
@@ -200,16 +201,22 @@ public:
         }
 
         std::vector<float> accum(DIM, 0.0f);
-        int matched = 0;
+        float total_weight = 0.0f;
         for (const auto& token : candidates) {
             auto it = token_to_idx_.find(token);
             if (it == token_to_idx_.end()) continue;
+            float weight = heuristic_idf(token);
+            if (weight <= 0.0f) continue;
             const int8_t* vec = blob_.data() + static_cast<size_t>(it->second) * DIM;
-            for (int i = 0; i < DIM; ++i) accum[i] += static_cast<float>(vec[i]);
-            ++matched;
+            total_weight += weight;
+            for (int i = 0; i < DIM; ++i) {
+                accum[i] += weight * static_cast<float>(vec[i]);
+            }
         }
 
-        if (matched == 0) return {};
+        if (total_weight <= 0.0f) return {};
+
+        for (float& value : accum) value /= total_weight;
 
         float norm_sq = 0.0f;
         for (float v : accum) norm_sq += v * v;
@@ -238,6 +245,29 @@ public:
     }
 
 private:
+    static float heuristic_idf(const std::string& piece) {
+        std::string lower = piece;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        std::string_view clean = lower;
+        if (clean.size() > 2 && clean.substr(0, 2) == "##") clean.remove_prefix(2);
+
+        static const std::unordered_set<std::string_view> low_idf = {
+            "test", "tests", "mock", "fake", "stub", "base", "abstract",
+            "get", "set", "is", "has", "on", "do", "run", "to", "by", "of",
+            "a", "an", "the", "new", "old", "my", "this", "that", "some",
+            "impl", "interface", "class", "type", "enum", "struct"
+        };
+        if (low_idf.count(clean)) return 0.3f;
+
+        if (clean.size() <= 1) return 0.1f;
+        if (clean.size() == 2) return 0.5f;
+
+        return 1.0f;
+    }
+
     void clear() {
         blob_.clear();
         token_to_idx_.clear();

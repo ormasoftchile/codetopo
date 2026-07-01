@@ -98,6 +98,7 @@ private:
     std::string get_callee_name(TSNode func_node);
     std::string extract_leading_comment(TSNode node);
     std::string compute_fingerprint(TSNode node);
+    void add_javascript_constructor_fallbacks(const std::string& source);
 
     void add_symbol(const std::string& kind, const std::string& name,
                     TSNode node, const std::string& qualname = "",
