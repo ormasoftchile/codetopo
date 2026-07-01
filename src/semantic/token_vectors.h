@@ -112,6 +112,13 @@ inline std::vector<std::pair<std::string, std::string>> token_vector_candidate_p
     }
 
     append_token_vector_candidate(candidates, seen, std::filesystem::current_path() / "tools");
+
+    // ~/.local/share/codetopo/ — installed by install.sh
+    if (const char* home = std::getenv("HOME")) {
+        append_token_vector_candidate(candidates, seen,
+            std::filesystem::path(home) / ".local" / "share" / "codetopo");
+    }
+
     return candidates;
 }
 

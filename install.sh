@@ -124,6 +124,21 @@ fi
 
 ok "Installed: ${INSTALL_DIR}/${BINARY_NAME}"
 
+# ─── 3b. Install embedding files (semantic search) ─────────────────────────────
+EMBED_DIR="${HOME}/.local/share/codetopo"
+EMBED_BIN="${SCRIPT_DIR}/tools/token_vectors_128d.bin"
+EMBED_TOKENS="${SCRIPT_DIR}/tools/token_list.txt"
+
+if [[ -f "${EMBED_BIN}" && -f "${EMBED_TOKENS}" ]]; then
+    mkdir -p "${EMBED_DIR}"
+    cp -f "${EMBED_BIN}" "${EMBED_DIR}/token_vectors_128d.bin"
+    cp -f "${EMBED_TOKENS}" "${EMBED_DIR}/token_list.txt"
+    ok "Semantic search embeddings installed: ${EMBED_DIR}"
+else
+    warn "Embedding files not found in tools/ — semantic search (symbol_search_semantic) will be unavailable."
+    warn "To generate them: /tmp/embed_env/bin/python3 tools/gen_token_vectors.py"
+fi
+
 # Check if INSTALL_DIR is on PATH
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
     echo ""
