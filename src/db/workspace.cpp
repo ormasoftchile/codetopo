@@ -7,6 +7,7 @@
 #include "db/schema.h"
 #include "db/fts.h"
 #include "index/supervisor.h"
+#include "semantic/token_vectors.h"
 #include "util/log.h"
 #include "util/repo.h"
 #include <sqlite3.h>
@@ -476,6 +477,54 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     } else {
         auto content_phase = WorkspaceClock::now();
         log_workspace_phase("content_fts", content_phase, color_output, "(disabled; 0 files)");
+    }
+
+    // Semantic embeddings — always runs, skips silently if embedding files not found
+    {
+        auto embed_phase = WorkspaceClock::now();
+        TokenVectorTable tvt;
+        for (auto& [bin, txt] : semantic::token_vector_candidate_paths(cfg.repo_root)) {
+            if (tvt.load(bin, txt)) break;
+        }
+        if (tvt.ready()) {
+            log_workspace_line("computing symbol embeddings...", color_output);
+            // Reuse embed_symbols logic inline — embed only new nodes for this root
+            sqlite3_stmt* sel = nullptr;
+            sqlite3_stmt* ins = nullptr;
+            int64_t offset = root_id * static_cast<int64_t>(1000000000LL);
+            std::string sel_sql =
+                "SELECT id, name FROM nodes "
+                "WHERE node_type='symbol' AND is_definition=1 "
+                "  AND kind IN ('function','method','class','interface','struct','constructor_fn') "
+                "  AND id >= " + std::to_string(offset) +
+                "  AND id < " + std::to_string(offset + 1000000000LL) +
+                "  AND id NOT IN (SELECT node_id FROM node_vectors)";
+            sqlite3_prepare_v2(conn_.raw(), sel_sql.c_str(), -1, &sel, nullptr);
+            sqlite3_prepare_v2(conn_.raw(),
+                "INSERT OR REPLACE INTO node_vectors(node_id, embedding) VALUES(?,?)",
+                -1, &ins, nullptr);
+            if (sel && ins) {
+                int64_t embedded = 0;
+                conn_.exec("BEGIN TRANSACTION");
+                while (sqlite3_step(sel) == SQLITE_ROW) {
+                    int64_t id = sqlite3_column_int64(sel, 0);
+                    const char* name = reinterpret_cast<const char*>(sqlite3_column_text(sel, 1));
+                    if (!name) continue;
+                    auto emb = tvt.embed(name);
+                    if (emb.empty()) continue;
+                    sqlite3_reset(ins); sqlite3_clear_bindings(ins);
+                    sqlite3_bind_int64(ins, 1, id);
+                    sqlite3_bind_blob(ins, 2, emb.data(), static_cast<int>(emb.size()), SQLITE_TRANSIENT);
+                    sqlite3_step(ins);
+                    ++embedded;
+                }
+                conn_.exec("COMMIT");
+                log_workspace_phase("symbol embeddings", embed_phase, color_output,
+                    "(" + format_with_commas(embedded) + " symbols)");
+            }
+            if (sel) sqlite3_finalize(sel);
+            if (ins) sqlite3_finalize(ins);
+        }
     }
 
     // Query stats
