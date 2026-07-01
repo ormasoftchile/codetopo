@@ -66,7 +66,7 @@ ts_grammars_init()
 
 add_ts_grammar(NAME c       REPO tree-sitter/tree-sitter-c       TAG v0.21.0)
 add_ts_grammar(NAME cpp     REPO tree-sitter/tree-sitter-cpp     TAG v0.21.0 SCANNER)
-add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.1 SCANNER V23)
+add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.5 SCANNER V23)
 add_ts_grammar(NAME go      REPO tree-sitter/tree-sitter-go      TAG v0.21.0)
 add_ts_grammar(NAME yaml    REPO tree-sitter-grammars/tree-sitter-yaml TAG v0.6.1 SCANNER C11
     SCANNER_DEPS schema.core.c schema.json.c
@@ -75,11 +75,11 @@ add_ts_grammar(NAME typescript REPO tree-sitter/tree-sitter-typescript TAG v0.23
     SRC_PATH typescript/src
     EXTRA_DOWNLOADS common/scanner.h
     EXTRA_INCLUDE_DIRS "${TS_GRAMMAR_DIR}/typescript/typescript/src")
-add_ts_grammar(NAME javascript REPO tree-sitter/tree-sitter-javascript TAG v0.23.1 SCANNER V23)
+add_ts_grammar(NAME javascript REPO tree-sitter/tree-sitter-javascript TAG v0.23.5 SCANNER V23)
 add_ts_grammar(NAME python  REPO tree-sitter/tree-sitter-python   TAG v0.23.6 SCANNER V23)
 add_ts_grammar(NAME rust    REPO tree-sitter/tree-sitter-rust     TAG v0.23.2 SCANNER V23)
 add_ts_grammar(NAME java    REPO tree-sitter/tree-sitter-java     TAG v0.23.4 V23)
-add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.3 SCANNER V23)
+add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.5 SCANNER V23)
 
 # --- Main executable ---
 set(CODETOPO_SOURCES
