@@ -9,6 +9,43 @@
 #   ...
 #   target_link_libraries(myapp PRIVATE ${TS_GRAMMAR_TARGETS})
 
+# --- ts_download_verified ---
+# Download a URL to a destination, retrying on failure and verifying the result
+# is a non-empty file. Plain file(DOWNLOAD) captures STATUS but the callers used
+# to ignore it, so a transient network error (rate-limit, 5xx) left a 0-byte file
+# that `if(NOT EXISTS)` then skipped forever — producing grammar objects with no
+# tree_sitter_<lang> symbol and a confusing link failure. This fails loudly instead.
+function(ts_download_verified url dest)
+    # Re-download if the file is missing OR empty (a prior failed download).
+    if(EXISTS "${dest}")
+        file(SIZE "${dest}" _existing_size)
+        if(_existing_size GREATER 0)
+            return()
+        endif()
+    endif()
+
+    set(_attempts 3)
+    foreach(_i RANGE 1 ${_attempts})
+        file(DOWNLOAD "${url}" "${dest}" STATUS _st TIMEOUT 60)
+        list(GET _st 0 _code)
+        if(_code EQUAL 0 AND EXISTS "${dest}")
+            file(SIZE "${dest}" _size)
+            if(_size GREATER 0)
+                return()
+            endif()
+        endif()
+        # Failed or empty — remove the stub so the next attempt/build retries cleanly.
+        file(REMOVE "${dest}")
+        message(WARNING "tree-sitter download attempt ${_i}/${_attempts} failed for ${url} (status: ${_st})")
+    endforeach()
+
+    message(FATAL_ERROR
+        "Failed to download ${url} after ${_attempts} attempts. "
+        "This is usually a transient network/rate-limit issue — re-run the build. "
+        "A missing grammar source produces an empty object and an 'Undefined symbol: "
+        "tree_sitter_<lang>' link error.")
+endfunction()
+
 # --- ts_grammars_init ---
 # Downloads shared tree-sitter header files and sets up variables.
 # Sets: TS_GRAMMAR_DIR, TS_INC, TS_GRAMMAR_TARGETS
@@ -17,37 +54,27 @@ macro(ts_grammars_init)
     file(MAKE_DIRECTORY "${TS_GRAMMAR_DIR}/tree_sitter")
 
     # v0.21 parser.h (base header, used by C/C++/Go/YAML grammars)
-    if(NOT EXISTS "${TS_GRAMMAR_DIR}/tree_sitter/parser.h")
-        file(DOWNLOAD
-            "https://raw.githubusercontent.com/tree-sitter/tree-sitter-c/refs/tags/v0.21.0/src/tree_sitter/parser.h"
-            "${TS_GRAMMAR_DIR}/tree_sitter/parser.h"
-            STATUS _dl_status)
-    endif()
+    ts_download_verified(
+        "https://raw.githubusercontent.com/tree-sitter/tree-sitter-c/refs/tags/v0.21.0/src/tree_sitter/parser.h"
+        "${TS_GRAMMAR_DIR}/tree_sitter/parser.h")
 
     # alloc.h and array.h (needed by newer grammar scanners)
-    if(NOT EXISTS "${TS_GRAMMAR_DIR}/tree_sitter/alloc.h")
-        file(DOWNLOAD
-            "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.10/cli/generate/src/templates/alloc.h"
-            "${TS_GRAMMAR_DIR}/tree_sitter/alloc.h"
-            STATUS _dl_status)
-    endif()
-    if(NOT EXISTS "${TS_GRAMMAR_DIR}/tree_sitter/array.h")
-        file(DOWNLOAD
-            "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.10/cli/generate/src/templates/array.h"
-            "${TS_GRAMMAR_DIR}/tree_sitter/array.h"
-            STATUS _dl_status)
-    endif()
+    ts_download_verified(
+        "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.10/cli/generate/src/templates/alloc.h"
+        "${TS_GRAMMAR_DIR}/tree_sitter/alloc.h")
+    ts_download_verified(
+        "https://raw.githubusercontent.com/tree-sitter/tree-sitter/v0.25.10/cli/generate/src/templates/array.h"
+        "${TS_GRAMMAR_DIR}/tree_sitter/array.h")
 
     # v0.23 parser.h — download from tree-sitter v0.25.10 (lib/src/parser.h) which
     # has TSMapSlice, TSLexerMode, and the expanded TSLanguage struct needed by
     # grammars v0.23.3+. We append backwards-compat aliases so older grammars
-    # (using TSFieldMapSlice / TSLexMode / .version) still compile.
+    # (using TSFieldMapSlice / .version) still compile.
     file(MAKE_DIRECTORY "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter")
     if(NOT EXISTS "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h")
-        file(DOWNLOAD
+        ts_download_verified(
             "https://raw.githubusercontent.com/tree-sitter/tree-sitter/refs/tags/v0.25.10/lib/src/parser.h"
-            "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h"
-            STATUS _dl_status)
+            "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h")
         # Append backwards-compatibility aliases for old grammar generators
         file(APPEND "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h" "\n\
 // Backwards-compat aliases for grammars generated before tree-sitter 0.24.\n\
@@ -119,45 +146,38 @@ macro(add_ts_grammar)
 
     file(MAKE_DIRECTORY "${_tsg_local_dir}")
 
-    # Download parser.c (and scanner.c + extras) if parser.c doesn't exist yet
-    if(NOT EXISTS "${_tsg_local_dir}/parser.c")
-        file(DOWNLOAD
-            "${_tsg_base_url}/${_TSG_SRC_PATH}/parser.c"
-            "${_tsg_local_dir}/parser.c"
-            STATUS _dl_status)
+    # Download parser.c (and scanner.c + extras). ts_download_verified re-downloads
+    # missing OR empty files and fails loudly on persistent failure, so a transient
+    # network error can't leave an empty stub that links into a broken binary.
+    ts_download_verified(
+        "${_tsg_base_url}/${_TSG_SRC_PATH}/parser.c"
+        "${_tsg_local_dir}/parser.c")
 
-        if(_TSG_SCANNER)
-            file(DOWNLOAD
-                "${_tsg_base_url}/${_TSG_SRC_PATH}/scanner.c"
-                "${_tsg_local_dir}/scanner.c"
-                STATUS _dl_status)
-        endif()
-
-        foreach(_src ${_TSG_EXTRA_SOURCES})
-            file(DOWNLOAD
-                "${_tsg_base_url}/${_TSG_SRC_PATH}/${_src}"
-                "${_tsg_local_dir}/${_src}"
-                STATUS _dl_status)
-        endforeach()
-
-        foreach(_dep ${_TSG_SCANNER_DEPS})
-            file(DOWNLOAD
-                "${_tsg_base_url}/${_TSG_SRC_PATH}/${_dep}"
-                "${_tsg_local_dir}/${_dep}"
-                STATUS _dl_status)
-        endforeach()
+    if(_TSG_SCANNER)
+        ts_download_verified(
+            "${_tsg_base_url}/${_TSG_SRC_PATH}/scanner.c"
+            "${_tsg_local_dir}/scanner.c")
     endif()
+
+    foreach(_src ${_TSG_EXTRA_SOURCES})
+        ts_download_verified(
+            "${_tsg_base_url}/${_TSG_SRC_PATH}/${_src}"
+            "${_tsg_local_dir}/${_src}")
+    endforeach()
+
+    foreach(_dep ${_TSG_SCANNER_DEPS})
+        ts_download_verified(
+            "${_tsg_base_url}/${_TSG_SRC_PATH}/${_dep}"
+            "${_tsg_local_dir}/${_dep}")
+    endforeach()
 
     # Download extra files (paths relative to repo tag root)
     foreach(_dl ${_TSG_EXTRA_DOWNLOADS})
         get_filename_component(_dl_dir "${TS_GRAMMAR_DIR}/${_TSG_NAME}/${_dl}" DIRECTORY)
         file(MAKE_DIRECTORY "${_dl_dir}")
-        if(NOT EXISTS "${TS_GRAMMAR_DIR}/${_TSG_NAME}/${_dl}")
-            file(DOWNLOAD
-                "${_tsg_base_url}/${_dl}"
-                "${TS_GRAMMAR_DIR}/${_TSG_NAME}/${_dl}"
-                STATUS _dl_status)
-        endif()
+        ts_download_verified(
+            "${_tsg_base_url}/${_dl}"
+            "${TS_GRAMMAR_DIR}/${_TSG_NAME}/${_dl}")
     endforeach()
 
     # Collect source files for the OBJECT library
