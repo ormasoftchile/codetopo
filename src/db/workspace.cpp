@@ -531,13 +531,25 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     if (sqlite3_step(stmt) == SQLITE_ROW) result.edges_total = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
 
+    stmt = nullptr;
+    sqlite3_prepare_v2(conn_.raw(),
+        "SELECT COUNT(*) FROM refs r JOIN files f ON f.id = r.file_id "
+        "WHERE f.root_id = ? AND r.kind = 'http_call'", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, result.root_id);
+    if (sqlite3_step(stmt) == SQLITE_ROW) result.http_call_refs = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+
+    mcp_log("protocol refs: " + std::to_string(result.http_call_refs) +
+            " http_call refs found, cross-root matching pending");
+
     std::ostringstream summary;
     summary << stderr_dim("[workspace]", color_output) << " "
             << stderr_bold_green("✓ done", color_output)
             << " — " << format_with_commas(result.roots_total) << " roots | "
             << format_with_commas(result.files_total) << " files | "
             << format_with_commas(result.symbols_total) << " nodes | "
-            << format_with_commas(result.edges_total) << " edges  ("
+            << format_with_commas(result.edges_total) << " edges | "
+            << format_with_commas(result.http_call_refs) << " http refs  ("
             << stderr_cyan(format_seconds(overall_phase) + "s total", color_output) << ")";
     std::cerr << summary.str() << "\n";
 
@@ -720,14 +732,17 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     log_workspace_line("copying nodes...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
-    prepare_or_throw(conn_.raw(), &stmt,
+    bool src_has_fingerprint = attached_table_has_column(conn_.raw(), "src", "nodes", "fingerprint");
+    std::string node_sql =
         "INSERT INTO nodes (id, node_type, file_id, kind, name, qualname, signature, "
-        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
+        "start_line, start_col, end_line, end_col, is_definition, visibility, doc, fingerprint, stable_key) "
         "SELECT (? + id), node_type, "
         "CASE WHEN file_id IS NOT NULL THEN (? + file_id) ELSE NULL END, "
         "kind, name, qualname, signature, start_line, start_col, end_line, end_col, "
-        "is_definition, visibility, doc, (? || ':' || stable_key) "
-        "FROM src.nodes");
+        "is_definition, visibility, doc, ";
+    node_sql += src_has_fingerprint ? "fingerprint" : "NULL";
+    node_sql += ", (? || ':' || stable_key) FROM src.nodes";
+    prepare_or_throw(conn_.raw(), &stmt, node_sql);
     sqlite3_bind_int64(stmt, 1, offset);
     sqlite3_bind_int64(stmt, 2, offset);
     std::string root_id_prefix = std::to_string(root_id);

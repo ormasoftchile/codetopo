@@ -29,3 +29,5 @@
 - **Created:** 2026-03-30
 - **Universe:** Captain Future
 - **Goal:** Fast, robust symbol/relation indexing for codebases with 100k+ files; exposes MCP tools so GitHub Copilot can query structural code topology instead of text search
+| Arn | Grammar & Parser Engineer | tree-sitter grammar, scanner.c, grammar.js, corpus tests, grammar crash debugging | 🔩 |
+| Halk | Compiler & Language Specialist | TypeScript AST, tree-sitter runtime, crash reproduction harness, TS 5.x internals | 🦾 |

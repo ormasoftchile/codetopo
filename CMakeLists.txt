@@ -66,7 +66,7 @@ ts_grammars_init()
 
 add_ts_grammar(NAME c       REPO tree-sitter/tree-sitter-c       TAG v0.21.0)
 add_ts_grammar(NAME cpp     REPO tree-sitter/tree-sitter-cpp     TAG v0.21.0 SCANNER)
-add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.1 SCANNER V23)
+add_ts_grammar(NAME csharp  REPO tree-sitter/tree-sitter-c-sharp TAG v0.23.5 SCANNER V23)
 add_ts_grammar(NAME go      REPO tree-sitter/tree-sitter-go      TAG v0.21.0)
 add_ts_grammar(NAME yaml    REPO tree-sitter-grammars/tree-sitter-yaml TAG v0.6.1 SCANNER C11
     SCANNER_DEPS schema.core.c schema.json.c
@@ -85,6 +85,7 @@ add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.3 SC
 set(CODETOPO_SOURCES
     src/main.cpp
     src/core/arena.cpp
+    src/core/arena_ledger.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
     src/db/workspace.cpp
@@ -99,6 +100,14 @@ add_executable(codetopo ${CODETOPO_SOURCES})
 target_include_directories(codetopo PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+# Optional arena allocation ledger for debugging crashes.
+# Enable with: cmake -DARENA_LEDGER=ON ...
+option(ARENA_LEDGER "Enable thread-local arena allocation ledger (debug)" OFF)
+if(ARENA_LEDGER)
+    message(STATUS "Arena ledger enabled — builds with ARENA_LEDGER")
+    target_compile_definitions(codetopo PRIVATE ARENA_LEDGER)
+endif()
 
 target_link_libraries(codetopo PRIVATE
     unofficial::sqlite3::sqlite3
@@ -140,6 +149,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
     tests/unit/test_stable_key.cpp
+    tests/unit/test_get_architecture.cpp
     tests/unit/test_file_summary_nodeid.cpp
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
@@ -152,11 +162,13 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_approx_callgraph.cpp
     tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
+    tests/unit/test_trace_tools.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
 set(CODETOPO_LIB_SOURCES
     src/core/arena.cpp
+    src/core/arena_ledger.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
     src/db/workspace.cpp

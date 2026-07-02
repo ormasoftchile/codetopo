@@ -38,7 +38,8 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
                   << "  root_id: " << result.root_id << "\n"
                   << "  files:   " << format_with_commas(result.files) << "\n"
                   << "  symbols: " << format_with_commas(result.symbols) << "\n"
-                  << "  edges:   " << format_with_commas(result.edges) << "\n";
+                  << "  edges:   " << format_with_commas(result.edges) << "\n"
+                  << "  http:    " << format_with_commas(result.http_call_refs) << " http_call refs\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << stderr_bold_red(std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";

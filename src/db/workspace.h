@@ -25,6 +25,7 @@ public:
         int64_t files = 0;
         int64_t symbols = 0;
         int64_t edges = 0;
+        int64_t http_call_refs = 0;
         int64_t roots_total = 0;
         int64_t files_total = 0;
         int64_t symbols_total = 0;

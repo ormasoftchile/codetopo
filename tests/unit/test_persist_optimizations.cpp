@@ -114,6 +114,77 @@ static int64_t count_query(Connection& conn, const std::string& query) {
     return count;
 }
 
+static void step_done(sqlite3_stmt* stmt) {
+    REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+}
+
+static int64_t insert_file_row(Connection& conn, const std::string& path, const std::string& lang = "csharp") {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status) "
+        "VALUES(?, ?, 100, 1000, ?, 'ok')",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, lang.c_str(), -1, SQLITE_TRANSIENT);
+    std::string hash = "hash:" + path;
+    sqlite3_bind_text(stmt, 3, hash.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
+static int64_t insert_file_node_row(Connection& conn, const std::string& path) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO nodes(node_type, kind, name, stable_key) VALUES('file', 'file', ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    std::string stable_key = "file:" + path;
+    sqlite3_bind_text(stmt, 2, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
+static int64_t insert_symbol_row(Connection& conn, int64_t file_id, const std::string& kind,
+                                 const std::string& name, const std::string& qualname,
+                                 bool is_definition = true) {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO nodes(node_type, file_id, kind, name, qualname, is_definition, stable_key) "
+        "VALUES('symbol', ?, ?, ?, ?, ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, file_id);
+    sqlite3_bind_text(stmt, 2, kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, qualname.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, is_definition ? 1 : 0);
+    std::string stable_key = qualname + "::" + kind + "::" + name;
+    sqlite3_bind_text(stmt, 6, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+    step_done(stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
+static int64_t insert_call_ref_row(Connection& conn, int64_t file_id, const std::string& name,
+                                   int64_t containing_node_id,
+                                   const std::string& receiver_type_hint = "") {
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(conn.raw(),
+        "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, "
+        "evidence, containing_node_id, receiver_type_hint) "
+        "VALUES(?, 'call', ?, 1, 1, 1, 10, 'call_expression', ?, ?)",
+        -1, &stmt, nullptr) == SQLITE_OK);
+    sqlite3_bind_int64(stmt, 1, file_id);
+    sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, containing_node_id);
+    if (receiver_type_hint.empty()) {
+        sqlite3_bind_null(stmt, 4);
+    } else {
+        sqlite3_bind_text(stmt, 4, receiver_type_hint.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    step_done(stmt);
+    return sqlite3_last_insert_rowid(conn.raw());
+}
+
 // ===========================================================================
 // OPT-1: Skip DELETE on cold index
 // ===========================================================================
@@ -178,6 +249,26 @@ TEST_CASE("OPT-1: Warm index (cold_index=false) still executes DELETE", "[persis
     cleanup(tmp);
 }
 
+TEST_CASE("Persist stores symbol fingerprints when present", "[unit][persist_opt][fingerprint]") {
+    auto tmp = make_test_dir("test_persist_symbol_fingerprint");
+    auto db_path = tmp / "fingerprint.sqlite";
+
+    {
+        Connection conn(db_path);
+        schema::ensure_schema(conn);
+
+        Persister persister(conn);
+        auto file = make_scanned_file("src/fingerprint.cpp");
+        ExtractionResult extraction = make_extraction_with_symbols(1, "fp");
+        extraction.symbols[0].fingerprint = std::string(128, 'a');
+
+        REQUIRE(persister.persist_file(file, extraction, "hash-fp", "ok"));
+        REQUIRE(count_query(conn,
+            "SELECT COUNT(*) FROM nodes WHERE fingerprint = '" + std::string(128, 'a') + "'") == 1);
+    }
+    cleanup(tmp);
+}
+
 TEST_CASE("Force clear truncates main-project index but keeps metadata", "[unit][persist_opt][force]") {
     auto tmp = make_test_dir("test_force_clear_main_only");
     auto db_path = tmp / "force_main.sqlite";
@@ -212,6 +303,66 @@ TEST_CASE("Force clear truncates main-project index but keeps metadata", "[unit]
         REQUIRE(schema::get_kv(conn, "custom_key", "") == "custom_value");
         REQUIRE(schema::quarantine_count(conn) == 1);
     }
+    cleanup(tmp);
+}
+
+TEST_CASE("resolve_references emits multiple call edges for overloaded targets",
+          "[unit][persist_opt][resolve_refs]") {
+    auto tmp = make_test_dir("test_resolve_refs_multitarget");
+    auto db_path = tmp / "multitarget.sqlite";
+
+    {
+        Connection conn(db_path);
+        schema::ensure_schema(conn);
+        Persister persister(conn);
+
+        const std::string http_path = "src/HttpClient.cs";
+        const std::string delegating_path = "src/DelegatingHandler.cs";
+        const std::string fake_path = "tests/FakeHandlerTests.cs";
+        const std::string caller_path = "src/Caller.cs";
+
+        int64_t http_file_id = insert_file_row(conn, http_path);
+        int64_t delegating_file_id = insert_file_row(conn, delegating_path);
+        int64_t fake_file_id = insert_file_row(conn, fake_path);
+        int64_t caller_file_id = insert_file_row(conn, caller_path);
+
+        insert_file_node_row(conn, http_path);
+        insert_file_node_row(conn, delegating_path);
+        insert_file_node_row(conn, fake_path);
+        insert_file_node_row(conn, caller_path);
+
+        int64_t http_send = insert_symbol_row(conn, http_file_id, "method", "SendAsync", "HttpClient.SendAsync");
+        int64_t delegating_send = insert_symbol_row(conn, delegating_file_id, "method", "SendAsync", "DelegatingHandler.SendAsync");
+        int64_t fake_send = insert_symbol_row(conn, fake_file_id, "method", "SendAsync", "FakeHandler.SendAsync");
+        int64_t caller_symbol = insert_symbol_row(conn, caller_file_id, "method", "UseAsync", "Caller.UseAsync");
+
+        insert_call_ref_row(conn, caller_file_id, "client.SendAsync", caller_symbol, "DelegatingHandler");
+
+        auto [resolved, edges_created] = persister.resolve_references();
+        CHECK(resolved == 1);
+        CHECK(edges_created == 3);
+
+        CHECK(count_query(conn,
+            "SELECT COUNT(*) FROM refs WHERE resolved_node_id = " + std::to_string(delegating_send)) == 1);
+
+        CHECK(count_query(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
+            " AND kind = 'calls'") == 3);
+
+        CHECK(count_query(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
+            " AND dst_id = " + std::to_string(http_send) +
+            " AND ABS(confidence - 0.75) < 0.0001") == 1);
+        CHECK(count_query(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
+            " AND dst_id = " + std::to_string(delegating_send) +
+            " AND ABS(confidence - 0.95) < 0.0001") == 1);
+        CHECK(count_query(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
+            " AND dst_id = " + std::to_string(fake_send) +
+            " AND ABS(confidence - 0.60) < 0.0001") == 1);
+    }
+
     cleanup(tmp);
 }
 

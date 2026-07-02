@@ -258,3 +258,72 @@ class Holder {
     REQUIRE(class_field != result.refs.end());
     CHECK(class_field->receiver_type_hint == "SavedObjectsRepository");
 }
+
+TEST_CASE("TypeScript call refs infer receiver types through underscore aliases and DI decorators",
+          "[unit][typescript][extractor]") {
+    std::string source = R"(interface IEditorService {
+  openEditor(input: string): void;
+  doSomething(): void;
+}
+
+class FieldAliasConsumer {
+  private _editorService: IEditorService;
+
+  run() {
+    this.editorService.openEditor("a");
+  }
+}
+
+class ConstructorInjectedConsumer {
+  constructor(
+    @IEditorService private readonly editorService: IEditorService
+  ) {}
+
+  run() {
+    this.editorService.doSomething();
+  }
+}
+)";
+
+    auto result = extract_typescript_for_test(source);
+
+    auto underscore_alias = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "this.editorService.openEditor";
+        });
+    REQUIRE(underscore_alias != result.refs.end());
+    CHECK(underscore_alias->receiver_type_hint == "IEditorService");
+
+    auto decorated_di = std::find_if(result.refs.begin(), result.refs.end(),
+        [](const ExtractedRef& ref) {
+            return ref.kind == "call" && ref.name == "this.editorService.doSomething";
+        });
+    REQUIRE(decorated_di != result.refs.end());
+    CHECK(decorated_di->receiver_type_hint == "IEditorService");
+}
+
+TEST_CASE("TypeScript extractor computes MinHash fingerprints for large functions",
+          "[unit][typescript][extractor]") {
+    std::string source = R"(function doWork(items: Item[], prefix: string) {
+  const results: string[] = [];
+  for (const item of items) {
+    const id = item.id;
+    const label = prefix + ":" + item.name;
+    const count = item.count + 1;
+    const active = item.enabled ? "yes" : "no";
+    const payload = { id, label, count, active };
+    if (count > 10) {
+      results.push(JSON.stringify(payload));
+    } else {
+      results.push(label + "-" + String(count));
+    }
+    console.log(id, label, count, active);
+  }
+  return results.join(",");
+})";
+
+    auto result = extract_typescript_for_test(source);
+    auto* fn = find_symbol(result, "function", "doWork");
+    REQUIRE(fn != nullptr);
+    CHECK(fn->fingerprint.size() == 16 * 8);
+}
