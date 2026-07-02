@@ -201,15 +201,7 @@ private:
         if (lang == "python") return tree_sitter_python();
         if (lang == "rust") return tree_sitter_rust();
         if (lang == "java") return tree_sitter_java();
-        // bash DISABLED: tree-sitter-bash v0.23.5's external scanner
-        // (tree_sitter_bash_external_scanner_scan) infinite-loops on virtually
-        // all input under the v0.25.10 runtime — every .sh file hangs a worker
-        // thread at 100% CPU, and the scanner never yields to check the
-        // cancellation flag so the watchdog cannot stop it. Other V23-scanner
-        // grammars (ts/js/python/rust/csharp/cpp) are unaffected. Returning
-        // nullptr makes set_language() fail so .sh files are cleanly skipped
-        // instead of hanging the indexer. Re-enable once the scanner is fixed.
-        if (lang == "bash") return nullptr;
+        if (lang == "bash") return tree_sitter_bash();
         if (lang == "sql") return nullptr; // Deferred — grammar MSVC issues
         if (lang == "go") return tree_sitter_go();
         if (lang == "yaml") return tree_sitter_yaml();

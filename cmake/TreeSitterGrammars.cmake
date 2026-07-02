@@ -51,13 +51,21 @@ macro(ts_grammars_init)
         # Append backwards-compatibility aliases for old grammar generators
         file(APPEND "${TS_GRAMMAR_DIR}/ts_v23_include/tree_sitter/parser.h" "\n\
 // Backwards-compat aliases for grammars generated before tree-sitter 0.24.\n\
-// TSFieldMapSlice was renamed TSMapSlice; TSLexMode was renamed TSLexerMode;\n\
-// .version field was renamed .abi_version in the TSLanguage struct.\n\
+// TSFieldMapSlice was renamed TSMapSlice; .version field was renamed\n\
+// .abi_version in the TSLanguage struct.\n\
+//\n\
+// IMPORTANT: do NOT alias TSLexMode -> TSLexerMode. tree-sitter 0.24 split\n\
+// the 4-byte TSLexMode (abi<=14) into a 6-byte TSLexerMode (abi>=15, adds\n\
+// reserved_word_set_id). abi-14 grammars declare ts_lex_modes[] with the\n\
+// native 4-byte TSLexMode and the runtime reads that array with a 4-byte\n\
+// stride for abi 14. Aliasing forces a 6-byte build, misaligning every\n\
+// lex-mode entry -> corrupt lex states -> spurious regex/ERROR tokens ->\n\
+// malformed trees (and infinite loops in some external scanners). Both\n\
+// TSLexMode and TSLexerMode are already defined in this header, so abi-14\n\
+// grammars (TSLexMode) and abi-15 grammars (TSLexerMode, e.g. C#) each\n\
+// compile against the correct struct with no alias.\n\
 #ifndef TSFieldMapSlice\n\
 #  define TSFieldMapSlice TSMapSlice\n\
-#endif\n\
-#ifndef TSLexMode\n\
-#  define TSLexMode TSLexerMode\n\
 #endif\n\
 #ifndef version\n\
 #  define version abi_version\n\
@@ -179,6 +187,16 @@ macro(add_ts_grammar)
     # v0.23 grammars need C11 on MSVC for designated initializers
     if((_TSG_V23 OR _TSG_C11) AND MSVC)
         target_compile_options(${_tsg_target} PRIVATE /std:c11)
+    endif()
+
+    # abi-14 grammars assign a native TSLexMode[] array to the TSLanguage
+    # .lex_modes field (declared TSLexerMode* in the 0.25 header). This is an
+    # intentional, benign incompatible-pointer-type: the DATA must stay 4-byte
+    # so the runtime's abi-14 stride matches. Suppress the warning so builds
+    # with -Werror don't fail. (Aliasing the types to silence it is what caused
+    # the lex-mode corruption — see the shim header comment.)
+    if(_TSG_V23 AND NOT MSVC)
+        target_compile_options(${_tsg_target} PRIVATE -Wno-incompatible-pointer-types)
     endif()
 
     # Accumulate target name
