@@ -1569,6 +1569,25 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("method", name, node);
     }
+    else if (type == "pair") {
+        // Object-property function value, e.g. `{ handler: (a) => {...} }` or
+        // `{ onDidChange: function() {...} }`. Extracting the property as a
+        // named symbol lets calls inside the callback attribute to a named
+        // container (e.g. `handler`) instead of falling back to file-level.
+        // Without this, command/event handlers registered via object literals
+        // (a very common TS/JS pattern) produce file-level call edges.
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        std::string value_type = ts_node_is_null(value) ? "" : ts_node_type(value);
+        if (is_js_function_like(value_type)) {
+            auto name = get_name_from_child(node, "key");
+            if (name.empty()) {
+                // Computed or string keys: fall back to the key node text.
+                TSNode key = ts_node_child_by_field_name(node, "key", 3);
+                if (!ts_node_is_null(key)) name = node_text(key);
+            }
+            if (!name.empty()) add_symbol("method", name, node);
+        }
+    }
     else if (type == "enum_declaration") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("enum", name, node);
@@ -1618,6 +1637,44 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
             std::string callee = node_text(func);
             add_call_ref(callee, node, "call_expression");
             maybe_add_http_call_ref(result_, *language_, callee, node, *source_, symbol_stack_);
+
+            // Test/lifecycle callbacks: `test('name', () => {...})`,
+            // `describe('name', fn)`, `beforeEach(() => {...})`, etc. The
+            // callback arrow is a direct call argument (not an object-property
+            // pair), so without this its body's calls fall back to file-level.
+            // Extract the callback as a named symbol (by the string name, or
+            // the lifecycle hook name) so calls inside attribute to it — the
+            // TS/JS equivalent of C#/Go's named test methods.
+            static const std::unordered_set<std::string> kTestCallees = {
+                "test", "it", "suite", "describe", "context", "specify",
+                "setup", "teardown", "before", "after",
+                "beforeEach", "afterEach", "beforeAll", "afterAll",
+                "test.only", "it.only", "describe.only", "suite.only",
+                "test.skip", "it.skip", "describe.skip", "suite.skip"
+            };
+            if (kTestCallees.count(callee)) {
+                TSNode args = ts_node_child_by_field_name(node, "arguments", 9);
+                if (!ts_node_is_null(args)) {
+                    std::string test_name;
+                    bool has_fn = false;
+                    uint32_t argc = ts_node_named_child_count(args);
+                    for (uint32_t i = 0; i < argc; ++i) {
+                        TSNode arg = ts_node_named_child(args, i);
+                        std::string at = ts_node_type(arg);
+                        if (test_name.empty() && (at == "string" || at == "template_string")) {
+                            test_name = node_text(arg);
+                            // strip surrounding quotes/backticks
+                            if (test_name.size() >= 2) test_name = test_name.substr(1, test_name.size() - 2);
+                        } else if (is_js_function_like(at)) {
+                            has_fn = true;
+                        }
+                    }
+                    if (has_fn) {
+                        std::string sym_name = test_name.empty() ? callee : test_name;
+                        if (!sym_name.empty()) add_symbol("test", sym_name, node);
+                    }
+                }
+            }
         }
     }
     else if (type == "member_expression") {
