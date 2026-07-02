@@ -229,15 +229,21 @@ int spawn_and_read_stdout(const std::string& exe,
 
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
-    // Open NUL for child stdin (same rationale as spawn_and_wait)
+    // Every handle passed via STARTF_USESTDHANDLES must be valid AND inheritable,
+    // otherwise CreateProcess fails with ERROR_INVALID_PARAMETER (87). GetStdHandle()
+    // can return NULL/non-inheritable handles when this process runs with redirected
+    // streams (ctest, `>NUL`, a service). The caller only reads the child's stdout
+    // (via the pipe), so route stdin and stderr to explicit inheritable NUL handles.
     SECURITY_ATTRIBUTES nul_sa2 = {};
     nul_sa2.nLength = sizeof(nul_sa2);
     nul_sa2.bInheritHandle = TRUE;
     HANDLE nul_stdin2 = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     &nul_sa2, OPEN_EXISTING, 0, nullptr);
+    HANDLE nul_stderr2 = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     &nul_sa2, OPEN_EXISTING, 0, nullptr);
     si.hStdInput = nul_stdin2;
     si.hStdOutput = write_end;                       // child stdout → pipe
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);   // stderr inherited
+    si.hStdError = nul_stderr2;                       // stderr → NUL (not read)
     si.dwFlags = STARTF_USESTDHANDLES;
 
     PROCESS_INFORMATION pi = {};
@@ -248,10 +254,12 @@ int spawn_and_read_stdout(const std::string& exe,
         CloseHandle(read_end);
         CloseHandle(write_end);
         CloseHandle(nul_stdin2);
+        if (nul_stderr2 != INVALID_HANDLE_VALUE) CloseHandle(nul_stderr2);
         if (hJob) CloseHandle(hJob);
         return 1;
     }
     CloseHandle(nul_stdin2);
+    if (nul_stderr2 != INVALID_HANDLE_VALUE) CloseHandle(nul_stderr2);
 
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
     ResumeThread(pi.hThread);
