@@ -14,6 +14,14 @@
 namespace fs = std::filesystem;
 using namespace codetopo;
 
+// Portable "discard stdout+stderr" redirect: cmd.exe has no /dev/null, and a
+// Unix-style redirect makes the whole command fail (non-zero exit) on Windows.
+#ifdef _WIN32
+static constexpr const char* kDevNull = " >NUL 2>NUL";
+#else
+static constexpr const char* kDevNull = " >/dev/null 2>/dev/null";
+#endif
+
 namespace {
 
 void cleanup(const fs::path& p) {
@@ -107,17 +115,17 @@ static DetectChangesDb make_detect_changes_db() {
         std::ofstream(db.root / "src" / "d.cpp") << "int low() { return foo(); }\n";
     }
 
-    REQUIRE(run_cmd("git -C " + quote_path(db.root) + " init >/dev/null 2>/dev/null") == 0);
+    REQUIRE(run_cmd("git -C " + quote_path(db.root) + " init" + kDevNull) == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " config user.email tester@example.com") == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " config user.name Tester") == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " add src && git -C " + quote_path(db.root) +
-                    " commit -m base >/dev/null 2>/dev/null") == 0);
+                    " commit -m base" + kDevNull) == 0);
 
     {
         std::ofstream(db.root / "src" / "a.cpp") << "int foo() { return 2; }\n";
     }
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " add src/a.cpp && git -C " + quote_path(db.root) +
-                    " commit -m change-foo >/dev/null 2>/dev/null") == 0);
+                    " commit -m change-foo" + kDevNull) == 0);
 
     db.db_path = db.root / "index.sqlite";
     Connection conn(db.db_path);

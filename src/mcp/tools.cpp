@@ -1389,6 +1389,15 @@ static yyjson_mut_val* emit_count_array(JsonMutDoc& doc,
     return arr;
 }
 
+// yyjson_mut_obj_add_val() stores the key POINTER without copying it, so passing
+// a temporary/local string's c_str() leaves a dangling key that yyjson_mut_write()
+// later dereferences — producing garbage or an empty document (NULL from write),
+// nondeterministically across platforms. Use this whenever the key is dynamic.
+static inline void obj_add_val_keycopy(JsonMutDoc& doc, yyjson_mut_val* obj,
+                                       const std::string& key, yyjson_mut_val* val) {
+    yyjson_mut_obj_add(obj, yyjson_mut_strcpy(doc.doc, key.c_str()), val);
+}
+
 static void add_callsite_candidate_buckets(JsonMutDoc& doc, yyjson_mut_val* root,
                                            const CallsiteCandidateSet& candidates) {
     auto* buckets = doc.new_obj();
@@ -1399,7 +1408,7 @@ static void add_callsite_candidate_buckets(JsonMutDoc& doc, yyjson_mut_val* root
         yyjson_mut_obj_add_val(doc.doc, item, "top_files",
             emit_count_array(doc, bucket.files, 3));
         std::string key = arity < 0 ? "unknown" : std::to_string(arity);
-        yyjson_mut_obj_add_val(doc.doc, by_arg_count, key.c_str(), item);
+        obj_add_val_keycopy(doc, by_arg_count, key, item);
     }
     yyjson_mut_obj_add_val(doc.doc, buckets, "arg_count", by_arg_count);
     yyjson_mut_obj_add_val(doc.doc, buckets, "heuristic",
@@ -3791,7 +3800,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
             auto* arr = doc.new_arr();
             for (size_t idx : indices)
                 yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
-            yyjson_mut_obj_add_val(doc.doc, grouped, gkey.empty() ? "(unknown)" : gkey.c_str(), arr);
+            obj_add_val_keycopy(doc, grouped, gkey.empty() ? std::string("(unknown)") : gkey, arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else if (group_by && strcmp(group_by, "symbol") == 0) {
@@ -3803,7 +3812,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
             auto* arr = doc.new_arr();
             for (size_t idx : indices)
                 yyjson_mut_arr_append(arr, emit_caller_item(rows[idx]));
-            yyjson_mut_obj_add_val(doc.doc, grouped, gkey.c_str(), arr);
+            obj_add_val_keycopy(doc, grouped, gkey, arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else {
@@ -3921,7 +3930,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
             auto* arr = doc.new_arr();
             for (size_t idx : indices)
                 yyjson_mut_arr_append(arr, emit_callee_item(rows[idx]));
-            yyjson_mut_obj_add_val(doc.doc, grouped, gkey.empty() ? "(unknown)" : gkey.c_str(), arr);
+            obj_add_val_keycopy(doc, grouped, gkey.empty() ? std::string("(unknown)") : gkey, arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else if (group_by && strcmp(group_by, "symbol") == 0) {
@@ -3932,7 +3941,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
             auto* arr = doc.new_arr();
             for (size_t idx : indices)
                 yyjson_mut_arr_append(arr, emit_callee_item(rows[idx]));
-            yyjson_mut_obj_add_val(doc.doc, grouped, gkey.c_str(), arr);
+            obj_add_val_keycopy(doc, grouped, gkey, arr);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "groups", grouped);
     } else {
