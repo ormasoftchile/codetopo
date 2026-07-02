@@ -145,7 +145,11 @@ int run_index_supervisor(const Config& config,
         // confuse it with the new child's progress.
         std::filesystem::remove(progress_path);
 
-        int exit_code = spawn_and_wait(self, args);
+        // Use stall-timeout waiting: if child makes no progress for 120s,
+        // kill it (handles infinite parse loops that ignore cancellation flag).
+        constexpr int STALL_TIMEOUT_S = 120;
+        int exit_code = spawn_and_wait_with_stall_timeout(
+            self, args, progress_path.string(), STALL_TIMEOUT_S);
 
         if (exit_code == 0) {
             // Success — clean up temp files

@@ -5,6 +5,7 @@
 
 #include "core/arena.h"
 #include "core/arena_pool.h"
+#include "core/arena_ledger.h"
 #include "core/thread_pool.h"
 #include "db/connection.h"
 #include "db/schema.h"
@@ -33,6 +34,7 @@
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <cstdlib>  // _exit()
 #ifdef _WIN32
 #include <process.h>  // _beginthreadex
 #include <windows.h>
@@ -182,6 +184,9 @@ static void embed_symbols(Connection& conn, const TokenVectorTable& tvt) {
 // T045-T050: Full index command implementation with parallel parse.
 int run_index(const Config& config) {
     namespace fs = std::filesystem;
+
+    // Install arena ledger crash handler (no-op unless ARENA_LEDGER is defined)
+    arena_ledger_install_crash_handler();
 
     Profiler profiler;
     profiler.enabled = config.profile;
@@ -571,22 +576,23 @@ int run_index(const Config& config) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         slots[slot].start_epoch_ms.store(now_ms, std::memory_order_release);
 
-        // Fresh parser per file — parser reuse (DEC-039 OPT-5) reverted per DEC-038/039.
-        // Tree-sitter parsers cache internal buffers from the arena; reusing across
-        // arena boundaries causes dangling pointers and heap corruption at high throughput.
-        //
-        // IMPORTANT: Parser is wrapped in a nested scope so ts_parser_delete() runs
-        // while the arena is still active. If set_thread_arena(nullptr) is called first
-        // and ts_parser_delete() then tries to allocate/realloc (e.g. cleanup tables),
-        // ts_arena_malloc returns nullptr → SIGSEGV. The nested scope ensures the
-        // Parser destructor fires before any set_thread_arena(nullptr) call.
+        // RAII guard: sets arena to nullptr when scope exits — declared BEFORE Parser
+        // so it destructs LAST (C++ reverse-order destruction). This guarantees
+        // ts_parser_delete() always fires BEFORE set_thread_arena(nullptr), on ALL
+        // code paths including early returns (overflow, timeout, language-not-found).
+        // Previous fix (nested scope + manual set_thread_arena) only fixed the normal
+        // path; early returns still called set_thread_arena(nullptr) inside the scope
+        // before Parser went out of scope → ts_parser_delete with null arena → SIGSEGV.
+        struct ArenaResetGuard {
+            ~ArenaResetGuard() { set_thread_arena(nullptr); }
+        } arena_guard;
+
         {
         Parser parser;
         if (!parser.set_language(file.language)) {
             slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
             result.parse_status = "skipped";
             result.parse_error = "language grammar not available";
-            set_thread_arena(nullptr);
             return result;
         }
         if (config.parse_timeout_s > 0) {
@@ -612,7 +618,6 @@ int run_index(const Config& config) {
                 std::to_string(lease->get()->capacity() / (1024*1024)) + "MB arena, " +
                 std::to_string(file.size_bytes / 1024) + "KB file)";
             result.has_error = true;
-            set_thread_arena(nullptr);
             return result;
         }
 
@@ -621,7 +626,6 @@ int run_index(const Config& config) {
             result.parse_status = "failed";
             result.parse_error = "parse cancelled by watchdog (exceeded timeout)";
             result.has_error = true;
-            set_thread_arena(nullptr);
             return result;
         }
 
@@ -646,6 +650,7 @@ int run_index(const Config& config) {
         tree = TreeGuard(nullptr);
 
         } // end Parser scope — ts_parser_delete() runs here, arena still active
+        // arena_guard destructs next → set_thread_arena(nullptr)
 
         // Mark slot idle now that both parse + extract are done.
         slots[slot].start_epoch_ms.store(0, std::memory_order_relaxed);
@@ -654,7 +659,6 @@ int run_index(const Config& config) {
             result.parse_status = "failed";
             result.parse_error = "extraction cancelled by watchdog (exceeded timeout)";
             result.has_error = true;
-            set_thread_arena(nullptr);
             return result;
         }
 
@@ -1121,6 +1125,16 @@ int run_index(const Config& config) {
     auto total_elapsed = std::chrono::steady_clock::now() - start_time;
     auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(total_elapsed).count();
     profiler.print_report(total_us, total, thread_count);
+
+    // If any worker threads were stuck (infinite parse loop, unresponsive to
+    // cancellation) and had to be detached, use _exit() to prevent UB: the
+    // detached threads still reference stack variables that would become dangling
+    // after run_index() returns. _exit() terminates all threads immediately.
+    // The DB was already checkpointed above, so data is safe.
+    if (worker_pool.had_stuck_threads()) {
+        std::cerr << "NOTE: stuck parse threads detected — using fast exit\n";
+        _exit(persist_errors > 0 ? 1 : 0);
+    }
 
     return persist_errors > 0 ? 1 : 0;
 }

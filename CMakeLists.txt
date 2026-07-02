@@ -85,6 +85,7 @@ add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.5 SC
 set(CODETOPO_SOURCES
     src/main.cpp
     src/core/arena.cpp
+    src/core/arena_ledger.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
     src/db/workspace.cpp
@@ -99,6 +100,14 @@ add_executable(codetopo ${CODETOPO_SOURCES})
 target_include_directories(codetopo PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+# Optional arena allocation ledger for debugging crashes.
+# Enable with: cmake -DARENA_LEDGER=ON ...
+option(ARENA_LEDGER "Enable thread-local arena allocation ledger (debug)" OFF)
+if(ARENA_LEDGER)
+    message(STATUS "Arena ledger enabled — builds with ARENA_LEDGER")
+    target_compile_definitions(codetopo PRIVATE ARENA_LEDGER)
+endif()
 
 target_link_libraries(codetopo PRIVATE
     unofficial::sqlite3::sqlite3
@@ -160,6 +169,7 @@ set(CODETOPO_TEST_SOURCES
 # Source files (excluding main.cpp) needed by tests
 set(CODETOPO_LIB_SOURCES
     src/core/arena.cpp
+    src/core/arena_ledger.cpp
     src/core/config.cpp
     src/cli/cmd_index.cpp
     src/db/workspace.cpp

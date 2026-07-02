@@ -1,5 +1,8 @@
 #include "util/process.h"
 #include <iostream>
+#include <filesystem>
+#include <thread>
+#include <chrono>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -7,6 +10,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <spawn.h>
+#include <signal.h>
 extern char** environ;
 #endif
 
@@ -121,6 +125,72 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);  // Convention: 128+signal
     return 1;
+#endif
+}
+
+int spawn_and_wait_with_stall_timeout(
+    const std::string& exe,
+    const std::vector<std::string>& args,
+    const std::string& progress_path,
+    int stall_timeout_s)
+{
+#ifdef _WIN32
+    // Windows: use spawn_and_wait (no stall detection implemented yet)
+    (void)progress_path; (void)stall_timeout_s;
+    return spawn_and_wait(exe, args);
+#else
+    pid_t pid;
+    std::vector<const char*> argv;
+    argv.push_back(exe.c_str());
+    for (const auto& arg : args) argv.push_back(arg.c_str());
+    argv.push_back(nullptr);
+
+    int rc = posix_spawn(&pid, exe.c_str(), nullptr, nullptr,
+                         const_cast<char* const*>(argv.data()), environ);
+    if (rc != 0) {
+        std::cerr << "ERROR: posix_spawn failed (rc=" << rc << ")\n";
+        return 1;
+    }
+
+    // Track the last known mtime of the progress file.
+    // We only reset the stall clock when the mtime actually CHANGES.
+    std::filesystem::file_time_type last_known_mtime = {};
+    auto start_time = std::chrono::steady_clock::now();
+    auto last_progress_seen = start_time;
+    const auto stall_limit = std::chrono::seconds(stall_timeout_s);
+
+    while (true) {
+        // Check if child exited (non-blocking)
+        int status = 0;
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            if (WIFEXITED(status)) return WEXITSTATUS(status);
+            if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+            return 1;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+
+        // Reset stall clock ONLY when the progress file's mtime changes —
+        // i.e., when the child actually commits a new batch.
+        std::error_code ec;
+        auto mtime = std::filesystem::last_write_time(progress_path, ec);
+        if (!ec && mtime != last_known_mtime) {
+            last_known_mtime = mtime;
+            last_progress_seen = std::chrono::steady_clock::now();
+        }
+
+        // Stall detection: if no new progress for stall_limit seconds AND
+        // total elapsed also exceeds the limit (grace period for initial scan).
+        auto now = std::chrono::steady_clock::now();
+        if (now - start_time > stall_limit && now - last_progress_seen > stall_limit) {
+            std::cerr << "SUPERVISOR: child stalled (no progress in "
+                      << stall_timeout_s << "s) — killing PID " << pid << "\n";
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return 128 + SIGKILL;
+        }
+    }
 #endif
 }
 
