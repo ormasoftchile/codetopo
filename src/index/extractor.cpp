@@ -1995,8 +1995,9 @@ std::string read_file_content(const std::filesystem::path& path) {
     return content;
 #else
     // POSIX: use open() with posix_fadvise for sequential read-ahead
-    auto size = std::filesystem::file_size(path);
-    if (size == 0) return "";
+    std::error_code _fs_ec;
+    auto size = std::filesystem::file_size(path, _fs_ec);
+    if (_fs_ec || size == 0) return "";
 
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return "";

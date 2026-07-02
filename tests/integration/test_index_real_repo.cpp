@@ -136,9 +136,9 @@ TEST_CASE("Index real repo produces nonzero counts", "[integration][us1]") {
             // cast away const for get_kv helper
             auto& mutable_conn = const_cast<Connection&>(conn);
             auto version = schema::get_kv(mutable_conn, "schema_version");
-            REQUIRE(version == "1");
+            REQUIRE(version == std::to_string(CURRENT_SCHEMA_VERSION));
             auto idx_version = schema::get_kv(mutable_conn, "indexer_version");
-            REQUIRE(idx_version == "1.0.0");
+            REQUIRE(idx_version == INDEXER_VERSION);
         }
     }
 
