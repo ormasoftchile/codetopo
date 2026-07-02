@@ -14,6 +14,14 @@
 namespace fs = std::filesystem;
 using namespace codetopo;
 
+// Portable "discard stdout+stderr" redirect: cmd.exe has no /dev/null, and a
+// Unix-style redirect makes the whole command fail (non-zero exit) on Windows.
+#ifdef _WIN32
+static constexpr const char* kDevNull = " >NUL 2>NUL";
+#else
+static constexpr const char* kDevNull = " >/dev/null 2>/dev/null";
+#endif
+
 namespace {
 
 void cleanup(const fs::path& p) {
@@ -107,17 +115,17 @@ static DetectChangesDb make_detect_changes_db() {
         std::ofstream(db.root / "src" / "d.cpp") << "int low() { return foo(); }\n";
     }
 
-    REQUIRE(run_cmd("git -C " + quote_path(db.root) + " init >/dev/null 2>/dev/null") == 0);
+    REQUIRE(run_cmd("git -C " + quote_path(db.root) + " init" + kDevNull) == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " config user.email tester@example.com") == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " config user.name Tester") == 0);
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " add src && git -C " + quote_path(db.root) +
-                    " commit -m base >/dev/null 2>/dev/null") == 0);
+                    " commit -m base" + kDevNull) == 0);
 
     {
         std::ofstream(db.root / "src" / "a.cpp") << "int foo() { return 2; }\n";
     }
     REQUIRE(run_cmd("git -C " + quote_path(db.root) + " add src/a.cpp && git -C " + quote_path(db.root) +
-                    " commit -m change-foo >/dev/null 2>/dev/null") == 0);
+                    " commit -m change-foo" + kDevNull) == 0);
 
     db.db_path = db.root / "index.sqlite";
     Connection conn(db.db_path);
@@ -137,7 +145,7 @@ static DetectChangesDb make_detect_changes_db() {
     insert_edge(conn, db.baz, db.bar, "calls", 0.8);
     insert_edge(conn, db.low, db.foo, "calls", 0.3);
 
-    schema::set_kv(conn, "repo_root", db.root.string());
+    schema::set_kv(conn, "repo_root", db.root.generic_string());
     schema::set_kv(conn, "last_index_time", "2026-06-29T20:49:15-04:00");
     conn.wal_checkpoint();
     return db;
@@ -148,7 +156,7 @@ static std::string invoke_detect_changes(const DetectChangesDb& db, const std::s
     QueryCache cache(conn);
     auto params_doc = json_parse(params);
     REQUIRE(params_doc);
-    return tools::detect_changes(params_doc.root(), conn, cache, db.root.string());
+    return tools::detect_changes(params_doc.root(), conn, cache, db.root.generic_string());
 }
 
 static yyjson_val* require_array_field(yyjson_val* obj, const char* key) {
@@ -173,7 +181,7 @@ static yyjson_val* find_by_name(yyjson_val* arr, const std::string& name) {
 TEST_CASE("detect_changes returns changed and impacted symbols from git diff", "[unit][mcp]") {
     auto db = make_detect_changes_db();
     std::string params =
-        "{\"repo_root\":\"" + db.root.string() + "\","
+        "{\"repo_root\":\"" + db.root.generic_string() + "\","
         "\"since\":\"HEAD~1\","
         "\"depth\":2,"
         "\"min_confidence\":0.5}";
@@ -214,7 +222,7 @@ TEST_CASE("detect_changes returns changed and impacted symbols from git diff", "
 TEST_CASE("detect_changes honors file_pattern filters", "[unit][mcp]") {
     auto db = make_detect_changes_db();
     std::string params =
-        "{\"repo_root\":\"" + db.root.string() + "\","
+        "{\"repo_root\":\"" + db.root.generic_string() + "\","
         "\"since\":\"HEAD~1\","
         "\"file_pattern\":\"src/**/*.go\"}";
 

@@ -68,27 +68,26 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
 
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
-    // Open NUL for child stdin — child process doesn't need stdin, and inheriting
-    // parent's stdin breaks MCP server mode (child would read JSON-RPC messages).
-    SECURITY_ATTRIBUTES nul_sa = {};
-    nul_sa.nLength = sizeof(nul_sa);
-    nul_sa.bInheritHandle = TRUE;
-    HANDLE nul_stdin = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                   &nul_sa, OPEN_EXISTING, 0, nullptr);
-    si.hStdInput = nul_stdin;
-    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    si.dwFlags = STARTF_USESTDHANDLES;
 
+    // Spawn WITHOUT inheriting handles (bInheritHandles = FALSE). Rationale:
+    //  * MCP correctness: when the parent is the MCP server, its stdin carries
+    //    JSON-RPC and the child must never consume it. A non-inheriting spawn
+    //    guarantees that without handing the child an explicit NUL stdin.
+    //  * Robustness: STARTF_USESTDHANDLES requires every std handle to be valid
+    //    AND inheritable, else CreateProcess fails with ERROR_INVALID_PARAMETER
+    //    (87). That happens whenever codetopo itself runs with redirected/absent
+    //    streams (under ctest, `>NUL`, or as a service) — exactly how the
+    //    supervised reindex worker is launched. The supervisor only needs the
+    //    child's exit code, so inheriting std handles buys nothing.
+    // The child is still bound to the supervisor's lifetime via the kill-on-close
+    // job object created above.
     PROCESS_INFORMATION pi = {};
     if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
-                        TRUE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+                        FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
         std::cerr << "ERROR: Failed to spawn child process (error " << GetLastError() << ")\n";
-        CloseHandle(nul_stdin);
         if (hJob) CloseHandle(hJob);
         return 1;
     }
-    CloseHandle(nul_stdin);
 
     // Assign to job object before resuming
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
@@ -230,15 +229,21 @@ int spawn_and_read_stdout(const std::string& exe,
 
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
-    // Open NUL for child stdin (same rationale as spawn_and_wait)
+    // Every handle passed via STARTF_USESTDHANDLES must be valid AND inheritable,
+    // otherwise CreateProcess fails with ERROR_INVALID_PARAMETER (87). GetStdHandle()
+    // can return NULL/non-inheritable handles when this process runs with redirected
+    // streams (ctest, `>NUL`, a service). The caller only reads the child's stdout
+    // (via the pipe), so route stdin and stderr to explicit inheritable NUL handles.
     SECURITY_ATTRIBUTES nul_sa2 = {};
     nul_sa2.nLength = sizeof(nul_sa2);
     nul_sa2.bInheritHandle = TRUE;
     HANDLE nul_stdin2 = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     &nul_sa2, OPEN_EXISTING, 0, nullptr);
+    HANDLE nul_stderr2 = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     &nul_sa2, OPEN_EXISTING, 0, nullptr);
     si.hStdInput = nul_stdin2;
     si.hStdOutput = write_end;                       // child stdout → pipe
-    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);   // stderr inherited
+    si.hStdError = nul_stderr2;                       // stderr → NUL (not read)
     si.dwFlags = STARTF_USESTDHANDLES;
 
     PROCESS_INFORMATION pi = {};
@@ -249,10 +254,12 @@ int spawn_and_read_stdout(const std::string& exe,
         CloseHandle(read_end);
         CloseHandle(write_end);
         CloseHandle(nul_stdin2);
+        if (nul_stderr2 != INVALID_HANDLE_VALUE) CloseHandle(nul_stderr2);
         if (hJob) CloseHandle(hJob);
         return 1;
     }
     CloseHandle(nul_stdin2);
+    if (nul_stderr2 != INVALID_HANDLE_VALUE) CloseHandle(nul_stderr2);
 
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
     ResumeThread(pi.hThread);
