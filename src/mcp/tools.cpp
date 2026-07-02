@@ -1585,6 +1585,24 @@ static bool detect_changes_matches_pattern(const std::string& rel_path, const ch
 }
 
 static std::string find_git_executable() {
+#ifdef _WIN32
+    // Common Git-for-Windows install locations. CreateProcess (with a NULL
+    // application name) does not run PATH the way cmd.exe does for a bare "git",
+    // and it will not find a Unix-style path, so probe real locations first.
+    static const char* candidates[] = {
+        "C:\\Program Files\\Git\\cmd\\git.exe",
+        "C:\\Program Files\\Git\\bin\\git.exe",
+        "C:\\Program Files (x86)\\Git\\cmd\\git.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\git.exe",
+    };
+    for (const char* candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec)) return candidate;
+    }
+    // Fall back to the bare name; CreateProcess searches the standard path and
+    // appends .exe, which resolves git when it is on PATH (GitHub runners).
+    return "git.exe";
+#else
     static const char* candidates[] = {
         "/usr/bin/git",
         "/opt/homebrew/bin/git",
@@ -1595,6 +1613,7 @@ static std::string find_git_executable() {
         if (std::filesystem::exists(candidate, ec)) return candidate;
     }
     return "/usr/bin/git";
+#endif
 }
 
 static bool collect_git_changed_files(const std::string& repo_root,
