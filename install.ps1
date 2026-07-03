@@ -12,9 +12,12 @@
       6. Prints a next-step hint
 
     cmake is located in this order:
-      1. cmake already on PATH
-      2. CMake bundled with Visual Studio (located via vswhere)
-      3. A standalone install at "C:\Program Files\CMake\bin\cmake.exe"
+      1. CMake bundled with the matched Visual Studio install, found by filesystem
+         glob (reuses the install pinned in build\CMakeCache.txt so the build stays
+         incremental). Works even when vswhere.exe is not installed.
+      2. cmake already on PATH
+      3. CMake bundled with Visual Studio via vswhere (if installed)
+      4. A standalone install at "C:\Program Files\CMake\bin\cmake.exe"
 
     NOTE — cmake --install support:
       CMakeLists.txt does not currently define an install() target, so this
@@ -44,12 +47,136 @@ function Write-WarnMsg  { param([string]$m) Write-Host "  [!] $m" -ForegroundCol
 function Write-Section { param([string]$m) Write-Host "`n$m" -ForegroundColor White }
 function Die           { param([string]$m) Write-Host "  [X] ERROR: $m" -ForegroundColor Red; exit 1 }
 
+# ─── Locate Visual Studio / cmake / MSVC (vswhere-free) ─────────────────────────
+
+# Newest-first list of VS install roots (…\Microsoft Visual Studio\<year>\<edition>)
+# that carry the MSVC toolset. Used instead of vswhere.exe, which is not always
+# installed — and when it's missing, vcpkg can't auto-detect Visual Studio either.
+function Get-VsInstallRoots {
+    $base = 'C:\Program Files\Microsoft Visual Studio'
+    if (-not (Test-Path $base)) { return @() }
+    # Rank installs by their newest MSVC toolset version (descending). Folder names mix
+    # year (2019/2022) and product major (18 = VS 2026), so a plain name sort is wrong
+    # ("2022" sorts above "18" even though 18 is newer). The toolset version under
+    # VC\Tools\MSVC is an unambiguous newest-wins signal.
+    Get-ChildItem $base -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ChildItem $_.FullName -Directory -ErrorAction SilentlyContinue } |
+        Where-Object { Test-Path (Join-Path $_.FullName 'VC\Auxiliary\Build\vcvars64.bat') } |
+        ForEach-Object {
+            $toolset = [version]'0.0'
+            $msvcDir = Join-Path $_.FullName 'VC\Tools\MSVC'
+            if (Test-Path $msvcDir) {
+                foreach ($d in (Get-ChildItem $msvcDir -Directory -ErrorAction SilentlyContinue)) {
+                    $v = $null
+                    if ([version]::TryParse($d.Name, [ref]$v) -and $v -gt $toolset) { $toolset = $v }
+                }
+            }
+            [pscustomobject]@{ Path = $_.FullName; Toolset = $toolset }
+        } |
+        Sort-Object Toolset -Descending |
+        Select-Object -ExpandProperty Path
+}
+
+# Choose which VS install to build with. If build\CMakeCache.txt already pins a
+# generator instance, reuse that exact install so the build stays INCREMENTAL — a
+# mismatch forces CMake to wipe and reconfigure (the slow "from scratch" rebuild).
+# Otherwise use the newest install found.
+function Resolve-VsRoot {
+    $roots = @(Get-VsInstallRoots)
+    if (-not $roots) { return $null }
+    $cache = Join-Path $ScriptDir 'build\CMakeCache.txt'
+    if (Test-Path $cache) {
+        $m = Select-String -Path $cache -Pattern '^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$' -ErrorAction SilentlyContinue
+        if ($m) {
+            $pinned = ($m.Matches[0].Groups[1].Value).Trim() -replace '/', '\'
+            $hit = $roots | Where-Object { $_ -ieq $pinned } | Select-Object -First 1
+            if ($hit) { return $hit }
+        }
+    }
+    return $roots[0]
+}
+
+# Import the MSVC dev environment (vcvars64.bat) for the chosen VS install into this
+# session. vcpkg and CMake need the toolset on PATH/INCLUDE/LIB; importing vcvars is
+# the reliable way to make MSVC discoverable without vswhere.
+#
+# Crucially, if a cl.exe from a DIFFERENT VS install is already on PATH (e.g. inherited
+# from an earlier shell), re-import the chosen install's vcvars anyway. Otherwise vcpkg
+# builds dependencies with one toolset while CMake links the project with another,
+# producing unresolved-symbol link errors (LNK2019) from mismatched STL versions.
+function Initialize-MsvcEnv {
+    param([string]$VsRoot)
+    $clCmd = Get-Command cl -ErrorAction SilentlyContinue
+    $cl = if ($clCmd) { $clCmd.Source } else { $null }
+    if ($cl -and (-not $VsRoot -or $cl.StartsWith($VsRoot, [System.StringComparison]::OrdinalIgnoreCase))) {
+        return $true
+    }
+    if (-not $VsRoot) { return $false }
+    $vcvars = Join-Path $VsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+    if (-not (Test-Path $vcvars)) { return $false }
+    # Clear the dev-shell re-entrancy guards so vcvars fully re-initializes even when a
+    # DIFFERENT VS environment is already active in this session. Otherwise vcvars sees
+    # VSCMD_VER set and just echoes back the stale, inherited toolset (mixed-toolchain).
+    $cmdLine = "set `"VSCMD_VER=`" && set `"__VSCMD_PREINIT_PATH=`" && `"$vcvars`" >nul 2>&1 && set"
+    & cmd.exe /c $cmdLine | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+        }
+    }
+    $newClCmd = Get-Command cl -ErrorAction SilentlyContinue
+    $newCl = if ($newClCmd) { $newClCmd.Source } else { $null }
+    return [bool]($newCl -and (-not $VsRoot -or $newCl.StartsWith($VsRoot, [System.StringComparison]::OrdinalIgnoreCase)))
+}
+
+function Test-BuildCacheToolchainMismatch {
+    param([string]$VsRoot, [string]$ClPath)
+
+    $cache = Join-Path $ScriptDir 'build\CMakeCache.txt'
+    if (-not (Test-Path $cache)) { return $false }
+
+    $raw = Get-Content $cache -Raw
+    $generatorMatch = [regex]::Match($raw, '(?m)^CMAKE_GENERATOR_INSTANCE:INTERNAL=(.+)$')
+    if ($generatorMatch.Success) {
+        $cachedVsRoot = ($generatorMatch.Groups[1].Value).Trim() -replace '/', '\'
+        if ($cachedVsRoot -and $cachedVsRoot -ne $VsRoot) {
+            return $true
+        }
+    }
+
+    $compilerMatch = [regex]::Match($raw, '(?m)^CMAKE_CXX_COMPILER:FILEPATH=(.+)$')
+    if ($compilerMatch.Success) {
+        $cachedCompiler = ($compilerMatch.Groups[1].Value).Trim() -replace '/', '\'
+        if ($cachedCompiler -and $cachedCompiler -ne $ClPath) {
+            return $true
+        }
+    }
+
+    $cCompilerMatch = [regex]::Match($raw, '(?m)^CMAKE_C_COMPILER:FILEPATH=(.+)$')
+    if ($cCompilerMatch.Success) {
+        $cachedCCompiler = ($cCompilerMatch.Groups[1].Value).Trim() -replace '/', '\'
+        if ($cachedCCompiler -and $cachedCCompiler -ne $ClPath) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 # ─── Locate cmake ───────────────────────────────────────────────────────────────
 function Resolve-CMake {
+    param([string]$VsRoot)
+
+    # Prefer the CMake bundled with the chosen VS install: its default generator
+    # matches the existing build cache, keeping the build incremental.
+    if ($VsRoot) {
+        $bundled = Join-Path $VsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+        if (Test-Path $bundled) { return $bundled }
+    }
+
     $cmd = Get-Command cmake -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # Try Visual Studio's bundled CMake via vswhere.
+    # Try Visual Studio's bundled CMake via vswhere (if present).
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (Test-Path $vswhere) {
         $vsRoot = & $vswhere -latest -products * `
@@ -71,7 +198,10 @@ function Resolve-CMake {
 # ─── 1. Prerequisites ───────────────────────────────────────────────────────────
 Write-Section 'Checking prerequisites...'
 
-$CMake = Resolve-CMake
+$VsRoot = Resolve-VsRoot
+if ($VsRoot) { Write-Ok "Visual Studio: $VsRoot" }
+
+$CMake = Resolve-CMake -VsRoot $VsRoot
 if (-not $CMake) {
     Die "cmake not found. Install CMake >= 3.20 (https://cmake.org/download/) or the Visual Studio 'C++ CMake tools for Windows' component."
 }
@@ -90,20 +220,14 @@ if ($cmakeVersion -lt [version]'3.20.0') {
 }
 Write-Ok "cmake $cmakeVersionStr ($CMake)"
 
-# C++20 compiler — MSVC. Locate a VS install with the VC toolset.
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-if (Test-Path $vswhere) {
-    $vsInstall = & $vswhere -latest -products * `
-        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property displayName 2>$null
-    if ($vsInstall) {
-        Write-Ok "Compiler: $vsInstall (MSVC)"
-    } else {
-        Write-WarnMsg "No MSVC C++ toolset detected via vswhere. Install the 'Desktop development with C++' workload."
-        Write-WarnMsg "CMake configuration will fail without a C++20 compiler."
-    }
+# C++20 compiler — MSVC. Import the dev environment so cl.exe / INCLUDE / LIB are set
+# for vcpkg and CMake. This works without vswhere, which isn't always installed.
+if (Initialize-MsvcEnv -VsRoot $VsRoot) {
+    $clPath = (Get-Command cl -ErrorAction SilentlyContinue).Source
+    Write-Ok "Compiler: MSVC ($clPath)"
 } else {
-    Write-WarnMsg "vswhere not found; cannot verify MSVC. Ensure Visual Studio with the C++ workload is installed."
+    Write-WarnMsg "MSVC C++ toolset not detected. Install Visual Studio's 'Desktop development with C++' workload."
+    Write-WarnMsg "CMake configuration will fail without a C++20 compiler."
 }
 
 # vcpkg — CMakeLists.txt will auto-clone if missing, but warn so the user knows.
@@ -139,8 +263,19 @@ try {
         Start-Sleep -Milliseconds 300
     }
 
+    $clPath = (Get-Command cl -ErrorAction SilentlyContinue).Source
+    if ($VsRoot -and $clPath -and (Test-BuildCacheToolchainMismatch -VsRoot $VsRoot -ClPath $clPath)) {
+        Write-WarnMsg "Existing build cache points at a different toolchain; resetting build directory..."
+        Remove-Item -Recurse -Force (Join-Path $ScriptDir 'build') -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path (Join-Path $ScriptDir 'build') -Force | Out-Null
+    }
+
     Write-Info 'Configuring...'
-    & $CMake --preset release
+    $configureArgs = @('--preset', 'release')
+    if ($VsRoot -and $clPath) {
+        $configureArgs += @("-DCMAKE_C_COMPILER=$clPath", "-DCMAKE_CXX_COMPILER=$clPath")
+    }
+    & $CMake @configureArgs
     if ($LASTEXITCODE -ne 0) { Die "CMake configuration failed (exit $LASTEXITCODE)." }
 
     Write-Info 'Compiling... (this may take a few minutes on first run)'
