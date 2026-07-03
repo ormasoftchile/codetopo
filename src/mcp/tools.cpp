@@ -2093,8 +2093,23 @@ static void architecture_accumulate_cluster_edge(
 
 } // namespace
 
-std::string get_architecture(yyjson_val* params, Connection& conn,
+std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
                              QueryCache& /*cache*/, const std::string& repo_root) {
+    // get_architecture builds per-call TEMP tables (temp.arch_scope_files / _nodes). Do
+    // that work on a PRIVATE connection so the temp-table state can never leak onto the
+    // shared, long-lived MCP connection: a persistent read-only connection that created
+    // these temp tables once would fail the NEXT call's "DROP TABLE IF EXISTS temp.*"
+    // with SQLITE_LOCKED ("database table is locked"). A throwaway connection (destroyed
+    // on return) mirrors the CLI's fresh-connection-per-call behavior, which never hit
+    // this. Fall back to the shared connection for in-memory/temp DBs (no filename),
+    // which are only ever used single-shot (tests).
+    const char* arch_db_file = sqlite3_db_filename(mcp_conn.raw(), "main");
+    std::unique_ptr<Connection> arch_conn;
+    if (arch_db_file && *arch_db_file) {
+        arch_conn = std::make_unique<Connection>(std::filesystem::path(arch_db_file), true);
+    }
+    Connection& conn = arch_conn ? *arch_conn : mcp_conn;
+
     int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
     if (limit > 100) limit = 100;
     if (limit < 1) limit = 1;
