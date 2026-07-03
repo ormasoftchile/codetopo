@@ -142,6 +142,18 @@ int run_index(const Config& config) {
     auto repo_root = fs::canonical(config.repo_root);
     auto db_path = config.db_path;
 
+    // In supervised mode a live MCP reader holds a WAL read mark, so a TRUNCATE (or
+    // RESTART) checkpoint would block on it for the full busy_timeout (up to 30s) at
+    // EVERY checkpoint below -- turning a fast incremental reindex into a multi-30s
+    // stall that makes the MCP session look hung during watch-mode reindex-on-checkout.
+    // PASSIVE never blocks on readers: it checkpoints what it can now and lets
+    // autocheckpoint fold the rest in later. Standalone (non-supervised) indexing has no
+    // concurrent reader, so TRUNCATE is safe there and keeps the WAL from surviving at
+    // multi-GB size.
+    const char* const kWalCheckpoint = config.supervised
+        ? "PRAGMA wal_checkpoint(PASSIVE)"
+        : "PRAGMA wal_checkpoint(TRUNCATE)";
+
     // Acquire lock (T014/FR-036)
     auto lock_path = db_path;
     lock_path += ".lock";
@@ -307,7 +319,7 @@ int run_index(const Config& config) {
         }
 
         persister.write_metadata(repo_root.string());
-        conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        conn.exec(kWalCheckpoint);
         fs::remove(worklist_path);  // Clean up stale worklist
         return 0;
     }
@@ -769,7 +781,7 @@ int run_index(const Config& config) {
     
     std::thread persist_thread([&persist_queue, &persist_state, &persister, &profiler, 
                                  &config, &work_list, effective_batch_size, &progress_path,
-                                 &conn]() {
+                                 &conn, kWalCheckpoint]() {
         persister.begin_batch();
         int local_count = 0;
 
@@ -846,7 +858,7 @@ int run_index(const Config& config) {
                 ++fts_count;
                 if (fts_count % fts_batch == 0) {
                     conn.exec("COMMIT");
-                    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+                    conn.exec(kWalCheckpoint);
                     conn.exec("BEGIN TRANSACTION");
                     auto now = std::chrono::steady_clock::now();
                     auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - fts_start).count();
@@ -856,7 +868,7 @@ int run_index(const Config& config) {
                 }
             }
             conn.exec("COMMIT");
-            conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+            conn.exec(kWalCheckpoint);
 
             sqlite3_finalize(cfts_ins);
             sqlite3_finalize(cfts_trk);
@@ -959,7 +971,7 @@ int run_index(const Config& config) {
     std::cerr << "\n";
 
     // Checkpoint WAL to main DB before read-heavy post-processing
-    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    conn.exec(kWalCheckpoint);
 
     // T039: Cross-file reference resolution (in-memory hash-based pass)
     // Run BEFORE any secondary indexes — resolve_refs only needs INTEGER PRIMARY KEY
@@ -979,7 +991,7 @@ int run_index(const Config& config) {
     }
 
     // Checkpoint WAL after resolve_refs before building indexes
-    conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    conn.exec(kWalCheckpoint);
 
     // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
     if (bulk_mode) {
@@ -1046,13 +1058,14 @@ int run_index(const Config& config) {
         persister.write_metadata(repo_root.string());
     }
 
-    // WAL checkpoint (T050). Use TRUNCATE (not PASSIVE): turbo mode disables
+    // WAL checkpoint (T050). Standalone: TRUNCATE (not PASSIVE) -- turbo mode disables
     // autocheckpoint, so without a truncating checkpoint here the WAL can survive
     // at multi-GB size, which drastically slows every subsequent read. TRUNCATE
     // folds all frames back into the main DB and shrinks the WAL to zero.
+    // Supervised: PASSIVE (kWalCheckpoint) so a live MCP reader never stalls us 30s.
     {
         ScopedPhase _wc(profiler.wal_ckpt);
-        conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        conn.exec(kWalCheckpoint);
     }
     // Restore normal autocheckpoint for any subsequent queries
     conn.exec("PRAGMA wal_autocheckpoint=1000");
