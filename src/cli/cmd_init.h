@@ -408,7 +408,13 @@ inline bool write_copilot_instructions(const std::filesystem::path& repo_root) {
         "## Multi-root workspace\n\n"
         "Extra reference repositories may be indexed alongside this project via "
         "`codetopo workspace add <path>`. Their files appear in results with absolute paths. "
-        "`dir_tree('.')` lists all indexed roots.\n";
+        "`dir_tree('.')` lists all indexed roots.\n\n"
+        "**An empty `workspace_list` (`{\"roots\":[]}`) is normal, not a bug.** The primary "
+        "project (this repo) is the *implicit* root: its files carry `root_id IS NULL` and are "
+        "never listed in the `roots` table. That table only holds *extra* roots added via "
+        "`codetopo workspace add`, so `roots:[]` means \"single-root index,\" not \"nothing indexed.\" "
+        "To confirm what is indexed, use `server_info` (see `repo_root`) or `repo_stats` "
+        "(see `file_count`/`symbol_count`), and browse the tree with `dir_tree('.')` or `dir_list('.')`.\n";
 
     std::ofstream f(path);
     if (!f) return false;
