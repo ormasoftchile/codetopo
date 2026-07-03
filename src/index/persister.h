@@ -580,6 +580,9 @@ public:
             bool is_test_or_mock;
         };
         std::unordered_map<std::string, ClassEntry> class_map;
+        // All type-like kinds (class/struct/interface/enum/union/typedef/type_alias/type),
+        // used to resolve 'type_ref' refs so type usages become queryable references.
+        std::unordered_map<std::string, ClassEntry> type_map;
 
         {
             sqlite3_stmt* stmt = nullptr;
@@ -619,16 +622,24 @@ public:
                 // Build class_map inline (replaces former Step 4 scan)
                 if (kind_raw) {
                     std::string_view kind_sv(kind_raw);
-                    if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface") {
-                        auto cit = class_map.find(name);
-                        if (cit == class_map.end()) {
-                            class_map[name] = {id, is_def, is_test_or_mock};
+                    auto prefer = [&](std::unordered_map<std::string, ClassEntry>& m) {
+                        auto cit = m.find(name);
+                        if (cit == m.end()) {
+                            m[name] = {id, is_def, is_test_or_mock};
                         } else if ((cit->second.is_test_or_mock && !is_test_or_mock) ||
                                   (cit->second.is_test_or_mock == is_test_or_mock &&
                                    ((!cit->second.is_def && is_def) ||
                                     (cit->second.is_def == is_def && id < cit->second.id)))) {
                             cit->second = {id, is_def, is_test_or_mock};
                         }
+                    };
+                    if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface") {
+                        prefer(class_map);
+                    }
+                    if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface" ||
+                        kind_sv == "enum" || kind_sv == "union" || kind_sv == "typedef" ||
+                        kind_sv == "type_alias" || kind_sv == "type") {
+                        prefer(type_map);
                     }
                 }
 
@@ -710,7 +721,7 @@ public:
 
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
-        int call_resolved = 0, include_resolved = 0, inherit_resolved = 0;
+        int call_resolved = 0, include_resolved = 0, inherit_resolved = 0, type_ref_resolved = 0;
         std::string name;
         name.reserve(256);  // reuse buffer across iterations
         auto find_cross_file_symbols = [&](
@@ -870,6 +881,14 @@ public:
                     edge_kind = "inherits";
                     ++inherit_resolved;
                 }
+            } else if (kind == "type_ref") {
+                auto it = type_map.find(name);
+                if (it != type_map.end()) {
+                    resolved_id = it->second.id;
+                    resolved = true;
+                    edge_kind = "references";
+                    ++type_ref_resolved;
+                }
             }
 
             if (resolved) {
@@ -911,7 +930,8 @@ public:
         std::cerr << "  Resolved "
                   << stderr_cyan(format_with_commas(call_resolved), color_output) << " call, "
                   << stderr_cyan(format_with_commas(include_resolved), color_output) << " include, "
-                  << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit refs\n";
+                  << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit, "
+                  << stderr_cyan(format_with_commas(type_ref_resolved), color_output) << " type refs\n";
 
         // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
         // Without a unique constraint, re-runs would accumulate duplicate edges.

@@ -307,7 +307,7 @@ int run_index(const Config& config) {
         }
 
         persister.write_metadata(repo_root.string());
-        conn.wal_checkpoint();
+        conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
         fs::remove(worklist_path);  // Clean up stale worklist
         return 0;
     }
@@ -1046,10 +1046,13 @@ int run_index(const Config& config) {
         persister.write_metadata(repo_root.string());
     }
 
-    // WAL checkpoint (T050)
+    // WAL checkpoint (T050). Use TRUNCATE (not PASSIVE): turbo mode disables
+    // autocheckpoint, so without a truncating checkpoint here the WAL can survive
+    // at multi-GB size, which drastically slows every subsequent read. TRUNCATE
+    // folds all frames back into the main DB and shrinks the WAL to zero.
     {
         ScopedPhase _wc(profiler.wal_ckpt);
-        conn.wal_checkpoint();
+        conn.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     }
     // Restore normal autocheckpoint for any subsequent queries
     conn.exec("PRAGMA wal_autocheckpoint=1000");

@@ -64,6 +64,11 @@ static constexpr const char* kPublicSymbolSql =
     "(n.visibility IS NULL AND (n.qualname IS NULL OR n.qualname = n.name) "
     "AND n.kind IN ('class','struct','interface','type_alias','type','enum','function')))";
 
+// Non-callable, type-like kinds. These have no call-sites, so call-based signals
+// (candidate_callers) are meaningless for them; they expose usage via references.
+static const std::unordered_set<std::string> kTypeLikeKinds = {
+    "class", "struct", "interface", "enum", "union", "typedef", "type_alias", "type"};
+
 static bool parse_symbol_fields(yyjson_val* params,
                                 std::unordered_set<std::string>& fields_set,
                                 bool& fields_provided,
@@ -269,6 +274,18 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCa
     if (!params) return -1;
     int64_t id = json_get_int(params, id_param, -1);
     if (id >= 0) return id;
+
+    // stable_key: a reindex-proof handle (path::kind::name...). node_id is a rowid
+    // that is reassigned on a full reindex, so callers caching handles across turns
+    // should prefer stable_key. Resolving here benefits every node-consuming tool.
+    auto* sk_val = yyjson_obj_get(params, "stable_key");
+    if (sk_val && yyjson_is_str(sk_val)) {
+        auto* sk_stmt = cache.get("resolve_node_by_stable_key",
+            "SELECT id FROM nodes WHERE stable_key = ? LIMIT 1");
+        sqlite3_bind_text(sk_stmt, 1, yyjson_get_str(sk_val), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sk_stmt) == SQLITE_ROW) return sqlite3_column_int64(sk_stmt, 0);
+        return -1;
+    }
 
     auto* sym_val = yyjson_obj_get(params, "symbol");
     auto* file_val = yyjson_obj_get(params, "file");
@@ -2137,36 +2154,141 @@ std::string get_architecture(yyjson_val* params, Connection& conn,
     std::unordered_set<int64_t> in_scope_file_ids;
     int64_t total_files = 0;
     int64_t total_symbols = 0;
+    const bool scoped = !scope_prefix.empty();
 
+    // Guard: an UNSCOPED architecture pass materializes every node and edge in memory
+    // (O(nodes + edges)) -- minutes and gigabytes on a monorepo. Past a limit, require a
+    // scope. MAX(rowid) is an instant edge-count estimate.
+    if (!scoped) {
+        int64_t edge_estimate = 0;
+        sqlite3_stmt* est = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(), "SELECT COALESCE(MAX(rowid), 0) FROM edges", -1, &est, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(est) == SQLITE_ROW) edge_estimate = sqlite3_column_int64(est, 0);
+            sqlite3_finalize(est);
+        }
+        if (edge_estimate > 5000000) {
+            return McpError::invalid_input(
+                "Repository too large for a whole-repo architecture pass (~" +
+                std::to_string(edge_estimate) + " edges). Pass a 'scope' directory "
+                "(e.g. \"src/server\") to analyze one subsystem at a time.").to_json_rpc(0);
+        }
+    }
+
+    // Scoped mode: build temp tables of the in-scope file ids and node ids so the
+    // node/edge loads below stay bounded to the scope (index-driven) instead of
+    // scanning the whole graph.
+    if (scoped) {
+        conn.exec("DROP TABLE IF EXISTS temp.arch_scope_files");
+        conn.exec("DROP TABLE IF EXISTS temp.arch_scope_nodes");
+        {
+            sqlite3_stmt* s = nullptr;
+            const char* sql = scope_is_file
+                ? "CREATE TEMP TABLE arch_scope_files AS SELECT id FROM files WHERE path = ?"
+                : "CREATE TEMP TABLE arch_scope_files AS SELECT id FROM files WHERE path = ? OR path GLOB ?";
+            if (sqlite3_prepare_v2(conn.raw(), sql, -1, &s, nullptr) != SQLITE_OK) {
+                return McpError::db_error("Failed to build architecture scope").to_json_rpc(0);
+            }
+            sqlite3_bind_text(s, 1, scope_prefix.c_str(), -1, SQLITE_TRANSIENT);
+            std::string glob = scope_prefix + "/*";
+            if (!scope_is_file) sqlite3_bind_text(s, 2, glob.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+        conn.exec(
+            "CREATE TEMP TABLE arch_scope_nodes AS "
+            "SELECT id FROM nodes WHERE file_id IN (SELECT id FROM temp.arch_scope_files) "
+            "UNION "
+            "SELECT id FROM nodes WHERE node_type = 'file' "
+            "AND name IN (SELECT path FROM files WHERE id IN (SELECT id FROM temp.arch_scope_files))");
+    }
+
+    // Scope-size guard: even bounded, the edge pass materializes every scope-touching
+    // edge in memory. A very large subsystem (e.g. an entire top-level source tree) can
+    // pull millions of edges and take minutes. Cap on the in-scope node count (instant)
+    // and ask the caller to narrow the scope instead.
+    if (scoped) {
+        constexpr int64_t kMaxScopeNodes = 75000;
+        int64_t scope_node_count = 0;
+        sqlite3_stmt* cnt = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(),
+                "SELECT COUNT(*) FROM temp.arch_scope_nodes", -1, &cnt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(cnt) == SQLITE_ROW) scope_node_count = sqlite3_column_int64(cnt, 0);
+            sqlite3_finalize(cnt);
+        }
+        if (scope_node_count > kMaxScopeNodes) {
+            conn.exec("DROP TABLE IF EXISTS temp.arch_scope_files");
+            conn.exec("DROP TABLE IF EXISTS temp.arch_scope_nodes");
+            return McpError::invalid_input(
+                "Scope too large for an architecture pass (~" +
+                std::to_string(scope_node_count) + " symbols; limit " +
+                std::to_string(kMaxScopeNodes) + "). Narrow 'scope' to a more specific "
+                "sub-directory (e.g. one component rather than a whole source tree).")
+                .to_json_rpc(0);
+        }
+    }
+
+    // Load every file's id+path (cheap; needed so out-of-scope edge endpoints resolve
+    // during boundary analysis). Symbol counts are loaded separately, bounded to scope.
     {
         sqlite3_stmt* stmt = nullptr;
-        const char* sql =
-            "SELECT f.id, f.path, COUNT(n.id) "
-            "FROM files f "
-            "LEFT JOIN nodes n ON n.file_id = f.id AND n.node_type = 'symbol' "
-            "GROUP BY f.id, f.path "
-            "ORDER BY f.id";
-        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(conn.raw(), "SELECT id, path FROM files", -1, &stmt, nullptr) != SQLITE_OK) {
             return McpError::db_error("Failed to load files for architecture analysis").to_json_rpc(0);
         }
-
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             ArchitectureFileInfo info;
             info.id = sqlite3_column_int64(stmt, 0);
             auto* raw = sqlite3_column_text(stmt, 1);
             info.raw_path = raw ? reinterpret_cast<const char*>(raw) : "";
-            info.path = architecture_display_path(info.raw_path, repo_root);
-            info.dir_parts = split_path_components(std::filesystem::path(info.path).parent_path().generic_string());
-            info.symbol_count = sqlite3_column_int64(stmt, 2);
+            info.symbol_count = 0;
             info.in_scope = architecture_scope_matches(info.raw_path, scope_prefix, scope_is_file);
-
             file_id_by_raw_path.emplace(info.raw_path, info.id);
+            // Out-of-scope files only need to exist (as edge endpoints); skip the
+            // per-row path parsing (163k std::filesystem ops would dominate on a
+            // monorepo). In-scope files get full display path + dir components.
             if (info.in_scope) {
+                info.path = architecture_display_path(info.raw_path, repo_root);
+                info.dir_parts = split_path_components(
+                    std::filesystem::path(info.path).parent_path().generic_string());
                 ++total_files;
-                total_symbols += info.symbol_count;
                 in_scope_file_ids.insert(info.id);
             }
             files_by_id.emplace(info.id, std::move(info));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // Symbol counts for in-scope files (bounded to scope when scoped). An explicit
+    // JOIN from the scope-file temp table drives via idx_nodes_file_id; an
+    // `IN (subquery)` form makes the planner scan all symbol nodes instead.
+    {
+        std::string sql;
+        if (scoped) {
+            // CROSS JOIN pins the join order so SQLite drives from the tiny scope-file
+            // temp table (14 rows) and does one idx_nodes_file_id lookup per file. A
+            // plain JOIN / INDEXED BY lets the (statistics-free) planner scan the whole
+            // idx_nodes_file_id index instead -- 4.8M rows on a monorepo.
+            sql =
+                "SELECT n.file_id, COUNT(*) "
+                "FROM temp.arch_scope_files asf "
+                "CROSS JOIN nodes n ON n.file_id = asf.id "
+                "WHERE n.node_type = 'symbol' GROUP BY n.file_id";
+        } else {
+            sql =
+                "SELECT file_id, COUNT(*) FROM nodes "
+                "WHERE node_type = 'symbol' AND file_id IS NOT NULL GROUP BY file_id";
+        }
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            return McpError::db_error("Failed to load symbol counts for architecture analysis").to_json_rpc(0);
+        }
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t file_id = sqlite3_column_int64(stmt, 0);
+            int64_t cnt = sqlite3_column_int64(stmt, 1);
+            auto it = files_by_id.find(file_id);
+            if (it != files_by_id.end() && it->second.in_scope) {
+                it->second.symbol_count = cnt;
+                total_symbols += cnt;
+            }
         }
         sqlite3_finalize(stmt);
     }
@@ -2196,30 +2318,6 @@ std::string get_architecture(yyjson_val* params, Connection& conn,
         file.cluster = file.initial_cluster;
     }
 
-    std::unordered_map<int64_t, ArchitectureNodeFile> node_files;
-    {
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql = "SELECT id, file_id, node_type, name FROM nodes";
-        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            return McpError::db_error("Failed to load nodes for architecture analysis").to_json_rpc(0);
-        }
-
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            int64_t node_id = sqlite3_column_int64(stmt, 0);
-            int64_t file_id = sqlite3_column_type(stmt, 1) == SQLITE_NULL
-                ? -1
-                : sqlite3_column_int64(stmt, 1);
-            const char* node_type = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-            const char* node_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-            if (file_id < 0 && node_type && std::strcmp(node_type, "file") == 0 && node_name) {
-                auto it = file_id_by_raw_path.find(node_name);
-                if (it != file_id_by_raw_path.end()) file_id = it->second;
-            }
-            if (file_id >= 0) node_files.emplace(node_id, ArchitectureNodeFile{file_id});
-        }
-        sqlite3_finalize(stmt);
-    }
-
     std::unordered_map<std::string, ArchitectureClusterStats> initial_clusters;
     for (const auto& [_, file] : files_by_id) {
         if (!file.in_scope) continue;
@@ -2232,47 +2330,66 @@ std::string get_architecture(yyjson_val* params, Connection& conn,
 
     std::vector<ArchitectureScopedEdge> scoped_edges;
     int64_t total_edges = 0;
+    // Resolve each edge's endpoints to file ids and accumulate cluster edge stats.
+    // Endpoints are resolved in SQL (file-nodes carry their path in `name`), so no
+    // full node table needs to be held in memory.
+    auto process_edge = [&](int64_t src_file_id, int64_t dst_file_id) {
+        bool src_in_scope = in_scope_file_ids.count(src_file_id);
+        bool dst_in_scope = in_scope_file_ids.count(dst_file_id);
+        if (!src_in_scope && !dst_in_scope) return;
+        scoped_edges.push_back({src_file_id, dst_file_id});
+        ++total_edges;
+        const auto* src_file = files_by_id.count(src_file_id) ? &files_by_id.at(src_file_id) : nullptr;
+        const auto* dst_file = files_by_id.count(dst_file_id) ? &files_by_id.at(dst_file_id) : nullptr;
+        bool same_cluster = src_in_scope && dst_in_scope && src_file && dst_file
+            && src_file->initial_cluster == dst_file->initial_cluster;
+        if (same_cluster && src_file) {
+            architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, true);
+        } else {
+            if (src_in_scope && src_file)
+                architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, false);
+            if (dst_in_scope && dst_file)
+                architecture_accumulate_cluster_edge(initial_clusters, dst_file->initial_cluster, false);
+        }
+    };
     {
-        sqlite3_stmt* stmt = nullptr;
-        const char* sql =
-            "SELECT src_id, dst_id FROM edges "
-            "WHERE kind != 'contains' AND confidence >= 0.5";
-        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-            return McpError::db_error("Failed to load edges for architecture analysis").to_json_rpc(0);
+        static const char* kEdgeSelect =
+            "SELECT COALESCE(sn.file_id, sf.id), COALESCE(dn.file_id, df.id) "
+            "FROM edges e "
+            "JOIN nodes sn ON e.src_id = sn.id "
+            "JOIN nodes dn ON e.dst_id = dn.id "
+            "LEFT JOIN files sf ON sn.node_type = 'file' AND sf.path = sn.name "
+            "LEFT JOIN files df ON dn.node_type = 'file' AND df.path = dn.name "
+            "WHERE e.kind != 'contains' AND e.confidence >= 0.5";
+        std::vector<std::string> queries;
+        if (scoped) {
+            // Two index-driven passes. `edges.src_id`/`dst_id` are indexed, and an
+            // IN-subquery over the (small) scope-node temp table forces the planner to
+            // drive edges via idx_edges_src/idx_edges_dst instead of scanning all 44M
+            // edges. The second pass counts incoming edges whose source is out of scope,
+            // so every scope-touching edge is seen exactly once.
+            queries.push_back(
+                std::string(kEdgeSelect)
+                + " AND e.src_id IN (SELECT id FROM temp.arch_scope_nodes)");
+            queries.push_back(
+                std::string(kEdgeSelect)
+                + " AND e.dst_id IN (SELECT id FROM temp.arch_scope_nodes)"
+                + " AND e.src_id NOT IN (SELECT id FROM temp.arch_scope_nodes)");
+        } else {
+            queries.push_back(kEdgeSelect);
         }
-
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            int64_t src_id = sqlite3_column_int64(stmt, 0);
-            int64_t dst_id = sqlite3_column_int64(stmt, 1);
-            auto src_it = node_files.find(src_id);
-            auto dst_it = node_files.find(dst_id);
-            if (src_it == node_files.end() || dst_it == node_files.end()) continue;
-
-            int64_t src_file_id = src_it->second.file_id;
-            int64_t dst_file_id = dst_it->second.file_id;
-            bool src_in_scope = in_scope_file_ids.count(src_file_id);
-            bool dst_in_scope = in_scope_file_ids.count(dst_file_id);
-            if (!src_in_scope && !dst_in_scope) continue;
-
-            scoped_edges.push_back({src_file_id, dst_file_id});
-            ++total_edges;
-
-            const auto* src_file = files_by_id.count(src_file_id) ? &files_by_id.at(src_file_id) : nullptr;
-            const auto* dst_file = files_by_id.count(dst_file_id) ? &files_by_id.at(dst_file_id) : nullptr;
-            bool same_cluster = src_in_scope && dst_in_scope && src_file && dst_file
-                && src_file->initial_cluster == dst_file->initial_cluster;
-            if (same_cluster && src_file) {
-                architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, true);
-            } else {
-                if (src_in_scope && src_file) {
-                    architecture_accumulate_cluster_edge(initial_clusters, src_file->initial_cluster, false);
-                }
-                if (dst_in_scope && dst_file) {
-                    architecture_accumulate_cluster_edge(initial_clusters, dst_file->initial_cluster, false);
-                }
+        for (const auto& q : queries) {
+            sqlite3_stmt* stmt = nullptr;
+            if (sqlite3_prepare_v2(conn.raw(), q.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                return McpError::db_error("Failed to load edges for architecture analysis").to_json_rpc(0);
             }
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                if (sqlite3_column_type(stmt, 0) == SQLITE_NULL
+                    || sqlite3_column_type(stmt, 1) == SQLITE_NULL) continue;
+                process_edge(sqlite3_column_int64(stmt, 0), sqlite3_column_int64(stmt, 1));
+            }
+            sqlite3_finalize(stmt);
         }
-        sqlite3_finalize(stmt);
     }
 
     std::unordered_set<std::string> refined_clusters;
@@ -2377,15 +2494,35 @@ std::string get_architecture(yyjson_val* params, Connection& conn,
     if (wants("hotspots")) {
         std::vector<ArchitectureHotspot> hotspots;
         sqlite3_stmt* stmt = nullptr;
-        const char* sql =
-            "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in "
-            "FROM edges e "
-            "JOIN nodes n ON e.dst_id = n.id "
-            "JOIN files f ON n.file_id = f.id "
-            "WHERE e.kind = 'calls' AND e.confidence >= 0.5 AND n.node_type = 'symbol' "
-            "GROUP BY n.id "
-            "ORDER BY fan_in DESC, n.name ASC";
-        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::string sql;
+        if (scoped) {
+            // The main DB carries no ANALYZE statistics, so SQLite misestimates
+            // `node_type='symbol'` at ~10 rows and will otherwise drive the whole join
+            // from a full symbol-node scan. Compute fan-in first from edges alone (the
+            // `dst_id IN scope` subquery is index-driven via idx_edges_dst_conf), then
+            // CROSS JOIN to force that co-routine to drive rowid lookups into nodes/files
+            // -- the CROSS JOIN also pins the join order so the planner cannot reorder.
+            sql =
+                "SELECT n.file_id, n.name, n.kind, f.path, fi.fan_in "
+                "FROM (SELECT e.dst_id AS id, COUNT(DISTINCT e.src_id) AS fan_in "
+                "      FROM edges e "
+                "      WHERE e.kind = 'calls' AND e.confidence >= 0.5 "
+                "        AND e.dst_id IN (SELECT id FROM temp.arch_scope_nodes) "
+                "      GROUP BY e.dst_id) fi "
+                "CROSS JOIN nodes n ON n.id = fi.id "
+                "CROSS JOIN files f ON f.id = n.file_id "
+                "WHERE n.node_type = 'symbol' "
+                "ORDER BY fi.fan_in DESC, n.name ASC";
+        } else {
+            sql =
+                "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in "
+                "FROM edges e "
+                "JOIN nodes n ON e.dst_id = n.id "
+                "JOIN files f ON n.file_id = f.id "
+                "WHERE e.kind = 'calls' AND e.confidence >= 0.5 AND n.node_type = 'symbol' "
+                "GROUP BY n.id ORDER BY fan_in DESC, n.name ASC";
+        }
+        if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
             return McpError::db_error("Failed to compute architecture hotspots").to_json_rpc(0);
         }
         while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -2546,8 +2683,12 @@ std::string dir_list(yyjson_val* params, Connection& conn,
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     if (limit > 2000) limit = 2000;
 
-    // Normalize: ensure trailing /
+    // Normalize: the repo root can be requested as "", ".", or "./". Repo-relative
+    // paths are stored without a leading "./", so map "." / "./" to an empty prefix
+    // (glob "*") which matches them. In workspace mode (absolute paths) this still
+    // yields nothing and the roots-table fallback below handles it.
     std::string dir = dir_path;
+    if (dir == "." || dir == "./") dir.clear();
     if (!dir.empty() && dir.back() != '/') dir += '/';
 
     // Match files directly under this directory (not in subdirectories)
@@ -2841,6 +2982,18 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     return doc.to_string();
 }
 
+// ORDER BY helper: 0 = real implementation file, 1 = test/mock/fake/stub file, so
+// core symbols rank above test doubles. Mirrors the indexer's is_test_or_mock
+// convention (src/index/persister.h) and also catches leading segments like
+// "testsrc/..." by prefixing '/'. COL must be a SQL string literal (e.g. "f.path").
+#define CODETOPO_TEST_RANK(COL) \
+    "CASE WHEN instr('/'||lower(COALESCE(" COL ",'')),'/test')>0 " \
+    "OR instr('/'||lower(COALESCE(" COL ",'')),'/mock')>0 " \
+    "OR instr('/'||lower(COALESCE(" COL ",'')),'/fake')>0 " \
+    "OR instr('/'||lower(COALESCE(" COL ",'')),'/stub')>0 " \
+    "OR instr(lower(COALESCE(" COL ",'')),'_test.')>0 " \
+    "OR instr(lower(COALESCE(" COL ",'')),'test_')>0 THEN 1 ELSE 0 END"
+
 // T062: symbol_search
 std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
                                    QueryCache& cache, const std::string& /*repo_root*/) {
@@ -2863,6 +3016,7 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     sqlite3_stmt* count_stmt = nullptr;
     int bind_idx = 1;
     int count_bind_idx = 1;
+    int64_t total_override = 0;  // used when count_stmt is skipped (FTS-only fast path)
 
     if (wildcard) {
         if (kind && strlen(kind) > 0) {
@@ -2900,157 +3054,83 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
         }
     } else {
         std::string fts_query = "name: \"" + std::string(query) + "\"*";
-        std::string like_pattern = std::string("%") + query + "%";
+        bool has_kind = kind && strlen(kind) > 0;
+        bool primary_fn_kind = has_kind && std::string(kind) == "function";
 
-        if (kind && strlen(kind) > 0) {
-            bool fn_kind = (std::string(kind) == "function");
-            stmt = fn_kind
-                ? cache.get("symbol_search_fn",
-                    "WITH primary_matches AS ("
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')"
-                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                    "fallback_matches AS ("
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
-                    "AND n.kind IN ('function', 'method') "
-                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                    "), combined AS ("
-                    "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                    "FROM primary_matches "
-                    "UNION ALL "
-                    "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                    "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                    ") "
-                    "SELECT id, kind, name, qualname, path, start_line, end_line "
-                    "FROM combined "
-                    "ORDER BY match_bucket, length(name), name, path, start_line, id "
-                    "LIMIT ? OFFSET ?")
-                : cache.get("symbol_search_kind",
-                    "WITH primary_matches AS ("
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind = ?"
-                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                    "fallback_matches AS ("
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) AND n.kind = ? "
-                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                    "), combined AS ("
-                    "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                    "FROM primary_matches "
-                    "UNION ALL "
-                    "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                    "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                    ") "
-                    "SELECT id, kind, name, qualname, path, start_line, end_line "
-                    "FROM combined "
-                    "ORDER BY match_bucket, length(name), name, path, start_line, id "
-                    "LIMIT ? OFFSET ?");
-            count_stmt = fn_kind
-                ? cache.get("symbol_search_fn_count",
-                    "WITH primary_matches AS ("
-                    "SELECT n.id "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')"
-                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                    "fallback_matches AS ("
-                    "SELECT n.id "
-                    "FROM nodes n "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
-                    "AND n.kind IN ('function', 'method') "
-                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                    "), combined AS ("
-                    "SELECT id FROM primary_matches "
-                    "UNION ALL "
-                    "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                    ") "
-                    "SELECT COUNT(*) FROM combined")
-                : cache.get("symbol_search_kind_count",
-                    "WITH primary_matches AS ("
-                    "SELECT n.id "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind = ?"
-                    "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                    "fallback_matches AS ("
-                    "SELECT n.id "
-                    "FROM nodes n "
-                    "WHERE (n.name LIKE ? OR n.qualname LIKE ?) AND n.kind = ? "
-                    "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                    "), combined AS ("
-                    "SELECT id FROM primary_matches "
-                    "UNION ALL "
-                    "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                    ") "
-                    "SELECT COUNT(*) FROM combined");
+        // Phase 1: cheap FTS-only primary count. The LIKE '%q%' fallback below
+        // requires a full scan of the nodes table (millions of rows on large
+        // repos) and only ever contributes rows when there are fewer than 5 FTS
+        // matches. Gate it in C++: when FTS already yields >= 5 matches, take an
+        // FTS-only path and skip the fallback entirely. This avoids a full-table
+        // scan on every search (previously ~26s vs ~1.5s on a 15GB / 4.8M-node index).
+        sqlite3_stmt* pc_stmt = nullptr;
+        if (!has_kind) {
+            pc_stmt = cache.get("symbol_search_pcount",
+                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "WHERE nodes_fts MATCH ?");
+            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+        } else if (primary_fn_kind) {
+            pc_stmt = cache.get("symbol_search_pcount_fn",
+                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')");
+            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
         } else {
-            stmt = cache.get("symbol_search",
-                "WITH primary_matches AS ("
-                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                "LEFT JOIN files f ON n.file_id = f.id "
-                "WHERE nodes_fts MATCH ?"
-                "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                "fallback_matches AS ("
-                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
-                "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                "), combined AS ("
-                "SELECT 0 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                "FROM primary_matches "
-                "UNION ALL "
-                "SELECT 1 AS match_bucket, id, kind, name, qualname, path, start_line, end_line "
-                "FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                ") "
-                "SELECT id, kind, name, qualname, path, start_line, end_line "
-                "FROM combined "
-                "ORDER BY match_bucket, length(name), name, path, start_line, id "
-                "LIMIT ? OFFSET ?");
-            count_stmt = cache.get("symbol_search_count",
-                "WITH primary_matches AS ("
-                "SELECT n.id "
-                "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                "WHERE nodes_fts MATCH ?"
-                "), primary_count AS (SELECT COUNT(*) AS cnt FROM primary_matches), "
-                "fallback_matches AS ("
-                "SELECT n.id "
-                "FROM nodes n "
-                "WHERE (n.name LIKE ? OR n.qualname LIKE ?) "
-                "AND NOT EXISTS (SELECT 1 FROM primary_matches p WHERE p.id = n.id)"
-                "), combined AS ("
-                "SELECT id FROM primary_matches "
-                "UNION ALL "
-                "SELECT id FROM fallback_matches WHERE (SELECT cnt FROM primary_count) < 5"
-                ") "
-                "SELECT COUNT(*) FROM combined");
+            pc_stmt = cache.get("symbol_search_pcount_kind",
+                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                "WHERE nodes_fts MATCH ? AND n.kind = ?");
+            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(pc_stmt, 2, kind, -1, SQLITE_TRANSIENT);
         }
+        int64_t primary_count = 0;
+        if (sqlite3_step(pc_stmt) == SQLITE_ROW) primary_count = sqlite3_column_int64(pc_stmt, 0);
 
-        sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-        if (kind && strlen(kind) > 0 && std::string(kind) != "function") {
-            sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
-        }
-        sqlite3_bind_text(stmt, bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(count_stmt, count_bind_idx++, like_pattern.c_str(), -1, SQLITE_TRANSIENT);
-        if (kind && strlen(kind) > 0 && std::string(kind) != "function") {
-            sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
+        // FTS-only: always index-backed, NEVER a full-table scan. The former LIKE
+        // '%q%' infix fallback (taken when FTS matched < 5 rows) scanned all ~4.8M
+        // nodes and caused intermittent symbol_search timeouts on large indexes
+        // (e.g. dsmaindev). Infix/substring matching now lives in code_search and
+        // symbol_list(name_glob); symbol_search stays purely FTS prefix-matched.
+        total_override = primary_count;
+        {
+            if (!has_kind) {
+                stmt = cache.get("symbol_search_primary",
+                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                    "LEFT JOIN files f ON n.file_id = f.id "
+                    "WHERE nodes_fts MATCH ? "
+                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
+                    "LIMIT ? OFFSET ?");
+                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+            } else if (primary_fn_kind) {
+                stmt = cache.get("symbol_search_primary_fn",
+                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                    "LEFT JOIN files f ON n.file_id = f.id "
+                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method') "
+                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
+                    "LIMIT ? OFFSET ?");
+                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+            } else {
+                stmt = cache.get("symbol_search_primary_kind",
+                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
+                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
+                    "LEFT JOIN files f ON n.file_id = f.id "
+                    "WHERE nodes_fts MATCH ? AND n.kind = ? "
+                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
+                    "LIMIT ? OFFSET ?");
+                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
+            }
         }
     }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
     int64_t total = 0;
-    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+    if (count_stmt) {
+        if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
+    } else {
+        total = total_override;
+    }
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -3073,10 +3153,14 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
         yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
         yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
             reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+        auto* nm = sqlite3_column_text(stmt, 2);
         yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+            reinterpret_cast<const char*>(nm));
         auto* qn = sqlite3_column_text(stmt, 3);
-        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
+        // Omit qualname when it merely duplicates name (very common; saves tokens).
+        if (qn && (!nm || strcmp(reinterpret_cast<const char*>(qn),
+                                 reinterpret_cast<const char*>(nm)) != 0))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
         if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
 
         auto* span = doc.new_obj();
@@ -3090,6 +3174,8 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
     return doc.to_string();
 }
+
+#undef CODETOPO_TEST_RANK
 
 // T062b: symbol_list — list/filter symbols without FTS, supports kind, file, and name-glob filters
 std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
@@ -4053,8 +4139,12 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     int64_t file_id = sqlite3_column_int64(stmt, 0);
     std::string language = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
 
-    // Use resolved path directly (absolute in workspace mode, repo-rooted otherwise)
-    auto full = std::filesystem::path(resolved);
+    // Build an absolute path for the line count: resolved is absolute in workspace
+    // mode but repo-relative for single-root indexes, so join repo_root when needed
+    // (otherwise ifstream opens it against the process cwd and fails -> lines: 0).
+    std::filesystem::path full = std::filesystem::path(resolved).is_absolute()
+        ? std::filesystem::path(resolved)
+        : std::filesystem::path(repo_root) / resolved;
     int lines = 0;
     {
         std::ifstream f(full);
@@ -4082,17 +4172,20 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "lines", lines);
     yyjson_mut_obj_add_strcpy(doc.doc, root, "language", language.c_str());
 
-    auto* results = doc.new_arr();
     auto* symbols = doc.new_arr();
     auto append_symbol = [&](yyjson_mut_val* arr) {
         auto* sym = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, sym, "node_id", sqlite3_column_int64(sym_stmt, 0));
         yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind",
             reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 1)));
+        auto* nm = sqlite3_column_text(sym_stmt, 2);
         yyjson_mut_obj_add_strcpy(doc.doc, sym, "name",
-            reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 2)));
+            reinterpret_cast<const char*>(nm));
         auto* qn = sqlite3_column_text(sym_stmt, 3);
-        if (qn) yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", reinterpret_cast<const char*>(qn));
+        // Omit qualname when it merely duplicates name (very common; saves tokens).
+        if (qn && (!nm || strcmp(reinterpret_cast<const char*>(qn),
+                                 reinterpret_cast<const char*>(nm)) != 0))
+            yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", reinterpret_cast<const char*>(qn));
         auto* vis = sqlite3_column_text(sym_stmt, 4);
         if (vis) yyjson_mut_obj_add_strcpy(doc.doc, sym, "visibility", reinterpret_cast<const char*>(vis));
         auto* sig = sqlite3_column_text(sym_stmt, 5);
@@ -4111,11 +4204,16 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     while (sqlite3_step(sym_stmt) == SQLITE_ROW && count <= limit) {
         if (count == limit) { has_more = true; break; }
         count++;
-        append_symbol(results);
         append_symbol(symbols);
     }
 
-    add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    // Pagination metadata without duplicating the symbol array. Previously each
+    // symbol was appended to BOTH a "results" and an identical "symbols" array,
+    // doubling the response size on large files.
+    yyjson_mut_obj_add_int(doc.doc, root, "total", total);
+    yyjson_mut_obj_add_bool(doc.doc, root, "has_more", has_more);
+    yyjson_mut_obj_add_int(doc.doc, root, "offset", offset);
+    yyjson_mut_obj_add_int(doc.doc, root, "limit", limit);
     yyjson_mut_obj_add_val(doc.doc, root, "symbols", symbols);
     return doc.to_string();
 }
@@ -4310,7 +4408,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
     // Symbol info (inline from symbol_get query)
     auto* sym_stmt = cache.get("context_symbol",
         "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-        "n.start_line, n.end_line, n.doc "
+        "n.start_line, n.end_line, n.doc, n.stable_key "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.id = ? AND n.node_type = 'symbol'");
     sqlite3_bind_int64(sym_stmt, 1, node_id);
@@ -4321,14 +4419,19 @@ std::string context_for(yyjson_val* params, Connection& conn,
 
     auto* symbol = doc.new_obj();
     yyjson_mut_obj_add_int(doc.doc, symbol, "node_id", sqlite3_column_int64(sym_stmt, 0));
-    yyjson_mut_obj_add_strcpy(doc.doc, symbol, "kind",
-        reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 1)));
+    const char* ctx_kind_raw = reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 1));
+    std::string sym_kind = ctx_kind_raw ? ctx_kind_raw : "";
+    yyjson_mut_obj_add_strcpy(doc.doc, symbol, "kind", sym_kind.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, symbol, "name",
         reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 2)));
     auto* qn = sqlite3_column_text(sym_stmt, 3);
     if (qn) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "qualname", reinterpret_cast<const char*>(qn));
     auto* sig = sqlite3_column_text(sym_stmt, 4);
     if (sig) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "signature", reinterpret_cast<const char*>(sig));
+    // stable_key is reindex-proof: cache THIS across turns, not node_id. If a later
+    // context_for on the same node_id returns a different stable_key, the id was reused.
+    auto* skv = sqlite3_column_text(sym_stmt, 9);
+    if (skv) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "stable_key", reinterpret_cast<const char*>(skv));
     auto* fp = sqlite3_column_text(sym_stmt, 5);
     std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
     if (!file_path.empty()) {
@@ -4380,7 +4483,11 @@ std::string context_for(yyjson_val* params, Connection& conn,
     }
     yyjson_mut_obj_add_val(doc.doc, root, "callers", callers_arr);
     if (callers_truncated) yyjson_mut_obj_add_bool(doc.doc, root, "callers_truncated", true);
-    if (should_collect_candidates(candidate_mode, exact_callers_empty)) {
+    // Types are not called: call-site candidate matching only yields noise (e.g.
+    // low-confidence suffix matches on unrelated members). Skip it for type-like
+    // kinds, which instead expose usage via the references section below.
+    bool candidates_meaningful = !kTypeLikeKinds.count(sym_kind);
+    if (candidates_meaningful && should_collect_candidates(candidate_mode, exact_callers_empty)) {
         int64_t candidate_limit = max_callers > 0 ? max_callers : 500;
         auto candidates = collect_callsite_candidates(node_id, candidate_limit, conn, cache, candidate_options, repo_root);
         auto* candidate_callers = doc.new_arr();
@@ -4493,6 +4600,31 @@ std::string context_for(yyjson_val* params, Connection& conn,
             }
             yyjson_mut_obj_add_val(doc.doc, root, "base_types", bases_arr);
         }
+    }
+
+    // References: for type-like symbols, surface where the type is used (resolved
+    // 'type_ref' refs). Call-based symbols already expose usage via callers/callees.
+    if (kTypeLikeKinds.count(sym_kind)) {
+        auto* ref_stmt = cache.get("context_references",
+            "SELECT r.kind, r.name, f.path, r.start_line, r.end_line "
+            "FROM refs r LEFT JOIN files f ON r.file_id = f.id "
+            "WHERE r.resolved_node_id = ? ORDER BY f.path, r.start_line LIMIT 50");
+        sqlite3_bind_int64(ref_stmt, 1, node_id);
+        auto* refs_arr = doc.new_arr();
+        while (sqlite3_step(ref_stmt) == SQLITE_ROW) {
+            auto* rf = doc.new_obj();
+            yyjson_mut_obj_add_strcpy(doc.doc, rf, "kind",
+                reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 0)));
+            auto* rfp = sqlite3_column_text(ref_stmt, 2);
+            if (rfp) yyjson_mut_obj_add_strcpy(doc.doc, rf, "file_path",
+                reinterpret_cast<const char*>(rfp));
+            auto* rspan = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, rspan, "start_line", sqlite3_column_int(ref_stmt, 3));
+            yyjson_mut_obj_add_int(doc.doc, rspan, "end_line", sqlite3_column_int(ref_stmt, 4));
+            yyjson_mut_obj_add_val(doc.doc, rf, "span", rspan);
+            yyjson_mut_arr_append(refs_arr, rf);
+        }
+        yyjson_mut_obj_add_val(doc.doc, root, "references", refs_arr);
     }
 
     return doc.to_string();
