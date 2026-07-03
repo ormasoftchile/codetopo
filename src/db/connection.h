@@ -42,7 +42,12 @@ public:
         // PRAGMA setup
         exec("PRAGMA journal_mode=WAL");
         exec("PRAGMA foreign_keys=ON");
-        exec("PRAGMA busy_timeout=5000");
+        // 30s (was 5s): on a large index a watch-mode/incremental reindex holds a write
+        // transaction and checkpoints the WAL; a heavy read (e.g. get_architecture) must
+        // wait out that burst rather than fail with "database is locked". WAL still lets
+        // readers and the single writer run concurrently -- this only affects the brief
+        // commit/checkpoint windows.
+        exec("PRAGMA busy_timeout=30000");
         exec("PRAGMA synchronous=NORMAL");
         exec("PRAGMA cache_size=-65536");    // 64 MB page cache
         exec("PRAGMA mmap_size=4294967296");  // 4 GB memory-mapped I/O (R4: covers DB growth past 2GB at 100K+ files)
