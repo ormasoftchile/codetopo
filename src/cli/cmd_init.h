@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "index/supervisor.h"
+#include "cli/cmd_skills.h"
 #include "util/repo.h"
 #include "util/json.h"
 #include "util/process.h"
@@ -587,6 +588,13 @@ inline int run_init(const std::string& root_str,
         }
     }
 
+    // 5c. Install embedded agent skills into .codetopo/skills/. These teach the
+    // agent codetopo-driven workflows (e.g. refactor) that cut token usage and
+    // improve agentic quality. Best-effort; references are appended to
+    // .github/copilot-instructions.md above if it was written.
+    std::vector<std::string> installed_skills;
+    skills_install("all", repo_root.string(), /*quiet=*/true, &installed_skills);
+
     // 6. Print summary
     std::cout << "\n";
     std::cout << "  \xe2\x9c\x93 Indexed " << stats.file_count << " files ("
@@ -594,6 +602,9 @@ inline int run_init(const std::string& root_str,
               << stats.edge_count << " edges)\n";
     for (const auto& path : written_configs) {
         std::cout << "  \xe2\x9c\x93 Wrote " << path << "\n";
+    }
+    for (const auto& path : installed_skills) {
+        std::cout << "  \xe2\x9c\x93 Installed skill " << path << "\n";
     }
     if (gitignore_modified) {
         std::cout << "  \xe2\x9c\x93 Added .codetopo/ to .gitignore\n";

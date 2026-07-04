@@ -130,8 +130,12 @@ inline void skills_list() {
     }
 }
 
-// Install a skill into the target repo
-inline int skills_install(const std::string& skill_name, const std::string& root) {
+// Install a skill into the target repo.
+// When quiet is true, suppresses stdout (init folds results into its own summary).
+// When installed_paths is non-null, appends each written SKILL.md path to it.
+inline int skills_install(const std::string& skill_name, const std::string& root,
+                          bool quiet = false,
+                          std::vector<std::string>* installed_paths = nullptr) {
     // Find the skill
     const SkillDef* skill = nullptr;
     for (int i = 0; i < SKILL_COUNT; ++i) {
@@ -144,7 +148,7 @@ inline int skills_install(const std::string& skill_name, const std::string& root
         // "all" installs everything
         if (skill_name == "all") {
             for (int i = 0; i < SKILL_COUNT; ++i) {
-                skills_install(AVAILABLE_SKILLS[i].name, root);
+                skills_install(AVAILABLE_SKILLS[i].name, root, quiet, installed_paths);
             }
             return 0;
         }
@@ -173,7 +177,8 @@ inline int skills_install(const std::string& skill_name, const std::string& root
     out << skill->content;
     out.close();
 
-    std::cout << "Installed: " << skill_path.string() << "\n";
+    if (!quiet) std::cout << "Installed: " << skill_path.string() << "\n";
+    if (installed_paths) installed_paths->push_back(skill_path.string());
 
     // Also append a reference to copilot-instructions.md if it exists
     fs::path instructions = fs::path(root) / ".github" / "copilot-instructions.md";
@@ -190,7 +195,7 @@ inline int skills_install(const std::string& skill_name, const std::string& root
             append << "\n\n## Skill: " << skill->name << "\n\n";
             append << "See [" << ref << "](" << ref << ") for the full skill instructions.\n";
             append.close();
-            std::cout << "Referenced in: " << instructions.string() << "\n";
+            if (!quiet) std::cout << "Referenced in: " << instructions.string() << "\n";
         }
     }
 
