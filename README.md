@@ -46,6 +46,11 @@ This will:
 1. Scan and index the repository
 2. Auto‑detect your editor (VS Code, Cursor, Windsurf) or fall back to VS Code
 3. Write the MCP server configuration so your AI tools can use the code graph immediately
+4. Install agent skills into `.github/skills/` (auto‑discovered by Copilot)
+5. Write agent‑guidance files — `.github/copilot-instructions.md` and `AGENTS.md` —
+   so coding agents prefer codetopo tools over grep/glob/raw file reads. These are
+   written non‑destructively: existing files get a removable `codetopo` marker block
+   appended, never overwritten.
 
 ### Index a repository
 
