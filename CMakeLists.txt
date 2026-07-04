@@ -38,7 +38,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 
-project(codetopo VERSION 1.6.1 LANGUAGES C CXX)
+project(codetopo VERSION 1.6.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -159,6 +159,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_fts_search.cpp
     tests/unit/test_gitignore.cpp
     tests/unit/test_lock.cpp
+    tests/unit/test_mcp_correctness.cpp
     tests/unit/test_path_normalize.cpp
     tests/unit/test_placeholder.cpp
     tests/unit/test_process.cpp
