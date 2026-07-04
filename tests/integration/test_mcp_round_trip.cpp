@@ -260,7 +260,11 @@ TEST_CASE("MCP callers_approx returns callers for helper", "[integration][us2]")
         int64_t helper_id = sqlite3_column_int64(stmt, 0);
         sqlite3_finalize(stmt);
 
-        auto params_str = "{\"node_id\": " + std::to_string(helper_id) + "}";
+        // Request full mode: this test asserts the verbose `caller_name` field,
+        // which is only emitted in full mode (lean mode — the default — emits
+        // a compact `caller` field instead).
+        auto params_str = "{\"node_id\": " + std::to_string(helper_id) +
+                          ", \"response_mode\": \"full\"}";
         auto params_doc = json_parse(params_str);
 
         auto result = tools::callers_approx(params_doc.root(), const_cast<Connection&>(conn),
