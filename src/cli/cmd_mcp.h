@@ -7,11 +7,13 @@
 #include "mcp/server.h"
 #include "mcp/tools.h"
 #include "util/log.h"
+#include "util/lock.h"
 #include "util/process.h"
 #include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -83,6 +85,58 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     if (!fs::exists(db_path)) {
         mcp_log("error: database not found: " + db_path);
         return 1;
+    }
+
+    // Schema version: migrate an older DB IN PLACE here instead of forcing a full
+    // reindex. Recent schema bumps only widen a CHECK / add an index / recreate a
+    // small table, so the migration is cheap even for very large workspaces —
+    // nodes and edges are left untouched. Without this, a version bump would make
+    // the MCP server refuse to start on an existing index until it was rebuilt.
+    {
+        int version = 0;
+        {
+            Connection probe(db_path, true);  // read-only
+            version = schema::get_schema_version(probe);
+        }
+        if (version > CURRENT_SCHEMA_VERSION) {
+            mcp_log("error: schema version mismatch (db=" + std::to_string(version)
+                    + " expected=" + std::to_string(CURRENT_SCHEMA_VERSION)
+                    + ") — database is newer than this binary");
+            return 3;
+        }
+        // Only migrate versions the incremental migration path understands (>=3).
+        // Older/empty DBs would require a destructive rebuild, so leave those to
+        // the read-only guard below (the user should reindex).
+        if (version >= 3 && version < CURRENT_SCHEMA_VERSION) {
+            auto lock_path = db_path;
+            lock_path += ".lock";
+            FileLock lock(lock_path);
+            if (lock.acquire()) {
+                mcp_log("schema: migrating db=" + std::to_string(version) + " -> "
+                        + std::to_string(CURRENT_SCHEMA_VERSION) + " in place (no reindex)");
+                {
+                    Connection wconn(db_path);  // read-write
+                    int rc = schema::ensure_schema(wconn);
+                    if (rc != 0) {
+                        lock.release();
+                        mcp_log("error: schema migration failed (db=" + std::to_string(version)
+                                + " expected=" + std::to_string(CURRENT_SCHEMA_VERSION) + ")");
+                        return 3;
+                    }
+                }
+                lock.release();
+                mcp_log("schema: migration done");
+            } else {
+                // Another indexer holds the lock and will migrate — wait for it.
+                mcp_log("schema: waiting for concurrent indexer (PID "
+                        + std::to_string(lock.holder_pid()) + ") to migrate");
+                for (int i = 0; i < 300 && version != CURRENT_SCHEMA_VERSION; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    Connection probe(db_path, true);
+                    version = schema::get_schema_version(probe);
+                }
+            }
+        }
     }
 
     Connection conn(db_path, true);  // read-only
