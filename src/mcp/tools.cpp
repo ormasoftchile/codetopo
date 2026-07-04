@@ -86,7 +86,7 @@ static bool parse_symbol_fields(yyjson_val* params,
     }
 
     static const std::unordered_set<std::string> valid_fields = {
-        "node_id", "name", "qualname", "kind", "signature",
+        "node_id", "stable_key", "name", "qualname", "kind", "signature",
         "start_line", "end_line", "span", "file_path", "file"
     };
 
@@ -127,6 +127,7 @@ static void add_symbol_span_array(JsonMutDoc& doc, yyjson_mut_val* item,
 static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
                               int64_t node_id, const char* kind,
                               const char* name, const char* qualname,
+                              const char* stable_key,
                               const char* file_path, int start_line,
                               int end_line, bool compact,
                               bool compact_include_file,
@@ -139,6 +140,7 @@ static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
             if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+            if (stable_key) yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", stable_key);
             if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
             add_symbol_span_object(doc, item, start_line, end_line);
             return;
@@ -152,6 +154,8 @@ static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
         if (qualname && include_field(fields_set, "qualname"))
             yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+        if (stable_key && include_field(fields_set, "stable_key"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", stable_key);
         if (file_path && include_field(fields_set, "file_path"))
             yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
         if (file_path && include_field(fields_set, "file"))
@@ -168,6 +172,7 @@ static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
     yyjson_mut_obj_add_int(doc.doc, item, "node_id", node_id);
     yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
     yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
+    if (stable_key) yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", stable_key);
     if (!compact) {
         if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
         if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
@@ -185,6 +190,7 @@ static void add_symbol_result(JsonMutDoc& doc, yyjson_mut_val* item,
 static void add_symbol_listing_result(JsonMutDoc& doc, yyjson_mut_val* item,
                                       int64_t node_id, const char* kind,
                                       const char* name, const char* qualname,
+                                      const char* stable_key,
                                       const char* file_path, int start_line,
                                       int end_line, const char* signature,
                                       bool include_handles, bool compact,
@@ -198,6 +204,7 @@ static void add_symbol_listing_result(JsonMutDoc& doc, yyjson_mut_val* item,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", kind);
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
             if (qualname) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+            if (stable_key) yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", stable_key);
             if (signature) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
             if (file_path) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path);
             add_symbol_span_object(doc, item, start_line, end_line);
@@ -212,6 +219,8 @@ static void add_symbol_listing_result(JsonMutDoc& doc, yyjson_mut_val* item,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name", name);
         if (qualname && include_field(fields_set, "qualname"))
             yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+        if (stable_key && include_field(fields_set, "stable_key"))
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", stable_key);
         if (signature && include_field(fields_set, "signature"))
             yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
         if (file_path && include_field(fields_set, "file_path"))
@@ -228,8 +237,8 @@ static void add_symbol_listing_result(JsonMutDoc& doc, yyjson_mut_val* item,
     }
 
     if (include_handles) {
-        add_symbol_result(doc, item, node_id, kind, name, qualname, file_path,
-                          start_line, end_line, compact, compact_include_file,
+        add_symbol_result(doc, item, node_id, kind, name, qualname,
+                          stable_key, file_path, start_line, end_line, compact, compact_include_file,
                           compact_file_key, fields_set, false);
         if (signature) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", signature);
         return;
@@ -256,35 +265,75 @@ static size_t estimate_symbol_listing_bytes(const char* kind, const char* name,
         || fields_set.count("signature"));
     bool include_qualname = qualname && (include_handles || fields_set.count("qualname")
         || (fields_provided && fields_set.empty()));
+    bool include_stable_key = include_handles || fields_set.count("stable_key")
+        || (fields_provided && fields_set.empty());
 
     if (include_file) bytes += 16 + cstr_len(file_path);
     if (include_signature) bytes += 16 + cstr_len(signature);
     if (include_qualname) bytes += 16 + cstr_len(qualname);
     if (include_handles || fields_set.count("node_id")) bytes += 24;
+    if (include_stable_key) bytes += 48;
     if (include_handles || fields_set.count("span")) bytes += 36;
     if (fields_set.count("start_line")) bytes += 18;
     if (fields_set.count("end_line")) bytes += 18;
     return bytes;
 }
 
-// Resolve a node by node_id, or by symbol+file name lookup.
+static const char* sqlite_text_or_null(sqlite3_stmt* stmt, int col) {
+    auto* text = sqlite3_column_text(stmt, col);
+    return text ? reinterpret_cast<const char*>(text) : nullptr;
+}
+
+static void add_stable_key_if_present(JsonMutDoc& doc, yyjson_mut_val* item,
+                                      const char* stable_key,
+                                      const char* field = "stable_key") {
+    if (stable_key && std::strlen(stable_key) > 0)
+        yyjson_mut_obj_add_strcpy(doc.doc, item, field, stable_key);
+}
+
+// Resolve a node by stable_key, node_id, or by symbol+file name lookup.
 // Allows tools to be called with stable identifiers instead of volatile IDs.
 static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCache& cache,
-                                const char* id_param = "node_id") {
+                                const char* id_param = "node_id",
+                                std::string* error = nullptr) {
     if (!params) return -1;
-    int64_t id = json_get_int(params, id_param, -1);
-    if (id >= 0) return id;
 
     // stable_key: a reindex-proof handle (path::kind::name...). node_id is a rowid
     // that is reassigned on a full reindex, so callers caching handles across turns
     // should prefer stable_key. Resolving here benefits every node-consuming tool.
     auto* sk_val = yyjson_obj_get(params, "stable_key");
-    if (sk_val && yyjson_is_str(sk_val)) {
+    if (sk_val && yyjson_is_str(sk_val) && std::strlen(yyjson_get_str(sk_val)) > 0) {
         auto* sk_stmt = cache.get("resolve_node_by_stable_key",
             "SELECT id FROM nodes WHERE stable_key = ? LIMIT 1");
         sqlite3_bind_text(sk_stmt, 1, yyjson_get_str(sk_val), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(sk_stmt) == SQLITE_ROW) return sqlite3_column_int64(sk_stmt, 0);
+        if (error) *error = std::string("stable_key not found: ") + yyjson_get_str(sk_val);
         return -1;
+    }
+
+    int64_t id = json_get_int(params, id_param, -1);
+    if (id >= 0) {
+        auto* expected_val = yyjson_obj_get(params, "expected_stable_key");
+        if (expected_val && yyjson_is_str(expected_val) && std::strlen(yyjson_get_str(expected_val)) > 0) {
+            const char* expected = yyjson_get_str(expected_val);
+            auto* check_stmt = cache.get("resolve_node_stable_key_by_id",
+                "SELECT stable_key FROM nodes WHERE id = ? LIMIT 1");
+            sqlite3_bind_int64(check_stmt, 1, id);
+            if (sqlite3_step(check_stmt) != SQLITE_ROW) {
+                if (error) *error = "node_id " + std::to_string(id) + " not found while checking expected_stable_key";
+                return -1;
+            }
+            const char* found = sqlite_text_or_null(check_stmt, 0);
+            if (!found || std::strcmp(found, expected) != 0) {
+                if (error) {
+                    *error = "node_id " + std::to_string(id) + " is stale/reused: expected stable_key "
+                        + expected + ", found " + (found ? found : "<null>")
+                        + " — reindex renumbered ids, re-resolve via symbol_search/context_for";
+                }
+                return -1;
+            }
+        }
+        return id;
     }
 
     auto* sym_val = yyjson_obj_get(params, "symbol");
@@ -345,6 +394,7 @@ struct CallsiteCandidateSet {
     int64_t eligible_total = 0;
     int64_t filtered_hidden = 0;
     int64_t arity_filtered = 0;
+    int64_t receiver_type_hits = 0;
     bool budget_exceeded = false;
     bool has_more = false;
     int64_t max_bytes = 16000;
@@ -376,6 +426,39 @@ static std::string lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+static std::vector<std::string> split_search_terms(const std::string& query) {
+    std::vector<std::string> terms;
+    std::istringstream in(query);
+    std::string term;
+    while (in >> term) {
+        if (!term.empty()) terms.push_back(term);
+    }
+    if (terms.empty() && !query.empty()) terms.push_back(query);
+    return terms;
+}
+
+static std::string escape_fts_phrase(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '"') out += "\"\"";
+        else out.push_back(ch);
+    }
+    return out;
+}
+
+static std::string escape_like_contains(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('%');
+    for (char ch : lower_copy(value)) {
+        if (ch == '\\' || ch == '%' || ch == '_') out.push_back('\\');
+        out.push_back(ch);
+    }
+    out.push_back('%');
+    return out;
 }
 
 static bool iequals(const std::string& lhs, const std::string& rhs) {
@@ -547,8 +630,10 @@ static CandidateMode parse_candidate_mode(yyjson_val* params) {
 }
 
 static bool should_collect_candidates(CandidateMode mode, bool exact_empty) {
-    return mode == CandidateMode::ExactPlusCandidates
-        || (mode == CandidateMode::ExactThenCandidates && exact_empty);
+    // Always-on fallback: exact-only/full-output knobs must not suppress refs-backed
+    // candidate recovery when exact call edges are absent (common for overloads).
+    if (exact_empty) return true;
+    return mode == CandidateMode::ExactPlusCandidates;
 }
 
 static bool is_common_member_name(const std::string& name) {
@@ -1233,6 +1318,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
         auto* receiver_type = sqlite3_column_text(stmt, 14);
         row.receiver_type_hint = receiver_type ? reinterpret_cast<const char*>(receiver_type) : "";
         row.receiver_hint = extract_receiver_hint(row.callee_text, target.name);
+        bool receiver_type_hit = false;
 
         std::string key = row.file_path + ":" + std::to_string(row.start_line) + ":" +
                           std::to_string(row.start_col) + ":" + row.callee_text;
@@ -1241,6 +1327,9 @@ static CallsiteCandidateSet collect_callsite_candidates(
         bool raw_receiver_type_matches_target =
             receiver_owner_match_strength(canonical_type_hint(row.receiver_type_hint), target) !=
                 ReceiverMatchStrength::None;
+        receiver_type_hit = raw_receiver_type_matches_target ||
+            (!options.receiver_filter.empty() &&
+             receiver_text_matches_name(row.receiver_type_hint, options.receiver_filter));
         if (!row.receiver_type_hint.empty() &&
             !(raw_receiver_type_matches_target && !options.receiver_filter.empty())) {
             bool receiver_filter_can_match =
@@ -1261,11 +1350,13 @@ static CallsiteCandidateSet collect_callsite_candidates(
                 if (resolved.resolved) {
                     row.resolved_receiver_type = resolved.resolved_type;
                     row.receiver_type_resolution_source = resolved.source;
+                    receiver_type_hit = true;
                 } else if (resolved.ambiguous) {
                     row.receiver_type_ambiguous = true;
                 }
             }
         }
+        if (receiver_type_hit) ++result.receiver_type_hits;
         score_candidate(row, target, row.caller_name, row.caller_qualname);
         if (!apply_arity_and_pattern_score(row, target)) {
             ++result.arity_filtered;
@@ -1435,6 +1526,14 @@ static void add_callsite_candidate_buckets(JsonMutDoc& doc, yyjson_mut_val* root
     yyjson_mut_obj_add_val(doc.doc, root, "candidate_buckets", buckets);
 }
 
+static const char* callsite_resolution_status(const CallsiteCandidateSet& candidates,
+                                                  const CallsiteCandidateOptions& options) {
+    if (options.receiver_filter.empty()) return "no_receiver_type";
+    if (candidates.total == 0 || candidates.eligible_total > 0 || candidates.receiver_type_hits > 0)
+        return "resolved";
+    return "unresolved";
+}
+
 static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* root,
                                             const char* prefix,
                                             const CallsiteCandidateSet& candidates,
@@ -1445,6 +1544,7 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_receiver_type_hits", candidates.receiver_type_hits);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_budget_exceeded", true);
@@ -1455,6 +1555,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "eligible_candidates", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", candidates.max_bytes);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     } else if (p == "candidate_callers") {
@@ -1462,6 +1565,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_callers_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_budget_exceeded", true);
@@ -1472,6 +1578,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_impacted_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_budget_exceeded", true);
@@ -3017,6 +3126,8 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
 
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    const char* match_param = params ? json_get_str(params, "match") : nullptr;
+    bool match_all = match_param && std::strcmp(match_param, "all") == 0;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     bool include_source = params ? json_get_bool(params, "include_source", false) : false;
@@ -3027,125 +3138,77 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     // When query is "*" or empty, skip FTS and query nodes table directly
     bool wildcard = (strcmp(query, "*") == 0 || strlen(query) == 0);
 
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_stmt* count_stmt = nullptr;
-    int bind_idx = 1;
-    int count_bind_idx = 1;
-    int64_t total_override = 0;  // used when count_stmt is skipped (FTS-only fast path)
+    bool has_kind = kind && strlen(kind) > 0;
+    bool fn_kind = has_kind && std::string(kind) == "function";
+    bool has_file_pattern = file_pattern && strlen(file_pattern) > 0;
+    auto terms = wildcard ? std::vector<std::string>{} : split_search_terms(query);
+    std::string fts_query;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        if (i) fts_query += match_all ? " AND " : " OR ";
+        fts_query += "name: \"" + escape_fts_phrase(terms[i]) + "\"*";
+    }
+    if (fts_query.empty() && !wildcard)
+        fts_query = "name: \"" + escape_fts_phrase(query) + "\"*";
+    std::string cache_key = std::string("symbol_search_") + (wildcard ? "wild" : "fts");
+    cache_key += has_kind ? (fn_kind ? "_fn" : "_kind") : "_all";
+    if (!wildcard) cache_key += match_all ? "_all_terms" : "_any_terms";
+    if (!wildcard) cache_key += "_t" + std::to_string(terms.empty() ? 1 : terms.size());
+    if (has_file_pattern) cache_key += "_fp";
 
+    std::string from_sql = wildcard
+        ? "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+        : "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id LEFT JOIN files f ON n.file_id = f.id ";
+    std::string where_sql = wildcard ? "WHERE 1=1 " : "WHERE nodes_fts MATCH ? ";
+    if (has_kind) {
+        where_sql += fn_kind ? "AND n.kind IN ('function', 'method') " : "AND n.kind = ? ";
+    }
+    if (has_file_pattern) where_sql += "AND f.path GLOB ? ";
+
+    std::string select_sql =
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.stable_key "
+        + from_sql + where_sql;
+    std::string match_score_sql;
+    if (!wildcard) {
+        for (size_t i = 0; i < terms.size(); ++i) {
+            if (i) match_score_sql += " + ";
+            match_score_sql +=
+                "CASE WHEN lower(COALESCE(n.name,'')) LIKE ? ESCAPE '\\' "
+                "OR lower(COALESCE(n.qualname,'')) LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END";
+        }
+        if (match_score_sql.empty()) match_score_sql = "0";
+    }
     if (wildcard) {
-        if (kind && strlen(kind) > 0) {
-            bool fn_kind = (std::string(kind) == "function");
-            stmt = fn_kind
-                ? cache.get("symbol_search_wildcard_fn",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE n.kind IN ('function', 'method') "
-                    "ORDER BY f.path, n.start_line, n.id "
-                    "LIMIT ? OFFSET ?")
-                : cache.get("symbol_search_wildcard_kind",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE n.kind = ? "
-                    "ORDER BY f.path, n.start_line, n.id "
-                    "LIMIT ? OFFSET ?");
-            count_stmt = fn_kind
-                ? cache.get("symbol_search_wildcard_fn_count",
-                    "SELECT COUNT(*) FROM nodes n WHERE n.kind IN ('function', 'method')")
-                : cache.get("symbol_search_wildcard_kind_count",
-                    "SELECT COUNT(*) FROM nodes n WHERE n.kind = ?");
-            if (!fn_kind) {
-                sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(count_stmt, count_bind_idx++, kind, -1, SQLITE_TRANSIENT);
-            }
-        } else {
-            stmt = cache.get("symbol_search_wildcard",
-                "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
-                "ORDER BY f.path, n.start_line, n.id "
-                "LIMIT ? OFFSET ?");
-            count_stmt = cache.get("symbol_search_wildcard_count",
-                "SELECT COUNT(*) FROM nodes n");
-        }
+        select_sql += "ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     } else {
-        std::string fts_query = "name: \"" + std::string(query) + "\"*";
-        bool has_kind = kind && strlen(kind) > 0;
-        bool primary_fn_kind = has_kind && std::string(kind) == "function";
+        select_sql += "ORDER BY (" + match_score_sql + ") DESC, " CODETOPO_TEST_RANK("f.path")
+            ", length(n.name), n.name, f.path, n.start_line, n.id LIMIT ? OFFSET ?";
+    }
+    std::string count_sql = "SELECT COUNT(*) " + from_sql + where_sql;
 
-        // Phase 1: cheap FTS-only primary count. The LIKE '%q%' fallback below
-        // requires a full scan of the nodes table (millions of rows on large
-        // repos) and only ever contributes rows when there are fewer than 5 FTS
-        // matches. Gate it in C++: when FTS already yields >= 5 matches, take an
-        // FTS-only path and skip the fallback entirely. This avoids a full-table
-        // scan on every search (previously ~26s vs ~1.5s on a 15GB / 4.8M-node index).
-        sqlite3_stmt* pc_stmt = nullptr;
-        if (!has_kind) {
-            pc_stmt = cache.get("symbol_search_pcount",
-                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                "WHERE nodes_fts MATCH ?");
-            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-        } else if (primary_fn_kind) {
-            pc_stmt = cache.get("symbol_search_pcount_fn",
-                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method')");
-            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-        } else {
-            pc_stmt = cache.get("symbol_search_pcount_kind",
-                "SELECT COUNT(*) FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                "WHERE nodes_fts MATCH ? AND n.kind = ?");
-            sqlite3_bind_text(pc_stmt, 1, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(pc_stmt, 2, kind, -1, SQLITE_TRANSIENT);
-        }
-        int64_t primary_count = 0;
-        if (sqlite3_step(pc_stmt) == SQLITE_ROW) primary_count = sqlite3_column_int64(pc_stmt, 0);
+    sqlite3_stmt* stmt = cache.get(cache_key, select_sql);
+    sqlite3_stmt* count_stmt = cache.get(cache_key + "_count", count_sql);
 
-        // FTS-only: always index-backed, NEVER a full-table scan. The former LIKE
-        // '%q%' infix fallback (taken when FTS matched < 5 rows) scanned all ~4.8M
-        // nodes and caused intermittent symbol_search timeouts on large indexes
-        // (e.g. dsmaindev). Infix/substring matching now lives in code_search and
-        // symbol_list(name_glob); symbol_search stays purely FTS prefix-matched.
-        total_override = primary_count;
-        {
-            if (!has_kind) {
-                stmt = cache.get("symbol_search_primary",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? "
-                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
-                    "LIMIT ? OFFSET ?");
-                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-            } else if (primary_fn_kind) {
-                stmt = cache.get("symbol_search_primary_fn",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind IN ('function', 'method') "
-                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
-                    "LIMIT ? OFFSET ?");
-                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-            } else {
-                stmt = cache.get("symbol_search_primary_kind",
-                    "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line "
-                    "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id "
-                    "LEFT JOIN files f ON n.file_id = f.id "
-                    "WHERE nodes_fts MATCH ? AND n.kind = ? "
-                    "ORDER BY " CODETOPO_TEST_RANK("f.path") ", length(n.name), n.name, f.path, n.start_line, n.id "
-                    "LIMIT ? OFFSET ?");
-                sqlite3_bind_text(stmt, bind_idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, bind_idx++, kind, -1, SQLITE_TRANSIENT);
-            }
+    auto bind_filters = [&](sqlite3_stmt* s, int idx) {
+        if (!wildcard) sqlite3_bind_text(s, idx++, fts_query.c_str(), -1, SQLITE_TRANSIENT);
+        if (has_kind && !fn_kind) sqlite3_bind_text(s, idx++, kind, -1, SQLITE_TRANSIENT);
+        if (has_file_pattern) sqlite3_bind_text(s, idx++, file_pattern, -1, SQLITE_TRANSIENT);
+        return idx;
+    };
+
+    int bind_idx = bind_filters(stmt, 1);
+    bind_filters(count_stmt, 1);
+    if (!wildcard) {
+        for (const auto& term : terms) {
+            auto pattern = escape_like_contains(term);
+            sqlite3_bind_text(stmt, bind_idx++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, bind_idx++, pattern.c_str(), -1, SQLITE_TRANSIENT);
         }
     }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
     int64_t total = 0;
-    if (count_stmt) {
-        if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
-    } else {
-        total = total_override;
-    }
+    if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -3158,10 +3221,6 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
         if (count == limit) { has_more = true; break; }
 
         auto* fp = sqlite3_column_text(stmt, 4);
-        // Apply file_pattern post-filter if provided
-        if (file_pattern && strlen(file_pattern) > 0 && fp) {
-            if (sqlite3_strglob(file_pattern, reinterpret_cast<const char*>(fp)) != 0) continue;
-        }
         count++;
 
         auto* item = doc.new_obj();
@@ -3177,6 +3236,7 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
                                  reinterpret_cast<const char*>(nm)) != 0))
             yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
         if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
+        add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 7));
 
         auto* span = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
@@ -3187,6 +3247,7 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    if (!wildcard) yyjson_mut_obj_add_str(doc.doc, root, "match", match_all ? "all" : "any");
     return doc.to_string();
 }
 
@@ -3224,11 +3285,13 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
 
     std::string semantic_sql = "1=1";
     bool semantic_filters = false;
+    bool explicit_method_kind = kind && std::strcmp(kind, "method") == 0;
+    bool apply_min_span_filter = min_span_lines > 0 && !explicit_method_kind;
     if (kind && strlen(kind) > 0) {
         semantic_sql += " AND n.kind = ?";
         semantic_filters = true;
     }
-    if (min_span_lines > 0) {
+    if (apply_min_span_filter) {
         semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
         semantic_sql += kPublicSymbolSql;
         semantic_sql += ")";
@@ -3239,7 +3302,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     if (semantic_filters) where_sql += " AND " + semantic_sql;
 
     std::string sql =
-        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature "
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature, n.stable_key "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
@@ -3266,7 +3329,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
         if (kind && strlen(kind) > 0)
             sqlite3_bind_text(s, idx++, kind, -1, SQLITE_TRANSIENT);
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             sqlite3_bind_int64(s, idx++, min_span_lines);
         return idx;
     };
@@ -3308,11 +3371,13 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
         auto* qn_txt = sqlite3_column_text(stmt, 3);
         auto* fp_txt = sqlite3_column_text(stmt, 4);
         auto* sig_txt = sqlite3_column_text(stmt, 7);
+        auto* sk_txt = sqlite3_column_text(stmt, 8);
         const char* row_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         const char* row_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
         const char* row_qn = qn_txt ? reinterpret_cast<const char*>(qn_txt) : nullptr;
         const char* row_file = fp_txt ? reinterpret_cast<const char*>(fp_txt) : nullptr;
         const char* row_sig = sig_txt ? reinterpret_cast<const char*>(sig_txt) : nullptr;
+        const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
         if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
@@ -3323,7 +3388,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
 
         auto* item = doc.new_obj();
         add_symbol_listing_result(doc, item,
-            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_file,
+            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_sk, row_file,
             sqlite3_column_int(stmt, 5), sqlite3_column_int(stmt, 6), row_sig,
             include_handles, compact, true, "file", fields_set, fields_provided);
 
@@ -3336,13 +3401,13 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
     yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
-    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
     if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
-    if (min_span_lines > 0 || hidden_public_count > 0) {
+    if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             yyjson_mut_arr_add_str(doc.doc, warnings,
                 "min_span_lines is lossy; public/API-like symbols bypass span pruning");
         if (hidden_public_count > 0)
@@ -3426,6 +3491,8 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
     std::string semantic_sql = "1=1";
     bool semantic_filters = false;
+    bool explicit_method_kind = std::find(kinds.begin(), kinds.end(), "method") != kinds.end();
+    bool apply_min_span_filter = min_span_lines > 0 && !explicit_method_kind;
     if (!kinds.empty()) {
         semantic_sql += " AND n.kind IN (";
         for (size_t i = 0; i < kinds.size(); ++i) {
@@ -3435,7 +3502,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         semantic_sql += ")";
         semantic_filters = true;
     }
-    if (min_span_lines > 0) {
+    if (apply_min_span_filter) {
         semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
         semantic_sql += kPublicSymbolSql;
         semantic_sql += ")";
@@ -3446,7 +3513,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     if (semantic_filters) where_sql += " AND " + semantic_sql;
 
     std::string sql =
-        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature "
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature, n.stable_key "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
@@ -3472,7 +3539,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
         for (const auto& k : kinds)
             sqlite3_bind_text(s, idx++, k.c_str(), -1, SQLITE_TRANSIENT);
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             sqlite3_bind_int64(s, idx++, min_span_lines);
         return idx;
     };
@@ -3516,11 +3583,13 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         auto* qn_txt = sqlite3_column_text(stmt, 3);
         auto* fp_txt = sqlite3_column_text(stmt, 4);
         auto* sig_txt = sqlite3_column_text(stmt, 7);
+        auto* sk_txt = sqlite3_column_text(stmt, 8);
         const char* row_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
         const char* row_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
         const char* row_qn = qn_txt ? reinterpret_cast<const char*>(qn_txt) : nullptr;
         const char* row_file = fp_txt ? reinterpret_cast<const char*>(fp_txt) : nullptr;
         const char* row_sig = sig_txt ? reinterpret_cast<const char*>(sig_txt) : nullptr;
+        const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
         if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
@@ -3531,7 +3600,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
         auto* item = doc.new_obj();
         add_symbol_listing_result(doc, item,
-            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_file,
+            sqlite3_column_int64(stmt, 0), row_kind, row_name, row_qn, row_sk, row_file,
             sqlite3_column_int(stmt, 5), sqlite3_column_int(stmt, 6), row_sig,
             include_handles, compact, false, "file_path", fields_set, fields_provided);
         yyjson_mut_arr_append(results, item);
@@ -3543,13 +3612,13 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
     yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
-    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
     if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
-    if (min_span_lines > 0 || hidden_public_count > 0) {
+    if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             yyjson_mut_arr_add_str(doc.doc, warnings,
                 "min_span_lines is lossy; public/API-like symbols bypass span pruning");
         if (hidden_public_count > 0)
@@ -3609,14 +3678,16 @@ static std::string truncate_source_lines(const std::string& source, int64_t max_
 // T063: symbol_get
 std::string symbol_get(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     bool include_source = params ? json_get_bool(params, "include_source", true) : true;
 
     auto* stmt = cache.get("symbol_get",
         "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-        "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns "
+        "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.id = ? AND n.node_type = 'symbol'");
 
@@ -3640,6 +3711,7 @@ std::string symbol_get(yyjson_val* params, Connection& conn,
     if (qn) yyjson_mut_obj_add_strcpy(doc.doc, root, "qualname", reinterpret_cast<const char*>(qn));
     auto* sig = sqlite3_column_text(stmt, 4);
     if (sig) yyjson_mut_obj_add_strcpy(doc.doc, root, "signature", reinterpret_cast<const char*>(sig));
+    add_stable_key_if_present(doc, root, sqlite_text_or_null(stmt, 12));
 
     auto* fp = sqlite3_column_text(stmt, 5);
     std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
@@ -3709,7 +3781,7 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
 
         auto* stmt = cache.get("symbol_get",
             "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-            "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns "
+            "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key "
             "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
             "WHERE n.id = ? AND n.node_type = 'symbol'");
         sqlite3_bind_int64(stmt, 1, nid);
@@ -3726,6 +3798,7 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
         if (qn) yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
         auto* sig = sqlite3_column_text(stmt, 4);
         if (sig) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", reinterpret_cast<const char*>(sig));
+        add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 12));
         auto* fp = sqlite3_column_text(stmt, 5);
         std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
         if (!file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path.c_str());
@@ -3752,7 +3825,9 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
 // T066: callers_approx
 std::string callers_approx(yyjson_val* params, Connection& conn,
                                     QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -3767,8 +3842,16 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     CandidateMode candidate_mode = parse_candidate_mode(params);
     CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
     const char* response_mode = params ? json_get_str(params, "response_mode") : nullptr;
-    bool lean_response = (response_mode && std::strcmp(response_mode, "lean") == 0) ||
-                         (params && json_get_bool(params, "lean", false));
+    bool lean_response = true;
+    if (response_mode) {
+        lean_response = std::strcmp(response_mode, "full") != 0 &&
+                        std::strcmp(response_mode, "verbose") != 0;
+    } else if (params && json_get_bool(params, "verbose", false)) {
+        lean_response = false;
+    } else if (params) {
+        auto* lean_val = yyjson_obj_get(params, "lean");
+        if (lean_val && yyjson_is_bool(lean_val)) lean_response = yyjson_get_bool(lean_val);
+    }
     bool include_buckets = !params || json_get_bool(params, "buckets", true);
     int64_t top_n = params ? json_get_int(params, "top_n", 10) : 10;
     if (top_n <= 0) top_n = 10;
@@ -3790,7 +3873,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     sqlite3_stmt* stmt = nullptr;
     if (min_confidence > 0.0) {
         sqlite3_prepare_v2(conn.raw(),
-            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
+            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence, n.stable_key "
             "FROM edges e "
             "JOIN nodes n ON e.src_id = n.id "
             "LEFT JOIN files f ON n.file_id = f.id "
@@ -3802,7 +3885,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         sqlite3_bind_int64(stmt, 3, exact_limit);
     } else {
         stmt = cache.get("callers_approx",
-            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence "
+            "SELECT e.src_id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, e.confidence, n.stable_key "
             "FROM edges e "
             "JOIN nodes n ON e.src_id = n.id "
             "LEFT JOIN files f ON n.file_id = f.id "
@@ -3818,6 +3901,7 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         std::string kind;
         std::string name;
         std::string qualname;
+        std::string stable_key;
         std::string file_path;
         int start_line = 0;
         int end_line = 0;
@@ -3836,14 +3920,18 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         r.start_line = sqlite3_column_int(stmt, 5);
         r.end_line = sqlite3_column_int(stmt, 6);
         r.confidence = sqlite3_column_double(stmt, 7);
+        auto* sk = sqlite3_column_text(stmt, 8);
+        r.stable_key = sk ? reinterpret_cast<const char*>(sk) : "";
         rows.push_back(std::move(r));
     }
     if (min_confidence > 0.0 && stmt) sqlite3_finalize(stmt);
     bool has_symbol_exact_callers = std::any_of(rows.begin(), rows.end(), [](const CallerRow& row) {
         return row.kind != "file";
     });
-    bool collect_candidates = candidate_mode == CandidateMode::ExactPlusCandidates
-        || (candidate_mode == CandidateMode::ExactThenCandidates && !has_symbol_exact_callers);
+    // Always-on fallback: if exact symbol callers are absent, approximate refs-backed
+    // candidates must be present regardless of mode/include_candidates flags.
+    bool collect_candidates = !has_symbol_exact_callers
+        || candidate_mode == CandidateMode::ExactPlusCandidates;
     CallsiteCandidateSet candidates;
     if (collect_candidates)
         candidates = collect_callsite_candidates(
@@ -3857,12 +3945,15 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
         auto* item = doc.new_obj();
         if (!compact) {
             yyjson_mut_obj_add_int(doc.doc, item, "caller_node_id", r.id);
+            if (!r.stable_key.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", r.stable_key.c_str());
             yyjson_mut_obj_add_strcpy(doc.doc, item, "caller_name", r.name.c_str());
             if (!r.file_path.empty())
                 yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", r.file_path.c_str());
         } else {
             add_symbol_result(doc, item, r.id, r.kind.c_str(), r.name.c_str(),
                 r.qualname.empty() ? nullptr : r.qualname.c_str(),
+                r.stable_key.empty() ? nullptr : r.stable_key.c_str(),
                 r.file_path.empty() ? nullptr : r.file_path.c_str(),
                 r.start_line, r.end_line, true, true, "file", {}, false);
         }
@@ -3960,7 +4051,9 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
 // T067: callees_approx
 std::string callees_approx(yyjson_val* params, Connection& conn,
                                     QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -3970,7 +4063,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
     bool compact = params ? json_get_bool(params, "compact", false) : false;
 
     auto* stmt = cache.get("callees_approx",
-        "SELECT e.dst_id, n.kind, n.name, n.qualname, n.signature, e.confidence, f.path, n.start_line, n.end_line "
+        "SELECT e.dst_id, n.kind, n.name, n.qualname, n.signature, e.confidence, f.path, n.start_line, n.end_line, n.stable_key "
         "FROM edges e "
         "JOIN nodes n ON e.dst_id = n.id "
         "LEFT JOIN files f ON n.file_id = f.id "
@@ -3987,6 +4080,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         std::string name;
         std::string qualname;
         std::string signature;
+        std::string stable_key;
         std::string file_path;
         int start_line = 0;
         int end_line = 0;
@@ -4007,6 +4101,8 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         r.file_path = fp ? reinterpret_cast<const char*>(fp) : "";
         r.start_line = sqlite3_column_int(stmt, 7);
         r.end_line = sqlite3_column_int(stmt, 8);
+        auto* sk = sqlite3_column_text(stmt, 9);
+        r.stable_key = sk ? reinterpret_cast<const char*>(sk) : "";
         rows.push_back(std::move(r));
     }
 
@@ -4018,6 +4114,8 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         auto* item = doc.new_obj();
         if (!compact) {
             yyjson_mut_obj_add_int(doc.doc, item, "callee_node_id", r.id);
+            if (!r.stable_key.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", r.stable_key.c_str());
             yyjson_mut_obj_add_strcpy(doc.doc, item, "callee_name", r.name.c_str());
             if (!r.qualname.empty())
                 yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", r.qualname.c_str());
@@ -4028,6 +4126,7 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
         } else {
             add_symbol_result(doc, item, r.id, r.kind.c_str(), r.name.c_str(),
                 r.qualname.empty() ? nullptr : r.qualname.c_str(),
+                r.stable_key.empty() ? nullptr : r.stable_key.c_str(),
                 r.file_path.empty() ? nullptr : r.file_path.c_str(),
                 r.start_line, r.end_line, true, true, "file", {}, false);
         }
@@ -4078,7 +4177,9 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
 // T065: references
 std::string references(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -4174,7 +4275,7 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     if (sqlite3_step(total_stmt) == SQLITE_ROW) total = sqlite3_column_int64(total_stmt, 0);
 
     auto* sym_stmt = cache.get("file_symbols",
-        "SELECT id, kind, name, qualname, visibility, signature, start_line, end_line "
+        "SELECT id, kind, name, qualname, visibility, signature, start_line, end_line, stable_key "
         "FROM nodes WHERE file_id = ? AND node_type = 'symbol' ORDER BY start_line, id LIMIT ? OFFSET ?");
     sqlite3_bind_int64(sym_stmt, 1, file_id);
     sqlite3_bind_int64(sym_stmt, 2, limit + 1);
@@ -4191,6 +4292,7 @@ std::string file_summary(yyjson_val* params, Connection& conn,
     auto append_symbol = [&](yyjson_mut_val* arr) {
         auto* sym = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, sym, "node_id", sqlite3_column_int64(sym_stmt, 0));
+        add_stable_key_if_present(doc, sym, sqlite_text_or_null(sym_stmt, 8));
         yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind",
             reinterpret_cast<const char*>(sqlite3_column_text(sym_stmt, 1)));
         auto* nm = sqlite3_column_text(sym_stmt, 2);
@@ -4398,7 +4500,9 @@ std::string file_overview(yyjson_val* params, Connection& conn,
 // T068: context_for (one-shot symbol understanding)
 std::string context_for(yyjson_val* params, Connection& conn,
                                 QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     bool include_source = params ? json_get_bool(params, "include_source", true) : true;
@@ -4552,7 +4656,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
     // Container info: enclosing type/namespace/module (via 'contains' edge where dst = node_id)
     {
         auto* cont_stmt = cache.get("context_container",
-            "SELECT n.id, n.kind, n.name, n.qualname "
+            "SELECT n.id, n.kind, n.name, n.qualname, n.stable_key "
             "FROM edges e JOIN nodes n ON e.src_id = n.id "
             "WHERE e.dst_id = ? AND e.kind = 'contains' LIMIT 1");
         sqlite3_bind_int64(cont_stmt, 1, node_id);
@@ -4560,6 +4664,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
             auto* container = doc.new_obj();
             int64_t container_id = sqlite3_column_int64(cont_stmt, 0);
             yyjson_mut_obj_add_int(doc.doc, container, "node_id", container_id);
+            add_stable_key_if_present(doc, container, sqlite_text_or_null(cont_stmt, 4));
             yyjson_mut_obj_add_strcpy(doc.doc, container, "kind",
                 reinterpret_cast<const char*>(sqlite3_column_text(cont_stmt, 1)));
             yyjson_mut_obj_add_strcpy(doc.doc, container, "name",
@@ -4571,7 +4676,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
 
             // Sibling members: other symbols contained by the same container
             auto* sib_stmt = cache.get("context_siblings",
-                "SELECT n.id, n.kind, n.name, n.signature "
+                "SELECT n.id, n.kind, n.name, n.signature, n.stable_key "
                 "FROM edges e JOIN nodes n ON e.dst_id = n.id "
                 "WHERE e.src_id = ? AND e.kind = 'contains' AND n.id != ? "
                 "ORDER BY n.start_line LIMIT 30");
@@ -4582,6 +4687,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
             while (sqlite3_step(sib_stmt) == SQLITE_ROW) {
                 auto* s = doc.new_obj();
                 yyjson_mut_obj_add_int(doc.doc, s, "node_id", sqlite3_column_int64(sib_stmt, 0));
+                add_stable_key_if_present(doc, s, sqlite_text_or_null(sib_stmt, 4));
                 yyjson_mut_obj_add_strcpy(doc.doc, s, "kind",
                     reinterpret_cast<const char*>(sqlite3_column_text(sib_stmt, 1)));
                 yyjson_mut_obj_add_strcpy(doc.doc, s, "name",
@@ -4595,7 +4701,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
 
             // Base/implements: what types this container inherits from
             auto* base_stmt = cache.get("context_bases",
-                "SELECT n.id, n.kind, n.name, n.qualname "
+                "SELECT n.id, n.kind, n.name, n.qualname, n.stable_key "
                 "FROM edges e JOIN nodes n ON e.dst_id = n.id "
                 "WHERE e.src_id = ? AND e.kind = 'inherits'");
             sqlite3_bind_int64(base_stmt, 1, container_id);
@@ -4604,6 +4710,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
             while (sqlite3_step(base_stmt) == SQLITE_ROW) {
                 auto* b = doc.new_obj();
                 yyjson_mut_obj_add_int(doc.doc, b, "node_id", sqlite3_column_int64(base_stmt, 0));
+                add_stable_key_if_present(doc, b, sqlite_text_or_null(base_stmt, 4));
                 yyjson_mut_obj_add_strcpy(doc.doc, b, "kind",
                     reinterpret_cast<const char*>(sqlite3_column_text(base_stmt, 1)));
                 yyjson_mut_obj_add_strcpy(doc.doc, b, "name",
@@ -4654,9 +4761,9 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
 
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
 
-    auto run_match_query = [&](bool prefix) -> std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>> {
+    auto run_match_query = [&](bool prefix) -> std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, std::string, int>> {
         std::string sql =
-            "SELECT n.id, n.name, n.qualname, n.kind, f.path, n.start_line "
+            "SELECT n.id, n.name, n.qualname, n.kind, f.path, n.stable_key, n.start_line "
             "FROM nodes n "
             "LEFT JOIN files f ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' AND ";
@@ -4665,7 +4772,7 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
         sql += " ORDER BY length(n.name), length(COALESCE(n.qualname, n.name)), f.path, n.start_line LIMIT 25";
 
         sqlite3_stmt* stmt = nullptr;
-        std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>> rows;
+        std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, std::string, int>> rows;
         if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
             return rows;
         }
@@ -4682,20 +4789,22 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
             auto* qual_txt = sqlite3_column_text(stmt, 2);
             auto* kind_txt = sqlite3_column_text(stmt, 3);
             auto* file_txt = sqlite3_column_text(stmt, 4);
+            auto* sk_txt = sqlite3_column_text(stmt, 5);
             rows.emplace_back(
                 sqlite3_column_int64(stmt, 0),
                 name_txt ? reinterpret_cast<const char*>(name_txt) : "",
                 qual_txt ? reinterpret_cast<const char*>(qual_txt) : "",
                 kind_txt ? reinterpret_cast<const char*>(kind_txt) : "",
                 file_txt ? reinterpret_cast<const char*>(file_txt) : "",
-                sqlite3_column_int(stmt, 5));
+                sk_txt ? reinterpret_cast<const char*>(sk_txt) : "",
+                sqlite3_column_int(stmt, 6));
         }
         sqlite3_finalize(stmt);
         return rows;
     };
 
     auto exact_matches = run_match_query(false);
-    auto prefix_matches = exact_matches.empty() ? run_match_query(true) : std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, int>>();
+    auto prefix_matches = exact_matches.empty() ? run_match_query(true) : std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, std::string, int>>();
     const auto& matches = exact_matches.empty() ? prefix_matches : exact_matches;
 
     if (matches.size() == 1) {
@@ -4717,13 +4826,15 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
     for (const auto& match : matches) {
         auto* item = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, item, "node_id", std::get<0>(match));
+        if (!std::get<5>(match).empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", std::get<5>(match).c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, item, "name", std::get<1>(match).c_str());
         if (!std::get<2>(match).empty())
             yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", std::get<2>(match).c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", std::get<3>(match).c_str());
         if (!std::get<4>(match).empty())
             yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", std::get<4>(match).c_str());
-        yyjson_mut_obj_add_int(doc.doc, item, "start_line", std::get<5>(match));
+        yyjson_mut_obj_add_int(doc.doc, item, "start_line", std::get<6>(match));
         yyjson_mut_arr_append(candidates, item);
     }
 
@@ -4758,7 +4869,7 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
     // 1. Main functions
     {
         std::string sql =
-            "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line "
+            "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key "
             "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' AND n.kind = 'function' "
             "AND (n.name = 'main' OR n.name = 'Main' OR n.name = 'wmain') ";
@@ -4778,6 +4889,7 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             auto* item = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+            add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 6));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
@@ -4798,7 +4910,7 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
         std::string sql;
         std::string cache_key;
         if (!scope_glob.empty()) {
-            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, top.cnt "
+            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
                   "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
                   "JOIN nodes n ON n.id = top.dst_id "
                   "LEFT JOIN files f ON n.file_id = f.id "
@@ -4806,7 +4918,7 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
                   "ORDER BY top.cnt DESC";
             cache_key = "entrypoints_indegree_scoped";
         } else {
-            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, top.cnt "
+            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
                   "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
                   "JOIN nodes n ON n.id = top.dst_id "
                   "LEFT JOIN files f ON n.file_id = f.id "
@@ -4824,6 +4936,7 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             auto* item = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+            add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 6));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
@@ -4846,7 +4959,9 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
 // T085: impact_of — transitive dependents via BFS
 std::string impact_of(yyjson_val* params, Connection& conn,
                               QueryCache& cache, const std::string& repo_root) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t depth = params ? json_get_int(params, "depth", 2) : 2;
@@ -4868,9 +4983,11 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     auto* sym = doc.new_obj();
     {
         auto* stmt = cache.get("impact_symbol",
-            "SELECT name, f.path FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
+            "SELECT name, f.path, n.stable_key FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
         sqlite3_bind_int64(stmt, 1, node_id);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
+            yyjson_mut_obj_add_int(doc.doc, sym, "node_id", node_id);
+            add_stable_key_if_present(doc, sym, sqlite_text_or_null(stmt, 2));
             yyjson_mut_obj_add_strcpy(doc.doc, sym, "name",
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
             auto* fp = sqlite3_column_text(stmt, 1);
@@ -4890,7 +5007,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
         for (int64_t nid : frontier) {
             // Find nodes that depend on nid (reverse edges: dst_id = nid)
             auto* stmt = cache.get("impact_reverse",
-                "SELECT e.src_id, n.name, f.path, e.kind, e.confidence "
+                "SELECT e.src_id, n.name, f.path, e.kind, e.confidence, n.stable_key "
                 "FROM edges e JOIN nodes n ON e.src_id = n.id "
                 "LEFT JOIN files f ON n.file_id = f.id "
                 "WHERE e.dst_id = ? AND e.kind != 'contains'");
@@ -4909,6 +5026,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
 
                 auto* item = doc.new_obj();
                 yyjson_mut_obj_add_int(doc.doc, item, "node_id", src_id);
+                add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 5));
                 yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
                     reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
                 auto* fp = sqlite3_column_text(stmt, 2);
@@ -5028,13 +5146,14 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         std::string kind;
         std::string qualname;
         std::string file;
+        std::string stable_key;
     };
     std::vector<ChangedSymbolRow> changed_symbols;
     std::vector<int64_t> changed_symbol_ids;
     changed_symbol_ids.reserve(indexed_files.size() * 4);
     if (!indexed_files.empty()) {
         std::string sql =
-            "SELECT n.id, n.name, n.kind, n.qualname, f.path "
+            "SELECT n.id, n.name, n.kind, n.qualname, f.path, n.stable_key "
             "FROM nodes n JOIN files f ON n.file_id = f.id "
             "WHERE n.file_id IN (";
         for (size_t i = 0; i < indexed_files.size(); ++i) {
@@ -5058,6 +5177,8 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
                 row.qualname = reinterpret_cast<const char*>(qual);
             if (const auto* fp = sqlite3_column_text(stmt, 4))
                 row.file = reinterpret_cast<const char*>(fp);
+            if (const auto* sk = sqlite3_column_text(stmt, 5))
+                row.stable_key = reinterpret_cast<const char*>(sk);
             changed_symbol_ids.push_back(row.id);
             changed_symbols.push_back(std::move(row));
         }
@@ -5069,6 +5190,7 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         std::string kind;
         std::string qualname;
         std::string file;
+        std::string stable_key;
         int distance = 0;
         double confidence = 0.0;
     };
@@ -5084,7 +5206,7 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
          current_depth <= depth && !frontier.empty() && impacted_rows.size() < kMaxImpacted;
          ++current_depth) {
         std::string sql =
-            "SELECT e.src_id, n.name, n.kind, n.qualname, f.path, e.confidence "
+            "SELECT e.src_id, n.name, n.kind, n.qualname, f.path, e.confidence, n.stable_key "
             "FROM edges e "
             "JOIN nodes n ON e.src_id = n.id "
             "LEFT JOIN files f ON n.file_id = f.id "
@@ -5106,6 +5228,7 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             std::string kind;
             std::string qualname;
             std::string file;
+            std::string stable_key;
             double confidence = 0.0;
         };
         std::unordered_map<int64_t, PendingImpact> pending;
@@ -5125,6 +5248,8 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
                 row.qualname = reinterpret_cast<const char*>(qual);
             if (const auto* fp = sqlite3_column_text(stmt, 4))
                 row.file = reinterpret_cast<const char*>(fp);
+            if (const auto* sk = sqlite3_column_text(stmt, 6))
+                row.stable_key = reinterpret_cast<const char*>(sk);
             row.confidence = confidence;
             pending[src_id] = std::move(row);
         }
@@ -5154,6 +5279,7 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             row.kind = std::move(entry.second.kind);
             row.qualname = std::move(entry.second.qualname);
             row.file = std::move(entry.second.file);
+            row.stable_key = std::move(entry.second.stable_key);
             row.distance = current_depth;
             row.confidence = entry.second.confidence;
             impacted_rows.push_back(std::move(row));
@@ -5190,6 +5316,8 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", symbol.kind.c_str());
         if (!symbol.file.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", symbol.file.c_str());
         yyjson_mut_obj_add_int(doc.doc, item, "node_id", symbol.id);
+        if (!symbol.stable_key.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", symbol.stable_key.c_str());
         yyjson_mut_arr_append(changed_symbols_arr, item);
     }
     yyjson_mut_obj_add_val(doc.doc, root, "changed_symbols", changed_symbols_arr);
@@ -5200,6 +5328,8 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", impacted.kind.c_str());
         if (!impacted.file.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file", impacted.file.c_str());
         yyjson_mut_obj_add_int(doc.doc, item, "node_id", impacted.id);
+        if (!impacted.stable_key.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", impacted.stable_key.c_str());
         yyjson_mut_obj_add_int(doc.doc, item, "distance", impacted.distance);
         yyjson_mut_obj_add_real(doc.doc, item, "confidence", impacted.confidence);
         yyjson_mut_arr_append(impacted_arr, item);
@@ -5321,12 +5451,13 @@ std::string subgraph(yyjson_val* params, Connection& /*conn*/,
     // Add seed nodes
     for (int64_t nid : frontier) {
         auto* stmt = cache.get("subgraph_node",
-            "SELECT n.id, n.kind, n.name, f.path "
+            "SELECT n.id, n.kind, n.name, f.path, n.stable_key "
             "FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
         sqlite3_bind_int64(stmt, 1, nid);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             auto* item = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+            add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 4));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
@@ -5369,12 +5500,13 @@ std::string subgraph(yyjson_val* params, Connection& /*conn*/,
 
                     // Add node
                     auto* ns = cache.get("subgraph_node",
-                        "SELECT n.id, n.kind, n.name, f.path "
+                        "SELECT n.id, n.kind, n.name, f.path, n.stable_key "
                         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
                     sqlite3_bind_int64(ns, 1, dst);
                     if (sqlite3_step(ns) == SQLITE_ROW) {
                         auto* ni = doc.new_obj();
                         yyjson_mut_obj_add_int(doc.doc, ni, "node_id", sqlite3_column_int64(ns, 0));
+                        add_stable_key_if_present(doc, ni, sqlite_text_or_null(ns, 4));
                         yyjson_mut_obj_add_strcpy(doc.doc, ni, "kind",
                             reinterpret_cast<const char*>(sqlite3_column_text(ns, 1)));
                         yyjson_mut_obj_add_strcpy(doc.doc, ni, "name",
@@ -5448,11 +5580,12 @@ std::string shortest_path(yyjson_val* params, Connection& /*conn*/,
             auto& node = queue[path_indices[i]];
 
             auto* stmt = cache.get("sp_node",
-                "SELECT n.kind, n.name FROM nodes n WHERE n.id = ?");
+                "SELECT n.kind, n.name, n.stable_key FROM nodes n WHERE n.id = ?");
             sqlite3_bind_int64(stmt, 1, node.id);
             if (sqlite3_step(stmt) == SQLITE_ROW) {
                 auto* ni = doc.new_obj();
                 yyjson_mut_obj_add_int(doc.doc, ni, "node_id", node.id);
+                add_stable_key_if_present(doc, ni, sqlite_text_or_null(stmt, 2));
                 yyjson_mut_obj_add_strcpy(doc.doc, ni, "kind",
                     reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
                 yyjson_mut_obj_add_strcpy(doc.doc, ni, "name",
@@ -5605,7 +5738,7 @@ std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
     std::unordered_set<int64_t> seen;
     for (int64_t base_id : base_ids) {
         auto* stmt = cache.get("find_impl_inherits",
-            "SELECT n.id, n.name, n.qualname, n.kind, n.signature, f.path "
+            "SELECT n.id, n.name, n.qualname, n.kind, n.signature, f.path, n.stable_key "
             "FROM edges e JOIN nodes n ON e.src_id = n.id "
             "LEFT JOIN files f ON n.file_id = f.id "
             "WHERE e.dst_id = ? AND e.kind = 'inherits' "
@@ -5619,6 +5752,7 @@ std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
 
             auto* item = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, item, "node_id", nid);
+            add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 6));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
             auto* qn = sqlite3_column_text(stmt, 2);
@@ -5643,7 +5777,9 @@ std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
 // T089b: find_similar — near-duplicate functions via MinHash fingerprints
 std::string find_similar(yyjson_val* params, Connection& conn,
                          QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     double threshold = params ? json_get_double(params, "threshold", 0.8) : 0.8;
@@ -5653,7 +5789,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
     static constexpr int64_t kMaxScannedFingerprints = 50000;
 
     auto* target_stmt = cache.get("find_similar_target",
-        "SELECT n.id, n.name, n.kind, f.path, n.fingerprint "
+        "SELECT n.id, n.name, n.kind, f.path, n.fingerprint, n.stable_key "
         "FROM nodes n "
         "LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.id = ? AND n.node_type = 'symbol'");
@@ -5667,6 +5803,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
     const char* target_kind = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 2));
     const char* target_file = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 3));
     const char* target_fp = reinterpret_cast<const char*>(sqlite3_column_text(target_stmt, 4));
+    const char* target_stable_key = sqlite_text_or_null(target_stmt, 5);
 
     std::vector<uint32_t> target_values;
     if (!decode_minhash_fingerprint(target_fp, target_values)) {
@@ -5674,7 +5811,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
     }
 
     auto* stmt = cache.get("find_similar_scan",
-        "SELECT n.id, n.name, f.path, n.fingerprint "
+        "SELECT n.id, n.name, f.path, n.fingerprint, n.stable_key "
         "FROM nodes n "
         "LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.node_type = 'symbol' AND n.kind = ? "
@@ -5688,6 +5825,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
         int64_t node_id = -1;
         std::string name;
         std::string file;
+        std::string stable_key;
         double similarity = 0.0;
     };
 
@@ -5709,6 +5847,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
             sqlite3_column_int64(stmt, 0),
             reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)),
             reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)),
+            sqlite_text_or_null(stmt, 4) ? sqlite_text_or_null(stmt, 4) : "",
             similarity
         });
     }
@@ -5726,6 +5865,7 @@ std::string find_similar(yyjson_val* params, Connection& conn,
 
     auto* target = doc.new_obj();
     yyjson_mut_obj_add_int(doc.doc, target, "node_id", node_id);
+    add_stable_key_if_present(doc, target, target_stable_key);
     yyjson_mut_obj_add_strcpy(doc.doc, target, "name", target_name ? target_name : "");
     if (target_file) yyjson_mut_obj_add_strcpy(doc.doc, target, "file", target_file);
     yyjson_mut_obj_add_val(doc.doc, root, "target", target);
@@ -5734,6 +5874,8 @@ std::string find_similar(yyjson_val* params, Connection& conn,
     for (const auto& row : matches) {
         auto* item = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, item, "node_id", row.node_id);
+        if (!row.stable_key.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", row.stable_key.c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, item, "name", row.name.c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, item, "file", row.file.c_str());
         yyjson_mut_obj_add_real(doc.doc, item, "similarity", row.similarity);
@@ -5749,7 +5891,9 @@ std::string find_similar(yyjson_val* params, Connection& conn,
 // T090: method_fields — field accesses and calls made by a method
 std::string method_fields(yyjson_val* params, Connection& conn,
                                   QueryCache& cache, const std::string& /*repo_root*/) {
-    int64_t node_id = resolve_node_id(params, conn, cache);
+    std::string resolve_error;
+    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     JsonMutDoc doc;
@@ -5760,9 +5904,10 @@ std::string method_fields(yyjson_val* params, Connection& conn,
     // Method name
     {
         auto* name_stmt = cache.get("method_fields_name",
-            "SELECT name FROM nodes WHERE id = ?");
+            "SELECT name, stable_key FROM nodes WHERE id = ?");
         sqlite3_bind_int64(name_stmt, 1, node_id);
         if (sqlite3_step(name_stmt) == SQLITE_ROW) {
+            add_stable_key_if_present(doc, root, sqlite_text_or_null(name_stmt, 1));
             yyjson_mut_obj_add_strcpy(doc.doc, root, "method_name",
                 reinterpret_cast<const char*>(sqlite3_column_text(name_stmt, 0)));
         }
@@ -5900,15 +6045,16 @@ std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
     struct MethodInfo {
         int64_t id;
         std::string name;
+        std::string stable_key;
         int lines;
     };
     std::vector<MethodInfo> methods;
     {
         std::string sql = class_id >= 0
-            ? "SELECT n.id, n.name, n.end_line - n.start_line + 1 FROM nodes n "
+            ? "SELECT n.id, n.name, n.stable_key, n.end_line - n.start_line + 1 FROM nodes n "
               "JOIN edges e ON e.dst_id = n.id WHERE e.src_id = ? AND e.kind = 'contains' "
               "AND n.kind = 'method' ORDER BY n.start_line"
-            : "SELECT n.id, n.name, n.end_line - n.start_line + 1 FROM nodes n "
+            : "SELECT n.id, n.name, n.stable_key, n.end_line - n.start_line + 1 FROM nodes n "
               "WHERE n.file_id = ? AND n.kind = 'method' ORDER BY n.start_line";
         auto* stmt = cache.get("dc_methods", sql.c_str());
         sqlite3_bind_int64(stmt, 1, class_id >= 0 ? class_id : file_id);
@@ -5916,7 +6062,8 @@ std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
             methods.push_back({
                 sqlite3_column_int64(stmt, 0),
                 std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1))),
-                sqlite3_column_int(stmt, 2)
+                sqlite_text_or_null(stmt, 2) ? sqlite_text_or_null(stmt, 2) : "",
+                sqlite3_column_int(stmt, 3)
             });
         }
     }
@@ -6095,6 +6242,8 @@ std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
         for (size_t mi : c.members) {
             auto* mobj = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, mobj, "node_id", methods[mi].id);
+            if (!methods[mi].stable_key.empty())
+                yyjson_mut_obj_add_strcpy(doc.doc, mobj, "stable_key", methods[mi].stable_key.c_str());
             yyjson_mut_obj_add_strcpy(doc.doc, mobj, "name", methods[mi].name.c_str());
             yyjson_mut_obj_add_int(doc.doc, mobj, "lines", methods[mi].lines);
             auto sit = scores.find(methods[mi].id);

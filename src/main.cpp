@@ -39,6 +39,8 @@ int main(int argc, char** argv) {
     bool index_safe_mode = false;
     bool index_resume = false;
     bool index_force = false;
+    std::vector<std::string> index_only_files;
+    std::vector<std::string> index_changed_file_lists;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
@@ -54,6 +56,8 @@ int main(int argc, char** argv) {
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
     sub_index->add_option("--exclude", index_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
+    sub_index->add_option("--only-files", index_only_files, "Targeted reindex path (repeatable; repo-relative or absolute)");
+    sub_index->add_option("--changed-file", index_changed_file_lists, "File containing newline-separated targeted paths (repeatable)");
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
     sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
@@ -199,6 +203,7 @@ int main(int argc, char** argv) {
     int ws_arena_size = 128;
     int ws_max_file_size = 10240;
     int ws_parse_timeout = 5;
+    int ws_add_lock_timeout = 30;
     bool ws_turbo = false;
     bool ws_with_content_fts = false;
 
@@ -210,6 +215,8 @@ int main(int argc, char** argv) {
     ws_add->add_option("--arena-size", ws_arena_size, "Arena size in MB per thread")->default_val(128);
     ws_add->add_option("--max-file-size", ws_max_file_size, "Max file size in KB")->default_val(10240);
     ws_add->add_option("--parse-timeout", ws_parse_timeout, "Per-file parse timeout in seconds")->default_val(5);
+    ws_add->add_option("--lock-timeout", ws_add_lock_timeout,
+        "Seconds to wait for the index lock (0=fail fast)")->default_val(30);
     ws_add->add_flag("--turbo", ws_turbo, "Aggressive perf mode");
     ws_add->add_flag("--with-content-fts", ws_with_content_fts,
         "Opt in to line-level content FTS for this added root (default: off)");
@@ -218,10 +225,13 @@ int main(int argc, char** argv) {
     std::string ws_remove_target;
     std::string ws_remove_root_pos = ".";
     std::string ws_remove_root_flag = ".";
+    int ws_remove_lock_timeout = 30;
     ws_remove->add_option("target", ws_remove_target, "Path to remove from workspace")->required();
     auto* ws_remove_root_pos_opt = ws_remove->add_option("workspace-root", ws_remove_root_pos,
         "Main project root (positional, default: current dir)")->default_val(".");
     ws_remove->add_option("--root", ws_remove_root_flag, "Main project root directory (flag)")->default_val(".");
+    ws_remove->add_option("--lock-timeout", ws_remove_lock_timeout,
+        "Seconds to wait for the index lock (0=fail fast)")->default_val(30);
 
     auto* ws_list = sub_workspace->add_subcommand("list", "List workspace roots");
     std::string ws_list_root_pos = ".";
@@ -251,6 +261,8 @@ int main(int argc, char** argv) {
         cfg.turbo = index_turbo;
         cfg.force_reindex = index_force;
         cfg.exclude_patterns = index_exclude;
+        cfg.only_files = index_only_files;
+        cfg.changed_file_lists = index_changed_file_lists;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
         cfg.resume = index_resume;
@@ -368,11 +380,11 @@ int main(int argc, char** argv) {
                 cfg.parse_timeout_s = ws_parse_timeout;
                 cfg.turbo = ws_turbo;
                 cfg.workspace_content_fts = ws_with_content_fts;
-                return codetopo::run_workspace_add(ws_root, ws_add_target, cfg);
+                return codetopo::run_workspace_add(ws_root, ws_add_target, cfg, ws_add_lock_timeout);
             }
             if (ws_remove->parsed()) {
                 std::string ws_root = (ws_remove_root_pos_opt->count() > 0) ? ws_remove_root_pos : ws_remove_root_flag;
-                return codetopo::run_workspace_remove(ws_root, ws_remove_target);
+                return codetopo::run_workspace_remove(ws_root, ws_remove_target, ws_remove_lock_timeout);
             }
             if (ws_list->parsed()) {
                 std::string ws_root = (ws_list_root_pos_opt->count() > 0) ? ws_list_root_pos : ws_list_root_flag;

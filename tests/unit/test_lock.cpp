@@ -1,14 +1,23 @@
 // T024: Unit test for lock file
 #include <catch2/catch_test_macros.hpp>
 #include "util/lock.h"
+#include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <string>
 
 namespace fs = std::filesystem;
 using namespace codetopo;
 
-TEST_CASE("Lock acquire on new file succeeds", "[lock]") {
-    auto tmp = fs::temp_directory_path() / "codetopo_test_lock";
-    fs::create_directories(tmp);
+static fs::path lock_test_dir(const std::string& name) {
+    auto dir = fs::current_path() / (".codetopo_lock_test_" + name);
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    return dir;
+}
+
+TEST_CASE("Lock acquire on new file succeeds", "[unit][lock]") {
+    auto tmp = lock_test_dir("new_file");
     auto lock_path = tmp / "test.lock";
 
     {
@@ -20,9 +29,8 @@ TEST_CASE("Lock acquire on new file succeeds", "[lock]") {
     fs::remove_all(tmp);
 }
 
-TEST_CASE("Lock detects live process holding lock", "[lock]") {
-    auto tmp = fs::temp_directory_path() / "codetopo_test_lock2";
-    fs::create_directories(tmp);
+TEST_CASE("Lock detects live process holding lock", "[unit][lock]") {
+    auto tmp = lock_test_dir("live_holder");
     auto lock_path = tmp / "test.lock";
 
     {
@@ -37,9 +45,8 @@ TEST_CASE("Lock detects live process holding lock", "[lock]") {
     fs::remove_all(tmp);
 }
 
-TEST_CASE("Lock breaks stale lock from dead PID", "[lock]") {
-    auto tmp = fs::temp_directory_path() / "codetopo_test_lock3";
-    fs::create_directories(tmp);
+TEST_CASE("Lock breaks stale lock from dead PID", "[unit][lock]") {
+    auto tmp = lock_test_dir("stale_holder");
     auto lock_path = tmp / "test.lock";
 
     {
@@ -50,6 +57,58 @@ TEST_CASE("Lock breaks stale lock from dead PID", "[lock]") {
     FileLock lock(lock_path);
     REQUIRE(lock.acquire());
     REQUIRE(lock.was_stale_broken());
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("Blocking acquire breaks stale lock immediately", "[unit][lock]") {
+    auto tmp = lock_test_dir("blocking_stale");
+    auto lock_path = tmp / "test.lock";
+
+    {
+        std::ofstream f(lock_path);
+        f << "99999999";
+    }
+
+    FileLock lock(lock_path);
+    auto start = std::chrono::steady_clock::now();
+    REQUIRE(lock.acquire_blocking(std::chrono::seconds(5),
+                                  std::chrono::milliseconds(100),
+                                  std::chrono::milliseconds(200)));
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    REQUIRE(lock.was_stale_broken());
+    REQUIRE(elapsed < std::chrono::seconds(1));
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("Blocking acquire waits for live holder then times out", "[unit][lock]") {
+    auto tmp = lock_test_dir("blocking_live_timeout");
+    auto lock_path = tmp / "test.lock";
+
+    {
+        FileLock lock1(lock_path);
+        REQUIRE(lock1.acquire());
+
+        FileLock lock2(lock_path);
+        int wait_messages = 0;
+        auto start = std::chrono::steady_clock::now();
+        REQUIRE_FALSE(lock2.acquire_blocking(
+            std::chrono::milliseconds(350),
+            std::chrono::milliseconds(100),
+            std::chrono::milliseconds(200),
+            [&wait_messages](int64_t pid, std::chrono::milliseconds timeout) {
+                REQUIRE(pid > 0);
+                REQUIRE(timeout == std::chrono::milliseconds(350));
+                ++wait_messages;
+            }));
+        auto elapsed = std::chrono::steady_clock::now() - start;
+
+        REQUIRE(wait_messages == 1);
+        REQUIRE(lock2.holder_pid() > 0);
+        REQUIRE(elapsed >= std::chrono::milliseconds(300));
+        REQUIRE(elapsed < std::chrono::seconds(2));
+    }
 
     fs::remove_all(tmp);
 }

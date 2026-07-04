@@ -124,6 +124,14 @@ int run_index_supervisor(const Config& config,
             args.push_back("--exclude");
             args.push_back(pat);
         }
+        for (const auto& path : config.only_files) {
+            args.push_back("--only-files");
+            args.push_back(path);
+        }
+        for (const auto& list : config.changed_file_lists) {
+            args.push_back("--changed-file");
+            args.push_back(list);
+        }
         args.push_back("--supervised");
         if (config.safe_mode) args.push_back("--safe-mode");
         if (attempt > 0) {

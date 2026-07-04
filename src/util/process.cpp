@@ -168,7 +168,12 @@ int spawn_and_wait_with_stall_timeout(
             return 1;
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        // Poll frequently so we notice a fast child promptly. The stall check
+        // below is time-based (compares elapsed against stall_limit), so a short
+        // poll interval does not affect stall semantics — it only removes the
+        // fixed multi-second latency a coarse poll added to every (even no-op)
+        // supervised reindex. Critical for lean delta reindex on large repos.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         // Reset stall clock ONLY when the progress file's mtime changes —
         // i.e., when the child actually commits a new batch.

@@ -205,12 +205,30 @@ static TestDb make_approx_db(const std::string& name, bool exact_set_edge = fals
     return db;
 }
 
-static std::string invoke_callers_raw(const TestDb& db, const std::string& params) {
+static bool has_callers_response_override(const std::string& params) {
+    return params.find("\"response_mode\"") != std::string::npos ||
+           params.find("\"lean\"") != std::string::npos ||
+           params.find("\"verbose\"") != std::string::npos;
+}
+
+static std::string add_full_response_mode_for_legacy_assertions(std::string params) {
+    if (has_callers_response_override(params)) return params;
+    auto pos = params.rfind('}');
+    REQUIRE(pos != std::string::npos);
+    params.insert(pos, ",\"response_mode\":\"full\"");
+    return params;
+}
+
+static std::string invoke_callers_raw_default_mode(const TestDb& db, const std::string& params) {
     Connection conn(db.db_path, true);
     QueryCache cache(conn);
     auto params_doc = json_parse(params);
     REQUIRE(params_doc);
     return tools::callers_approx(params_doc.root(), conn, cache, db.root.string());
+}
+
+static std::string invoke_callers_raw(const TestDb& db, std::string params) {
+    return invoke_callers_raw_default_mode(db, add_full_response_mode_for_legacy_assertions(std::move(params)));
 }
 
 static std::string invoke_callers(const TestDb& db, int64_t node_id,
@@ -696,6 +714,77 @@ TEST_CASE("callers_approx lean mode returns summary buckets and top candidates",
     REQUIRE(yyjson_obj_get(buckets, "file") != nullptr);
 }
 
+TEST_CASE("callers_approx defaults candidate dumps to lean and full can opt out",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-lean-default", false, 40);
+
+    auto default_result = invoke_callers_raw_default_mode(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"top_n\":3,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\"}");
+    auto full_result = invoke_callers_raw_default_mode(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":100,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"include_handles\":true,\"response_mode\":\"full\"}");
+
+    INFO("default bytes: " << default_result.size() << " full bytes: " << full_result.size());
+    CHECK(default_result.size() < full_result.size());
+
+    auto default_doc = json_parse(default_result);
+    REQUIRE(default_doc);
+    auto* default_root = default_doc.root();
+    REQUIRE(json_get_str(default_root, "response_mode") != nullptr);
+    CHECK(std::string(json_get_str(default_root, "response_mode")) == "lean");
+    CHECK(json_get_int(default_root, "candidate_max_bytes", -1) == 4096);
+    auto* default_candidates = require_array_field(default_root, "candidate_results");
+    CHECK(yyjson_arr_size(default_candidates) <= 3);
+    REQUIRE(yyjson_obj_get(default_root, "candidate_buckets") != nullptr);
+    auto* default_first = yyjson_arr_get_first(default_candidates);
+    REQUIRE(default_first != nullptr);
+    CHECK(has_field(default_first, "file"));
+    CHECK(has_field(default_first, "line"));
+    CHECK_FALSE(has_field(default_first, "span"));
+
+    auto full_doc = json_parse(full_result);
+    REQUIRE(full_doc);
+    auto* full_root = full_doc.root();
+    CHECK(json_get_str(full_root, "response_mode") == nullptr);
+    auto* full_candidates = require_array_field(full_root, "candidate_results");
+    auto* full_item = find_item_with_string(full_candidates, "callee_text", "LinkedMap.set");
+    REQUIRE(full_item != nullptr);
+    CHECK(has_field(full_item, "span"));
+    CHECK(has_field(full_item, "evidence"));
+}
+
+TEST_CASE("callers_approx and impact_of always fall back to candidates without exact edges",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-fallback-always-on");
+    require_no_exact_set_edges(db);
+
+    auto callers_result = invoke_callers_raw_default_mode(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":false,\"mode\":\"exact\"}");
+    auto callers_doc = json_parse(callers_result);
+    REQUIRE(callers_doc);
+    REQUIRE(json_get_str(callers_doc.root(), "response_mode") != nullptr);
+    CHECK(std::string(json_get_str(callers_doc.root(), "response_mode")) == "lean");
+    CHECK(yyjson_arr_size(require_array_field(callers_doc.root(), "results")) == 0);
+    auto* caller_candidates = require_array_field(callers_doc.root(), "candidate_results");
+    CHECK(yyjson_arr_size(caller_candidates) > 0);
+
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    auto impact_params = json_parse(
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"depth\":1,\"max_nodes\":20,\"include_candidates\":false,\"mode\":\"exact\"}");
+    REQUIRE(impact_params);
+    auto impact_result = tools::impact_of(impact_params.root(), conn, cache, db.root.string());
+    auto impact_doc = json_parse(impact_result);
+    REQUIRE(impact_doc);
+    CHECK(yyjson_arr_size(require_array_field(impact_doc.root(), "impacted")) == 0);
+    auto* impacted_candidates = require_array_field(impact_doc.root(), "candidate_impacted");
+    CHECK(yyjson_arr_size(impacted_candidates) > 0);
+}
+
 TEST_CASE("callers_approx resolves receiver type through include edges conservatively",
           "[unit][approx-callgraph]") {
     auto db = make_approx_db("candidate-cross-file-receiver-type");
@@ -748,4 +837,44 @@ TEST_CASE("callers_approx does not boost ambiguous global receiver type hints",
     CHECK(json_get_bool(typed_receiver, "receiver_type_ambiguous", false));
     REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
     CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("cross_file_receiver_type") == std::string::npos);
+}
+
+TEST_CASE("callers and impact report unresolved receiver-type attribution",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-unresolved-receiver-type");
+
+    auto callers_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"receiver\":\"LRUCache\"}");
+    auto callers_doc = json_parse(callers_result);
+    REQUIRE(callers_doc);
+    auto* callers_root = callers_doc.root();
+    CHECK(json_get_int(callers_root, "candidate_total", -1) > 0);
+    CHECK(json_get_int(callers_root, "candidate_eligible", -1) == 0);
+    CHECK(json_get_int(callers_root, "receiver_type_hits", -1) == 0);
+    REQUIRE(json_get_str(callers_root, "resolution_status") != nullptr);
+    CHECK(std::string(json_get_str(callers_root, "resolution_status")) == "unresolved");
+
+    auto impact_result = invoke_impact_of(db, db.ids.linked_set);
+    auto impact_doc = json_parse(impact_result);
+    REQUIRE(impact_doc);
+    CHECK(json_get_int(impact_doc.root(), "candidate_impacted_receiver_type_hits", -1) == 0);
+
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    auto params_doc = json_parse(
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"depth\":1,\"max_nodes\":20,\"include_candidates\":true,"
+        "\"mode\":\"exact_plus_candidates\",\"receiver\":\"LRUCache\"}");
+    REQUIRE(params_doc);
+    auto filtered_impact_result = tools::impact_of(params_doc.root(), conn, cache, db.root.string());
+    auto filtered_impact_doc = json_parse(filtered_impact_result);
+    REQUIRE(filtered_impact_doc);
+    auto* impact_root = filtered_impact_doc.root();
+    CHECK(json_get_int(impact_root, "candidate_impacted_total", -1) > 0);
+    CHECK(json_get_int(impact_root, "candidate_impacted_eligible", -1) == 0);
+    CHECK(json_get_int(impact_root, "candidate_impacted_receiver_type_hits", -1) == 0);
+    REQUIRE(json_get_str(impact_root, "candidate_impacted_resolution_status") != nullptr);
+    CHECK(std::string(json_get_str(impact_root, "candidate_impacted_resolution_status")) == "unresolved");
 }

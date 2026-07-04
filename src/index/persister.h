@@ -7,6 +7,7 @@
 #include "util/git.h"
 #include "util/log.h"
 #include "db/schema.h"
+#include "db/fts.h"
 #include <sqlite3.h>
 #include <algorithm>
 #include <cctype>
@@ -84,18 +85,28 @@ public:
     int prune_deleted(const std::vector<std::string>& deleted_paths) {
         if (deleted_paths.empty()) return 0;
 
+        sqlite3_stmt* find_stmt = nullptr;
+        sqlite3_prepare_v2(conn_.raw(),
+            "SELECT id FROM files WHERE path = ? AND root_id IS NULL", -1, &find_stmt, nullptr);
         sqlite3_stmt* stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
             "DELETE FROM files WHERE path = ? AND root_id IS NULL", -1, &stmt, nullptr);
 
         int count = 0;
         for (const auto& path : deleted_paths) {
+            sqlite3_reset(find_stmt);
+            sqlite3_bind_text(find_stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(find_stmt) == SQLITE_ROW) {
+                content_fts::delete_file(conn_, sqlite3_column_int64(find_stmt, 0));
+            }
+
             sqlite3_reset(stmt);
             sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(stmt) == SQLITE_DONE) {
                 ++count;
             }
         }
+        sqlite3_finalize(find_stmt);
         sqlite3_finalize(stmt);
         return count;
     }
@@ -221,6 +232,16 @@ public:
             // Delete existing file record (cascades to nodes → edges, refs)
             // R4: Skip on cold index — DELETE is a guaranteed no-op on empty tables
             if (!cold_index_) {
+                sqlite3_stmt* find_file_stmt = nullptr;
+                sqlite3_prepare_v2(conn_.raw(),
+                    "SELECT id FROM files WHERE path = ? AND root_id IS NULL",
+                    -1, &find_file_stmt, nullptr);
+                sqlite3_bind_text(find_file_stmt, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
+                while (sqlite3_step(find_file_stmt) == SQLITE_ROW) {
+                    content_fts::delete_file(conn_, sqlite3_column_int64(find_file_stmt, 0));
+                }
+                sqlite3_finalize(find_file_stmt);
+
                 auto file_key = make_file_stable_key(file.relative_path);
                 sqlite3_reset(stmt_delete_file_node_);
                 sqlite3_bind_text(stmt_delete_file_node_, 1, file_key.c_str(), -1, SQLITE_TRANSIENT);

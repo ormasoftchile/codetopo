@@ -292,6 +292,7 @@ static bool attached_table_has_column(sqlite3* db, const char* schema,
 WorkspaceDB::WorkspaceDB(const std::string& main_db_path)
     : conn_(main_db_path) {
     schema::register_custom_functions(conn_.raw());
+    conn_.exec("PRAGMA busy_timeout=30000");
     ensure_schema();
 }
 
@@ -333,6 +334,7 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
         sqlite3* src_db = nullptr;
         if (sqlite3_open_v2(root_index.c_str(), &src_db,
                             SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK) {
+            sqlite3_busy_timeout(src_db, 30000);
             sqlite3_exec(src_db, "PRAGMA wal_checkpoint(TRUNCATE)", nullptr, nullptr, nullptr);
             sqlite3_close(src_db);
         }

@@ -9,22 +9,32 @@
 #include "util/log.h"
 #include "util/lock.h"
 #include "util/process.h"
+#include "util/git.h"
 #include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <thread>
 #include <chrono>
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <unordered_set>
 
 namespace codetopo {
 
 // R8: Manages a spawned child indexer — deduplicates rapid triggers, monitors completion.
 struct ReindexState {
-    std::atomic<bool> running{false};
-    std::atomic<bool> queued{false};
+    std::mutex mutex;
+    bool running = false;
+    bool queued = false;
+    bool queued_full = false;
+    std::unordered_set<std::string> queued_paths;
     std::thread monitor_thread;
+    std::atomic<uint64_t> list_counter{0};
 
     ~ReindexState() {
         // Detached threads manage their own lifetime; if still joinable, detach.
@@ -32,21 +42,84 @@ struct ReindexState {
     }
 
     void trigger(const std::string& root, const std::string& db,
-                 std::function<void()> on_complete) {
-        if (running.exchange(true)) {
-            queued = true;  // collapse into next run
-            mcp_log("reindex: already running, queued");
-            return;
+                 std::function<void()> on_complete,
+                 const std::vector<std::string>& paths = {},
+                 bool full_reindex = false) {
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            queued = true;
+            queued_full = queued_full || full_reindex || paths.empty();
+            if (queued_full) {
+                queued_paths.clear();
+            } else {
+                queued_paths.insert(paths.begin(), paths.end());
+            }
+            if (running) {
+                mcp_log("reindex: already running, queued");
+                return;
+            }
+            running = true;
         }
+
         if (monitor_thread.joinable()) monitor_thread.detach();
         monitor_thread = std::thread([=, this]() {
-            do {
-                queued = false;
+            namespace fs = std::filesystem;
+            while (true) {
+                bool run_full = false;
+                std::unordered_set<std::string> run_paths;
+                {
+                    std::lock_guard<std::mutex> lk(mutex);
+                    if (!queued) {
+                        running = false;
+                        break;
+                    }
+                    run_full = queued_full;
+                    run_paths = queued_paths;
+                    queued = false;
+                    queued_full = false;
+                    queued_paths.clear();
+                }
+
+                if (!run_full && run_paths.empty()) run_full = true;
+
+                std::optional<fs::path> changed_file;
+                std::vector<std::string> args = {"index", "--root", root, "--db", db, "--supervised"};
+                if (!run_full) {
+                    std::error_code ec;
+                    auto dir = fs::path(root) / ".codetopo";
+                    fs::create_directories(dir, ec);
+                    if (!ec) {
+                        auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        auto seq = list_counter.fetch_add(1, std::memory_order_relaxed);
+                        auto path = dir / ("changed-files-" + std::to_string(now) + "-"
+                                           + std::to_string(seq) + ".lst");
+                        std::ofstream out(path, std::ios::trunc);
+                        if (out) {
+                            for (const auto& p : run_paths) out << p << '\n';
+                            out.close();
+                            if (out) changed_file = path;
+                        }
+                    }
+                    if (changed_file) {
+                        args.push_back("--changed-file");
+                        args.push_back(changed_file->string());
+                    } else {
+                        run_full = true;
+                        mcp_log("reindex: could not write changed-file list; falling back to full");
+                    }
+                }
+
                 auto started = std::chrono::steady_clock::now();
-                mcp_log("reindex: started");
+                mcp_log(run_full ? "reindex: started (full)"
+                                  : "reindex: started (targeted, "
+                                      + std::to_string(run_paths.size()) + " paths)");
                 auto exe = get_self_executable_path();
-                int rc = spawn_and_wait(exe,
-                    {"index", "--root", root, "--db", db, "--supervised"});
+                int rc = spawn_and_wait(exe, args);
+                if (changed_file) {
+                    std::error_code ec;
+                    fs::remove(*changed_file, ec);
+                }
                 auto elapsed = std::chrono::steady_clock::now() - started;
                 if (rc == 0) {
                     mcp_log("reindex: done (" + format_duration_seconds(elapsed) + ")");
@@ -55,12 +128,74 @@ struct ReindexState {
                     mcp_log("reindex: failed (" + format_duration_seconds(elapsed)
                             + ", exit=" + std::to_string(rc) + ")");
                 }
-            } while (queued.load());
-            running = false;
+            }
         });
         monitor_thread.detach();
     }
 };
+
+inline std::vector<std::string> split_git_paths(const std::string& output) {
+    std::vector<std::string> paths;
+    std::istringstream in(output);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) paths.push_back(line);
+    }
+    return paths;
+}
+
+inline void append_unique_paths(std::vector<std::string>& paths,
+                                std::unordered_set<std::string>& seen,
+                                const std::vector<std::string>& add) {
+    for (const auto& path : add) {
+        if (seen.insert(path).second) paths.push_back(path);
+    }
+}
+
+inline std::optional<std::string> repo_relative_watch_path(const std::filesystem::path& root,
+                                                           const std::filesystem::path& path) {
+    namespace fs = std::filesystem;
+    fs::path rel;
+    if (path.is_absolute()) {
+        auto norm_root = root.lexically_normal();
+        auto norm_path = path.lexically_normal();
+        auto root_s = norm_root.generic_string();
+        auto path_s = norm_path.generic_string();
+        if (path_s != root_s &&
+            (path_s.size() <= root_s.size() || path_s.compare(0, root_s.size(), root_s) != 0 ||
+             path_s[root_s.size()] != '/')) {
+            return std::nullopt;
+        }
+        rel = norm_path.lexically_relative(norm_root);
+    } else {
+        rel = path.lexically_normal();
+    }
+    auto rel_s = rel.generic_string();
+    while (rel_s.rfind("./", 0) == 0) rel_s.erase(0, 2);
+    if (rel_s.empty() || rel_s == "." || rel_s == ".." || rel_s.rfind("../", 0) == 0)
+        return std::nullopt;
+    return rel_s;
+}
+
+inline std::vector<std::string> git_changed_paths_for_heads(const std::string& repo_root,
+                                                            const std::string& old_head,
+                                                            const std::string& new_head,
+                                                            bool* empty_head_diff = nullptr) {
+    std::vector<std::string> paths;
+    std::unordered_set<std::string> seen;
+    if (!old_head.empty() && !new_head.empty() && old_head != new_head) {
+        auto head_paths = split_git_paths(
+            git_command(repo_root, "diff --name-only " + old_head + " " + new_head));
+        if (head_paths.empty() && empty_head_diff) *empty_head_diff = true;
+        append_unique_paths(paths, seen, head_paths);
+    }
+    append_unique_paths(paths, seen,
+        split_git_paths(git_command(repo_root, "diff --name-only")));
+    append_unique_paths(paths, seen,
+        split_git_paths(git_command(repo_root, "diff --name-only --cached")));
+    return paths;
+}
 
 // T075: Wire cmd_mcp — start MCP server over stdio.
 // R8+R9: Updated to accept freshness policy and debounce, with startup reconciliation.
@@ -150,6 +285,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     }
 
     auto repo_root = schema::get_kv(conn, "repo_root", ".");
+    std::string last_known_head = get_git_head(repo_root);
+    if (last_known_head.empty()) {
+        last_known_head = schema::get_kv(conn, "git_head", "");
+    }
 
     // R8: Startup reconciliation — spawn codetopo index to catch up on missed changes.
     // Behavior depends on freshness policy (R9):
@@ -216,36 +355,36 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","properties":{"path":{"type":"string","description":"Root path to traverse (default: '.')"},"depth":{"type":"integer","description":"Max depth (default: 2, 0=unlimited)"},"max_files":{"type":"integer","description":"Cap visible file entries by truncating deepest directories first (default: 500)"}}})J");
 
     server.register_tool("symbol_search", tools::symbol_search,
-        "Search for symbols (functions, classes, macros, variables) by name. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns kind, name, file_path, span, and an internal node_id handle for chaining into other tools (context_for, callers_approx, impact_of). Never mention node_id values to the user — refer to symbols by name and file location instead.",
-        R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for. Use '*' to list all (combine with kind filter)"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, etc."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict results to specific file paths, e.g. '/Volumes/Projects/kibana/**' or 'src/mcp/*'"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["query"]})J");
+        "Search for symbols (functions, classes, macros, variables) by name. Multi-term queries default to match=any (OR) and rank symbols matching more terms higher; set match=all for AND. Use query='*' with kind filter to list all symbols of a kind without FTS. Returns kind, name, file_path, span, node_id, and stable_key. Prefer stable_key for chaining because it is reindex-proof; node_id is a volatile rowid. Never mention node_id values to the user — refer to symbols by name and file location instead.",
+        R"J({"type":"object","properties":{"query":{"type":"string","description":"Symbol name or prefix to search for. Use '*' to list all (combine with kind filter)"},"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, etc."},"file_pattern":{"type":"string","description":"Optional GLOB pattern to restrict results to specific file paths, e.g. '/Volumes/Projects/kibana/**' or 'src/mcp/*'"},"match":{"type":"string","enum":["any","all"],"description":"How to combine whitespace-separated query terms. Default any uses OR and ranks more term matches higher; all uses AND."},"limit":{"type":"integer","description":"Max results (default 50, max 500)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":["query"]})J");
 
     server.register_tool("symbol_list", tools::symbol_list,
-        "List and filter symbols without full-text search. Default output is listing-safe (kind, name, signature when present, file, start_line) and omits internal handles/spans. Responses include total_candidates, filtered_hidden, and hidden_public_count so kind/min_span filters are never silent; min_span_lines is lossy and public/API-like symbols bypass span pruning.",
+        "List and filter symbols without full-text search. Default output is listing-safe (kind, name, signature when present, file, start_line) and omits internal handles/spans. Responses always include total_candidates, filtered_hidden, and hidden_public_count so kind/min_span filters are never silent; min_span_lines is lossy, public/API-like symbols bypass span pruning, and explicit kind=method keeps interface/abstract methods visible.",
         R"J({"type":"object","properties":{"kind":{"type":"string","description":"Filter by symbol kind: function, class, struct, variable, field, macro, etc."},"file_path":{"type":"string","description":"Filter to symbols in this file (relative path)"},"name_glob":{"type":"string","description":"SQLite GLOB pattern for symbol name (e.g. 'Get*', '*Handler')"},"compact":{"type":"boolean","description":"Legacy handle output shape when include_handles=true (collapses span to array)"},"include_handles":{"type":"boolean","description":"Opt in to internal node_id handles and spans for graph follow-up (default false)"},"fields":{"type":"array","items":{"type":"string"},"description":"Fields to include: node_id, name, qualname, kind, signature, start_line, end_line, span, file_path, file. Overrides default listing."},"min_span_lines":{"type":"integer","description":"Lossy minimum symbol span in lines; public/API-like symbols bypass this pruning and response metadata reports hidden counts"},"max_bytes":{"type":"integer","description":"Soft response budget before pagination (default 16000, 0 disables, max 100000)"},"limit":{"type":"integer","description":"Max results (default 200, max 2000)"},"offset":{"type":"integer","description":"Pagination offset (default 0)"}},"required":[]})J");
 
     server.register_tool("symbols_in_path", tools::symbols_in_path,
-        "List symbols found under a directory path. Default output is listing-safe (kind, name, signature when present, file, start_line) and omits internal handles/spans. Responses include total_candidates, filtered_hidden, and hidden_public_count; min_span_lines is lossy and public/API-like symbols bypass span pruning.",
+        "List symbols found under a directory path. Default output is listing-safe (kind, name, signature when present, file, start_line) and omits internal handles/spans. Responses always include total_candidates, filtered_hidden, and hidden_public_count; min_span_lines is lossy, public/API-like symbols bypass span pruning, and explicit kind=method keeps interface/abstract methods visible.",
         R"J({"type":"object","properties":{"path":{"type":"string","description":"Directory path to search under"},"kind":{"type":"array","items":{"type":"string"},"description":"Symbol kinds to include (empty = all)"},"recursive":{"type":"boolean","default":true},"compact":{"type":"boolean","description":"Legacy handle output shape when include_handles=true (collapses span to array)"},"include_handles":{"type":"boolean","description":"Opt in to internal node_id handles and spans for graph follow-up (default false)"},"fields":{"type":"array","items":{"type":"string"},"description":"Fields to include: node_id, name, qualname, kind, signature, start_line, end_line, span, file_path, file. Overrides default listing."},"min_span_lines":{"type":"integer","description":"Lossy minimum symbol span in lines; public/API-like symbols bypass this pruning and response metadata reports hidden counts","default":0},"max_bytes":{"type":"integer","description":"Soft response budget before pagination (default 16000, 0 disables, max 100000)"},"limit":{"type":"integer","default":200},"offset":{"type":"integer","default":0}}})J");
 
     server.register_tool("symbol_get", tools::symbol_get,
-        "Get detailed information about a specific symbol by its internal node_id handle, including source code snippet. Do not mention node_id to the user.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id from symbol_search results"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
+        "Get detailed information about a specific symbol by stable_key (preferred, reindex-proof) or node_id (volatile rowid), including source code snippet. Do not mention node_id to the user.",
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle returned by symbol_search/context_for. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id from symbol_search results; changes on reindex"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id: if the current row's stable_key differs, returns invalid_input instead of using a stale/reused id."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
 
     server.register_tool("symbol_get_batch", tools::symbol_get_batch,
         "Get details for multiple symbols at once by their internal node_id handles. Do not mention node_ids to the user.",
         R"J({"type":"object","properties":{"node_ids":{"type":"array","items":{"type":"integer"},"description":"Array of node_ids to fetch"}},"required":["node_ids"])J");
 
     server.register_tool("callers_approx", tools::callers_approx,
-        "Find exact callers from call graph edges. If exact callers are empty, also returns lean refs-backed candidate_results for overloaded/common member calls such as .set; use response_mode='lean' for grep-weight summaries. Use min_confidence to filter noise on generic method names (e.g. find, get) — try 0.5 or higher to get only attributed callers.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callers for"},"min_confidence":{"type":"number","description":"Minimum confidence threshold (0.0–1.0). Use 0.5+ to filter noise on generic method names. Default: 0.0 (no filter)."},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group exact results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output for exact results: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."},"response_mode":{"type":"string","enum":["lean","verbose"],"description":"Use 'lean' for summary counts, buckets, and top-N callers only. Omit or 'verbose' preserves the legacy full response."},"lean":{"type":"boolean","description":"Shortcut for response_mode='lean'."},"top_n":{"type":"integer","description":"Lean-mode top caller/candidate rows (default 10, max 100)."},"buckets":{"type":"boolean","description":"Lean-mode candidate buckets by arity, heuristic, and file (default true)."},"include_candidates":{"type":"boolean","description":"When true, always add refs-backed candidate_results; when false, return exact edges only. Omitted means add candidates only if exact results are empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode. Default exact_then_candidates keeps exact edges in results/groups and puts approximate refs matches in candidate_results only when exact edges are empty."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidates (e.g. LinkedMap); response includes candidate_total and candidate_filtered_hidden."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_results (default 16000, lean default 4096, 0 disables, max 100000)."},"limit":{"type":"integer","description":"Max exact results and candidate results (default 50, max 500)"}},"required":["node_id"]})J");
+        "Find exact callers from call graph edges. Defaults to response_mode='lean' for summary counts, buckets, and top-N exact/candidate rows; use response_mode='full' (or 'verbose'/verbose=true) for the legacy full dump. If exact symbol callers are empty, refs-backed candidate_results are always returned for overloaded/common member calls such as .set, even when exact-only knobs are present. Receiver-type resolution depends on local type annotations in the indexed codebase; metadata includes resolution_status, candidate_total, candidate_eligible, and receiver_type_hits so unresolved attribution is distinct from no callers. Use min_confidence to filter noise on generic method names (e.g. find, get) — try 0.5 or higher to get only attributed callers.",
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol to find callers for"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"min_confidence":{"type":"number","description":"Minimum confidence threshold (0.0–1.0). Use 0.5+ to filter noise on generic method names. Default: 0.0 (no filter)."},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group exact results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output for exact results in full mode: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."},"response_mode":{"type":"string","enum":["lean","full","verbose"],"description":"Default lean returns summary counts, buckets, and top-N callers/candidates. Use 'full' or 'verbose' for the legacy full response."},"lean":{"type":"boolean","description":"Shortcut for response_mode='lean'; lean=false opts into full when response_mode is omitted."},"verbose":{"type":"boolean","description":"Shortcut opt-out to the legacy full response when response_mode is omitted."},"top_n":{"type":"integer","description":"Lean-mode top caller/candidate rows (default 10, max 100)."},"buckets":{"type":"boolean","description":"Lean-mode candidate buckets by arity, heuristic, and file (default true)."},"include_candidates":{"type":"boolean","description":"When true, always add refs-backed candidate_results; when false, exact-empty fallback still returns candidate_results. Omitted means add candidates when exact symbol callers are empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode. Default exact_then_candidates keeps exact edges in results/groups and puts approximate refs matches in candidate_results when exact symbol callers are empty; exact-empty fallback is always on."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidates (e.g. LinkedMap). Receiver-type resolution depends on local type annotations; response includes resolution_status, candidate_total, candidate_eligible, receiver_type_hits, and hidden counts."},"include_handles":{"type":"boolean","description":"Full-mode opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_results (default 16000, lean default 4096, 0 disables, max 100000)."},"limit":{"type":"integer","description":"Max exact results and candidate results (default 50, max 500)"}}})J");
 
     server.register_tool("callees_approx", tools::callees_approx,
         "Find all functions/symbols that the given symbol calls or references. Optionally group results by file, module, or symbol.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find callees for"},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."}},"required":["node_id"]})J");
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol to find callees for"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"group_by":{"type":"string","enum":["file","module","symbol"],"description":"Group results by file path, module (directory), or symbol name. Omit for flat list."},"compact":{"type":"boolean","description":"Compact output: use generic symbol fields, omit qualname=name, collapse span to [start,end], and use 'file' instead of 'file_path'."}}})J");
 
     server.register_tool("references", tools::references,
         "Find all references to a symbol across the codebase.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to find references for"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol to find references for"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}})J");
 
     server.register_tool("file_summary", tools::file_summary,
         "List all symbols defined in a file: functions, classes, structs, macros, variables.",
@@ -256,8 +395,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"File path (relative or absolute)"}}})J");
 
     server.register_tool("context_for", tools::context_for,
-        "Get the full structural context of a symbol: definition, source, exact callers/callees, container, siblings, and bases. Candidate callers are lean by default; receiver narrows approximate member-call sites and metadata reports hidden candidates.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol"},"stable_key":{"type":"string","description":"Reindex-proof handle (returned as symbol.stable_key). Prefer this over node_id when re-referencing a symbol across turns/sessions, since node_id is a rowid that changes on reindex."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"include_source":{"type":"boolean","description":"When false, omit the source field entirely. Defaults to true."},"max_source_lines":{"type":"integer","description":"Truncate source to at most N lines; 0 keeps the current full source behavior."},"max_callers":{"type":"integer","description":"Cap exact callers and candidate_callers returned after query collection; 0 disables the exact caller cap and caps candidates at 500. If omitted, preserves the current default behavior."},"max_callees":{"type":"integer","description":"Cap callees returned after query collection; 0 disables the cap. If omitted, preserves the current default behavior."},"include_candidates":{"type":"boolean","description":"When true, always add candidate_callers; when false, return exact callers only. Omitted means add candidates only if exact callers are empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_callers. Default exact_then_candidates."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_callers (e.g. LinkedMap); response includes candidate_callers_total and candidate_callers_filtered_hidden."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_callers (default 16000, 0 disables, max 100000)."}}})J");
+        "Get the full structural context of a symbol: definition, source, exact callers/callees, container, siblings, and bases. Candidate callers are lean by default; receiver narrows approximate member-call sites. Receiver-type resolution depends on local type annotations and metadata reports resolution_status plus hidden candidates.",
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof handle (returned as symbol.stable_key). When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol; changes on reindex"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id: if the current row's stable_key differs, returns invalid_input instead of using a stale/reused id."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"include_source":{"type":"boolean","description":"When false, omit the source field entirely. Defaults to true."},"max_source_lines":{"type":"integer","description":"Truncate source to at most N lines; 0 keeps the current full source behavior."},"max_callers":{"type":"integer","description":"Cap exact callers and candidate_callers returned after query collection; 0 disables the exact caller cap and caps candidates at 500. If omitted, preserves the current default behavior."},"max_callees":{"type":"integer","description":"Cap callees returned after query collection; 0 disables the cap. If omitted, preserves the current default behavior."},"include_candidates":{"type":"boolean","description":"When true, always add candidate_callers; when false, return exact callers only. Omitted means add candidates only if exact callers are empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_callers. Default exact_then_candidates."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_callers (e.g. LinkedMap). Receiver-type resolution depends on local type annotations; response includes candidate_callers_resolution_status, totals, receiver_type_hits, and hidden counts."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_callers (default 16000, 0 disables, max 100000)."}}})J");
 
     server.register_tool("context_by_name", tools::context_by_name,
         "Find a symbol by name and, when uniquely resolved, return the same full structural context as context_for. If multiple matches exist, returns a disambiguation list instead.",
@@ -268,8 +407,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","properties":{"scope":{"type":"string","description":"Optional file path or directory prefix to restrict results (e.g. 'src/mcp/' or 'src/cli/main.cpp')"},"limit":{"type":"integer","description":"Max results (default 20)"}},"required":[]})J");
 
     server.register_tool("impact_of", tools::impact_of,
-        "Compute the blast radius of changing a symbol from exact graph edges. Candidate impact is first-hop only, lean by default, and can be narrowed by receiver with metadata for hidden candidates.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the symbol to analyze"},"depth":{"type":"integer","description":"How many levels of transitive callers to follow (default 2, max 3)"},"max_nodes":{"type":"integer","description":"Max exact impacted nodes and candidate_impacted rows (default 50, max 200)"},"include_candidates":{"type":"boolean","description":"When true, always add candidate_impacted; when false, return exact impact only. Omitted means add candidates only if exact impact is empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_impacted. Default exact_then_candidates."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_impacted (e.g. LinkedMap); response includes candidate_impacted_total and candidate_impacted_filtered_hidden."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_impacted (default 16000, 0 disables, max 100000)."}},"required":["node_id"])J");
+        "Compute the blast radius of changing a symbol from exact graph edges. If first-hop exact callers are empty, candidate_impacted fallback is always on (not version/flag gated) for overloaded/common member calls. Candidate impact is first-hop only, lean by default, and can be narrowed by receiver. Receiver-type resolution depends on local type annotations and metadata reports resolution_status plus hidden candidates.",
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol to analyze"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"depth":{"type":"integer","description":"How many levels of transitive callers to follow (default 2, max 3)"},"max_nodes":{"type":"integer","description":"Max exact impacted nodes and candidate_impacted rows (default 50, max 200)"},"include_candidates":{"type":"boolean","description":"When true, always add candidate_impacted; when false, exact-empty fallback still returns candidate_impacted. Omitted means add candidates if exact impact is empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_impacted. Default exact_then_candidates; exact-empty fallback is always on."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_impacted (e.g. LinkedMap). Receiver-type resolution depends on local type annotations; response includes candidate_impacted_resolution_status, totals, receiver_type_hits, and hidden counts."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_impacted (default 16000, 0 disables, max 100000)."}}})J");
 
     server.register_tool("detect_changes", tools::detect_changes,
         "Given a git ref, list changed files and symbols, then walk reverse call edges to estimate blast radius for PR review.",
@@ -293,11 +432,11 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
     server.register_tool("find_similar", tools::find_similar,
         "Find near-duplicate functions or methods using MinHash fingerprints of normalized AST leaf trigrams.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the function or method to compare"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"threshold":{"type":"number","description":"Minimum MinHash similarity to return (default 0.8)"},"limit":{"type":"integer","description":"Max results (default 20, max 200)"}}})J");
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the function or method to compare"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"},"threshold":{"type":"number","description":"Minimum MinHash similarity to return (default 0.8)"},"limit":{"type":"integer","description":"Max results (default 20, max 200)"}}})J");
 
     server.register_tool("method_fields", tools::method_fields,
         "List all 'this.X' field accesses (reads and writes) and outgoing calls made by a method, classified as calls_self (same class) or calls_external. Useful for understanding a TypeScript/JavaScript method's state usage.",
-        R"J({"type":"object","properties":{"node_id":{"type":"integer","description":"The node_id of the method symbol to analyze"},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}}})J");
+        R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the method symbol to analyze"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"symbol":{"type":"string","description":"Symbol name (alternative to node_id)"},"file":{"type":"string","description":"File path relative to repo root (used with symbol)"}}})J");
 
     server.register_tool("dependency_cluster", tools::dependency_cluster,
         "Group methods in a file by shared field access patterns, weighted by read/write direction. Returns clusters with extractability scores (1.0=pure read, easily extractable; 0.0=heavily writes state, tightly coupled). Use to plan refactoring decomposition.",
@@ -382,24 +521,59 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             [&](const std::vector<WatchEvent>& events) {
                 // Filter: ignore .codetopo/ writes (our own DB) and .git/ internals
                 // (except .git/HEAD which signals branch switch)
-                bool has_relevant = false;
+                std::vector<std::string> changed_paths;
+                std::unordered_set<std::string> seen_paths;
+                bool branch_switch = false;
+                bool fallback_full = false;
+                auto root_path = fs::path(repo_root).lexically_normal();
+
                 for (const auto& ev : events) {
                     auto s = ev.path.generic_string();
                     if (s.find(".codetopo/") != std::string::npos) continue;
                     if (s.find(".codetopo\\") != std::string::npos) continue;
-                    if (ev.type == FileEvent::BranchSwitch) { has_relevant = true; break; }
+                    if (ev.type == FileEvent::BranchSwitch) {
+                        if (s.find(".git/HEAD") != std::string::npos ||
+                            s.find(".git\\HEAD") != std::string::npos) {
+                            branch_switch = true;
+                        }
+                        continue;
+                    }
                     // Skip .git/ internals (pack files, index, refs updates, etc.)
                     if (s.find(".git/") != std::string::npos || s.find(".git\\") != std::string::npos) continue;
-                    has_relevant = true;
-                    break;
+                    auto rel = repo_relative_watch_path(root_path, ev.path);
+                    if (rel && seen_paths.insert(*rel).second) {
+                        changed_paths.push_back(*rel);
+                    }
                 }
-                if (!has_relevant) return;
 
-                mcp_log("watcher: change detected, triggering reindex");
+                if (branch_switch) {
+                    auto new_head = get_git_head(repo_root);
+                    if (last_known_head.empty() || new_head.empty()) {
+                        fallback_full = true;
+                    } else {
+                        bool empty_head_diff = false;
+                        append_unique_paths(changed_paths, seen_paths,
+                            git_changed_paths_for_heads(repo_root, last_known_head, new_head,
+                                                        &empty_head_diff));
+                        if (new_head != last_known_head && empty_head_diff) {
+                            fallback_full = true;
+                        } else if (new_head != last_known_head && changed_paths.empty()) {
+                            changed_paths.push_back(".git/HEAD");
+                        }
+                    }
+                    if (!new_head.empty()) last_known_head = new_head;
+                }
+
+                if (!fallback_full && changed_paths.empty()) return;
+
+                mcp_log(fallback_full
+                    ? "watcher: change detected, triggering full reindex"
+                    : "watcher: change detected, triggering targeted reindex ("
+                        + std::to_string(changed_paths.size()) + " paths)");
                 reindex.trigger(repo_root, db_path, [&]() {
                     server.request_refresh();
                     mcp_log("watcher: reindex complete, cache invalidated");
-                });
+                }, changed_paths, fallback_full);
             },
             debounce
         );

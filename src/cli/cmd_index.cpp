@@ -161,8 +161,19 @@ int run_index(const Config& config) {
     lock_path += ".lock";
     FileLock lock(lock_path);
     if (!config.supervised) {
-        if (!lock.acquire()) {
-            std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid() << ")\n";
+        constexpr int kLockTimeoutSeconds = 30;
+        if (!lock.acquire_blocking(
+                std::chrono::seconds(kLockTimeoutSeconds),
+                std::chrono::milliseconds(250),
+                std::chrono::seconds(2),
+                [](int64_t pid, std::chrono::milliseconds timeout) {
+                    std::cerr << "Waiting for index lock held by PID " << pid
+                              << " (up to "
+                              << std::chrono::duration_cast<std::chrono::seconds>(timeout).count()
+                              << "s)...\n";
+                })) {
+            std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid()
+                      << ") (waited " << kLockTimeoutSeconds << "s)\n";
             return 1;
         }
         if (lock.was_stale_broken()) {
@@ -201,6 +212,7 @@ int run_index(const Config& config) {
     std::vector<ScannedFile> work_list;
     bool force_cleared_index = false;
     bool force_dropped_fts_triggers = false;
+    bool targeted_mode = !config.only_files.empty() || !config.changed_file_lists.empty();
 
     bool resumed = false;
     if (config.resume && fs::exists(worklist_path)) {
@@ -233,14 +245,35 @@ int run_index(const Config& config) {
     }
 
     if (!resumed) {
+        std::vector<std::string> target_paths = config.only_files;
+        for (const auto& list_path : config.changed_file_lists) {
+            std::ifstream lf(list_path);
+            std::string line;
+            while (std::getline(lf, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) target_paths.push_back(line);
+            }
+        }
+
         // Normal path: full scan + change detection
-        std::cerr << "Scanning " << repo_root.string() << "...\n";
         Scanner scanner(config);
-        auto scanned_files = scanner.scan();
-        std::cerr << "Found " << scanned_files.size() << " source files\n";
+        std::vector<ScannedFile> scanned_files;
+        std::vector<std::string> targeted_deleted_paths;
+        if (targeted_mode) {
+            scanned_files = scanner.scan_paths(target_paths, targeted_deleted_paths);
+            std::cerr << "Targeted scan: " << scanned_files.size()
+                      << " source files, " << targeted_deleted_paths.size()
+                      << " deleted paths\n";
+        } else {
+            std::cerr << "Scanning " << repo_root.string() << "...\n";
+            scanned_files = scanner.scan();
+            std::cerr << "Found " << scanned_files.size() << " source files\n";
+        }
 
         ChangeDetector detector(conn, config.force_reindex);
-        auto changes = detector.detect(scanned_files);
+        auto changes = targeted_mode
+            ? detector.detect_targeted(scanned_files, targeted_deleted_paths)
+            : detector.detect(scanned_files);
 
         std::cerr << "New: " << changes.new_files.size()
                   << " Changed: " << changes.changed_files.size()
@@ -262,6 +295,9 @@ int run_index(const Config& config) {
 
         // Prune deleted files (T041)
         if (!config.force_reindex && !changes.deleted_paths.empty()) {
+            // Deletes must update symbol FTS immediately. In delete-only targeted
+            // runs there may be no later persist phase to create these triggers.
+            fts::create_sync_triggers(conn);
             int pruned = persister.prune_deleted(changes.deleted_paths);
             std::cerr << "Pruned " << pruned << " deleted files\n";
         }
@@ -283,7 +319,7 @@ int run_index(const Config& config) {
         // main-project rows once up front so the persist phase behaves like a
         // cold index.  On --resume this is intentionally skipped because the
         // first attempt already cleared the DB before writing progress.
-        if (config.force_reindex) {
+        if (config.force_reindex && !targeted_mode) {
             std::cerr << "Force reindex: clearing existing index rows...\n";
             if (!config.safe_mode) {
                 fts::drop_sync_triggers(conn);
