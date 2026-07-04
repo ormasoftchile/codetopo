@@ -913,7 +913,10 @@ TEST_CASE("callers_approx: without group_by returns flat list (backward compat)"
         QueryCache cache(conn);
         auto repo_root = schema::get_kv(const_cast<Connection&>(conn), "repo_root");
 
-        auto params_str = "{\"node_id\": " + std::to_string(ids.bark) + "}";
+        // Full mode: asserts the verbose `caller_name` field (lean mode, the
+        // default, emits a compact `caller` field instead).
+        auto params_str = "{\"node_id\": " + std::to_string(ids.bark) +
+                          ", \"response_mode\": \"full\"}";
         auto params_doc = json_parse(params_str);
 
         auto result = tools::callers_approx(params_doc.root(),
@@ -942,8 +945,10 @@ TEST_CASE("callers_approx: group_by=file groups results by file path",
         QueryCache cache(conn);
         auto repo_root = schema::get_kv(const_cast<Connection&>(conn), "repo_root");
 
+        // group_by is a full-mode feature; lean mode (the default) ignores it
+        // and returns a summary shape without a `groups` object.
         auto params_str = "{\"node_id\": " + std::to_string(ids.bark) +
-                          ", \"group_by\": \"file\"}";
+                          ", \"group_by\": \"file\", \"response_mode\": \"full\"}";
         auto params_doc = json_parse(params_str);
 
         auto result = tools::callers_approx(params_doc.root(),
@@ -979,8 +984,10 @@ TEST_CASE("callers_approx: group_by=symbol groups results by caller symbol",
         QueryCache cache(conn);
         auto repo_root = schema::get_kv(const_cast<Connection&>(conn), "repo_root");
 
+        // group_by is a full-mode feature; lean mode (the default) ignores it
+        // and returns a summary shape without a `groups` object.
         auto params_str = "{\"node_id\": " + std::to_string(ids.bark) +
-                          ", \"group_by\": \"symbol\"}";
+                          ", \"group_by\": \"symbol\", \"response_mode\": \"full\"}";
         auto params_doc = json_parse(params_str);
 
         auto result = tools::callers_approx(params_doc.root(),
