@@ -2,6 +2,7 @@
 
 #include "db/workspace.h"
 #include "core/config.h"
+#include "util/lock.h"
 #include "util/log.h"
 #include "util/repo.h"
 #include <string>
@@ -31,6 +32,22 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
         return 1;
     }
 
+    // Acquire the same lock the indexer and MCP server use, so a running
+    // `codetopo mcp --watch` (or index) can't write concurrently and corrupt
+    // the DB / balloon the WAL during the merge.
+    auto lock_path = db_path + ".lock";
+    FileLock lock(lock_path);
+    if (!lock.acquire()) {
+        std::cerr << stderr_bold_red(
+            "ERROR: Another codetopo process holds this index (PID " +
+            std::to_string(lock.holder_pid()) + "). Stop the running "
+            "MCP/watch/index process, then retry.", stderr_is_tty()) << "\n";
+        return 1;
+    }
+    if (lock.was_stale_broken()) {
+        std::cerr << "WARN: Broke stale lock from dead process\n";
+    }
+
     try {
         WorkspaceDB ws(db_path);
         auto result = ws.add_root(target_path, cfg);
@@ -56,6 +73,19 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
     if (!fs::exists(db_path)) {
         std::cerr << stderr_bold_red("ERROR: No index.sqlite found at " + db_path, stderr_is_tty()) << "\n";
         return 1;
+    }
+
+    auto lock_path = db_path + ".lock";
+    FileLock lock(lock_path);
+    if (!lock.acquire()) {
+        std::cerr << stderr_bold_red(
+            "ERROR: Another codetopo process holds this index (PID " +
+            std::to_string(lock.holder_pid()) + "). Stop the running "
+            "MCP/watch/index process, then retry.", stderr_is_tty()) << "\n";
+        return 1;
+    }
+    if (lock.was_stale_broken()) {
+        std::cerr << "WARN: Broke stale lock from dead process\n";
     }
 
     try {
