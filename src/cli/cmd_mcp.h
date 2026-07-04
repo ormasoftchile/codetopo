@@ -352,6 +352,22 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     mcp_log("repo: " + repo_root);
     mcp_log("schema: v" + std::to_string(version) + "  tools: " + std::to_string(server.tool_count()));
 
+    // A --watch server is a long-lived writer (it spawns supervised reindex
+    // children). Hold the index lock for the server's lifetime so one-shot
+    // writers (`codetopo index`, `codetopo workspace add/remove`) refuse to run
+    // concurrently — concurrent writes here corrupt the DB and balloon the WAL.
+    // Supervised reindex children skip lock acquisition (see cmd_index.cpp).
+    std::unique_ptr<FileLock> watch_lock;
+    if (watch && freshness != FreshnessPolicy::off) {
+        watch_lock = std::make_unique<FileLock>(db_path + ".lock");
+        if (!watch_lock->acquire()) {
+            mcp_log("watcher: disabled — another codetopo process holds the index (PID "
+                    + std::to_string(watch_lock->holder_pid()) + "); serving read-only");
+            watch_lock.reset();
+            watch = false;
+        }
+    }
+
     // P2: Start filesystem watcher for auto-reindex when --watch is enabled.
     // Cross-thread contract: watcher thread -> reindex monitor thread -> atomic flag
     //   -> main thread picks up flag before next tool dispatch.
