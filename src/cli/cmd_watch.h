@@ -15,8 +15,21 @@
 #include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
+#include <csignal>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 namespace codetopo {
+
+// Set by SIGINT/SIGTERM to stop the watch loop. Using a signal (not stdin)
+// means `codetopo watch` keeps running when backgrounded or launched with a
+// closed/redirected stdin — a bare `std::getline(std::cin, …)` returns EOF
+// immediately in those cases and the process would exit at once.
+namespace {
+volatile std::sig_atomic_t g_watch_stop = 0;
+void watch_signal_handler(int) { g_watch_stop = 1; }
+}
 
 // T096: cmd_watch — starts watcher and triggers incremental indexing.
 inline int run_watch(const std::string& root_str, const std::string& db_path_str) {
@@ -95,12 +108,15 @@ inline int run_watch(const std::string& root_str, const std::string& db_path_str
     Watcher watcher(repo_root, reindex);
     watcher.start();
 
-    // Block until ctrl+C
+    // Block until interrupted (Ctrl+C) or terminated. Signal-based rather than
+    // stdin-based so the watcher survives being backgrounded / stdin-less.
+    std::signal(SIGINT, watch_signal_handler);
+    std::signal(SIGTERM, watch_signal_handler);
     std::cerr << "Press Ctrl+C to stop watching.\n";
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        // Wait for stdin EOF or user interrupt
+    while (g_watch_stop == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    std::cerr << "Stopping watcher...\n";
 
     return 0;
 }
