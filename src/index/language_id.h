@@ -18,7 +18,9 @@ enum class LanguageId {
     Rust,
     Java,
     Bash,
-    Sql
+    Sql,
+    PowerShell,
+    Batch
 };
 
 // Map file extension string to LanguageId. Extension should include the dot.
@@ -31,6 +33,7 @@ inline LanguageId lang_id_from_extension(const std::string& ext) {
             if (ext == ".c") return LanguageId::C;
             if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") return LanguageId::Cpp;
             if (ext == ".cs") return LanguageId::CSharp;
+            if (ext == ".cmd") return LanguageId::Batch;
             break;
         case 'h':
             if (ext == ".h") return LanguageId::C;
@@ -45,6 +48,7 @@ inline LanguageId lang_id_from_extension(const std::string& ext) {
             break;
         case 'p':
             if (ext == ".py" || ext == ".pyi") return LanguageId::Python;
+            if (ext == ".ps1" || ext == ".psm1" || ext == ".psd1") return LanguageId::PowerShell;
             break;
         case 'g':
             if (ext == ".go") return LanguageId::Go;
@@ -58,6 +62,7 @@ inline LanguageId lang_id_from_extension(const std::string& ext) {
             break;
         case 'b':
             if (ext == ".bash") return LanguageId::Bash;
+            if (ext == ".bat") return LanguageId::Batch;
             break;
         case 'y':
             if (ext == ".yaml" || ext == ".yml") return LanguageId::Yaml;
@@ -84,6 +89,8 @@ inline const char* lang_id_to_string(LanguageId id) {
         case LanguageId::Java:       return "java";
         case LanguageId::Bash:       return "bash";
         case LanguageId::Sql:        return "sql";
+        case LanguageId::PowerShell: return "powershell";
+        case LanguageId::Batch:      return "batch";
         default:                     return "";
     }
 }
@@ -112,12 +119,14 @@ inline LanguageId lang_id_from_string(const std::string& lang) {
             break;
         case 'p':
             if (lang == "python") return LanguageId::Python;
+            if (lang == "powershell") return LanguageId::PowerShell;
             break;
         case 'r':
             if (lang == "rust") return LanguageId::Rust;
             break;
         case 'b':
             if (lang == "bash") return LanguageId::Bash;
+            if (lang == "batch") return LanguageId::Batch;
             break;
         case 's':
             if (lang == "sql") return LanguageId::Sql;

@@ -1313,6 +1313,12 @@ void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, i
         else if (*language_ == "bash") {
             extract_bash(node, type_str, parent_qualname);
         }
+        else if (*language_ == "powershell") {
+            extract_powershell(node, type_str, parent_qualname);
+        }
+        else if (*language_ == "batch") {
+            extract_batch(node, type_str, parent_qualname);
+        }
         else if (*language_ == "sql") {
             extract_sql(node, type_str, parent_qualname);
         }
@@ -1919,6 +1925,101 @@ void Extractor::extract_bash(TSNode node, const std::string& type, const std::st
     }
     else if (type == "source_command") {
         add_ref("include", node_text(node), node, "source");
+    }
+}
+
+void Extractor::extract_powershell(TSNode node, const std::string& type, const std::string& parent_qn) {
+    // Return the text of the first named child whose node type matches child_type.
+    // PowerShell defs name their identifier as a positional named child (function_name /
+    // simple_name), not a field, so a field lookup won't find it.
+    auto named_child_text = [&](const char* child_type) -> std::string {
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; ++i) {
+            TSNode c = ts_node_named_child(node, i);
+            const char* ct = ts_node_type(c);
+            if (ct && std::string(ct) == child_type) return node_text(c);
+        }
+        return "";
+    };
+    auto qn = [&](const std::string& name) {
+        return parent_qn.empty() ? name : parent_qn + "\\" + name;
+    };
+
+    if (type == "function_statement") {
+        // function / filter / workflow NAME { ... }
+        std::string name = named_child_text("function_name");
+        if (!name.empty()) add_symbol("function", name, node, qn(name));
+    }
+    else if (type == "class_statement") {
+        std::string name = named_child_text("simple_name");
+        if (!name.empty()) add_symbol("class", name, node, qn(name));
+    }
+    else if (type == "class_method_definition") {
+        std::string name = named_child_text("simple_name");
+        if (!name.empty()) add_symbol("method", name, node, qn(name));
+    }
+    else if (type == "enum_statement") {
+        std::string name = named_child_text("simple_name");
+        if (!name.empty()) add_symbol("enum", name, node, qn(name));
+    }
+    else if (type == "command") {
+        // Cmdlet / function invocation: `Verb-Noun args` or `myFunc args`. The
+        // command_name field carries the invoked name; when it matches a defined
+        // function_statement, ref resolution creates a 'calls' edge -> blast radius.
+        TSNode nm = ts_node_child_by_field_name(node, "command_name", 12);
+        if (!ts_node_is_null(nm)) {
+            std::string callee = node_text(nm);
+            if (!callee.empty()) add_call_ref(callee, node, "command");
+        }
+    }
+}
+
+void Extractor::extract_batch(TSNode node, const std::string& type, const std::string& parent_qn) {
+    // Strip a leading ':' (and surrounding whitespace) from a label / jump
+    // target so a definition ':build' and its reference 'call :build' resolve
+    // to the same bare name.
+    auto strip_colon = [](std::string s) -> std::string {
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ':' || s[i] == ' ' || s[i] == '\t')) ++i;
+        size_t j = s.size();
+        while (j > i && (s[j - 1] == ' ' || s[j - 1] == '\t' ||
+                         s[j - 1] == '\r' || s[j - 1] == '\n')) --j;
+        return s.substr(i, j - i);
+    };
+    auto qn = [&](const std::string& name) {
+        return parent_qn.empty() ? name : parent_qn + "\\" + name;
+    };
+    // In tree-sitter-batch, CALL/GOTO parse as bare call_stmt/goto_stmt nodes
+    // whose target label is an anonymous token (not a named child), so pull it
+    // from the statement text: drop the leading keyword, then any ':' and
+    // whitespace, then keep the first whitespace-delimited token.
+    auto target_after_keyword = [&](const std::string& text) -> std::string {
+        size_t i = 0;
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+        while (i < text.size() &&
+               ((text[i] >= 'a' && text[i] <= 'z') || (text[i] >= 'A' && text[i] <= 'Z'))) ++i;
+        std::string t = strip_colon(text.substr(i));
+        size_t sp = t.find_first_of(" \t\r\n");
+        if (sp != std::string::npos) t = t.substr(0, sp);
+        return t;
+    };
+
+    if (type == "label") {
+        // ':name' — batch's unit of callable structure (a subroutine target).
+        // CALL :name and GOTO :name reference it, so treat it as a function so
+        // ref resolution builds call edges -> blast radius across subroutines.
+        std::string name = strip_colon(node_text(node));
+        if (!name.empty()) add_symbol("function", name, node, qn(name));
+    }
+    else if (type == "call_stmt") {
+        // CALL :label  or  CALL script.bat
+        std::string target = target_after_keyword(node_text(node));
+        if (!target.empty()) add_call_ref(target, node, "call");
+    }
+    else if (type == "goto_stmt") {
+        // GOTO :label / GOTO label / goto:eof
+        std::string target = target_after_keyword(node_text(node));
+        if (!target.empty()) add_call_ref(target, node, "goto");
     }
 }
 

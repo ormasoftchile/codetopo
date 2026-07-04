@@ -123,6 +123,8 @@ private:
     void extract_rust(TSNode node, const std::string& type, const std::string& parent_qn);
     void extract_java(TSNode node, const std::string& type, const std::string& parent_qn);
     void extract_bash(TSNode node, const std::string& type, const std::string& parent_qn);
+    void extract_powershell(TSNode node, const std::string& type, const std::string& parent_qn);
+    void extract_batch(TSNode node, const std::string& type, const std::string& parent_qn);
     void extract_sql(TSNode node, const std::string& type, const std::string& parent_qn);
 };
 

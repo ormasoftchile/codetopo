@@ -85,6 +85,8 @@ inline std::string detect_language(const std::filesystem::path& file_path) {
     if (ext == ".java") return "java";
     if (ext == ".go") return "go";
     if (ext == ".sh" || ext == ".bash") return "bash";
+    if (ext == ".ps1" || ext == ".psm1" || ext == ".psd1") return "powershell";
+    if (ext == ".bat" || ext == ".cmd") return "batch";
     if (ext == ".sql" || ext == ".tsql") return "sql";
     if (ext == ".yaml" || ext == ".yml") return "yaml";
 

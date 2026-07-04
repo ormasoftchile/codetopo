@@ -80,6 +80,21 @@ add_ts_grammar(NAME python  REPO tree-sitter/tree-sitter-python   TAG v0.23.6 SC
 add_ts_grammar(NAME rust    REPO tree-sitter/tree-sitter-rust     TAG v0.23.2 SCANNER V23)
 add_ts_grammar(NAME java    REPO tree-sitter/tree-sitter-java     TAG v0.23.4 V23)
 add_ts_grammar(NAME bash    REPO tree-sitter/tree-sitter-bash     TAG v0.23.3 SCANNER V23)
+add_ts_grammar(NAME powershell REPO airbus-cert/tree-sitter-powershell TAG v0.24.4 SCANNER V23)
+# tree-sitter-batch is generated with newer (0.26) tooling: its parser.c uses
+# set_contains()/ADVANCE_MAP()/TSCharacterRange and a TSLanguage struct whose
+# first field is .abi_version. That doesn't match the shared v0.21 or patched
+# v23 shim headers, so we let the grammar use its OWN bundled tree_sitter/parser.h.
+# A quoted #include "tree_sitter/parser.h" resolves relative to parser.c's own
+# directory first, so downloading the header next to parser.c makes it win over
+# any -I path. The grammar is abi-14 (like bash/powershell), so the runtime
+# (abi 15, min-compatible 13) reads it correctly. C11 is needed on MSVC for the
+# designated initializers / compound literals the generated code uses.
+file(MAKE_DIRECTORY "${TS_GRAMMAR_DIR}/batch/tree_sitter")
+ts_download_verified(
+    "https://raw.githubusercontent.com/wharflab/tree-sitter-batch/refs/tags/v0.11.1/src/tree_sitter/parser.h"
+    "${TS_GRAMMAR_DIR}/batch/tree_sitter/parser.h")
+add_ts_grammar(NAME batch   REPO wharflab/tree-sitter-batch      TAG v0.11.1 C11)
 
 # --- Main executable ---
 set(CODETOPO_SOURCES
