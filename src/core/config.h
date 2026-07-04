@@ -36,6 +36,8 @@ struct Config {
     bool resume = false;       // True = load cached worklist instead of rescanning
     int progress_offset = 0;   // Files already completed in prior runs (for display)
     int progress_total = 0;    // Original total file count (0 = use work_list.size())
+    std::vector<std::string> only_files;          // Targeted reindex paths
+    std::vector<std::string> changed_file_lists;  // Files containing targeted reindex paths
 
     // MCP server settings
     int tool_timeout_s = 10;

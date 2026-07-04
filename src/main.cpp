@@ -39,6 +39,8 @@ int main(int argc, char** argv) {
     bool index_safe_mode = false;
     bool index_resume = false;
     bool index_force = false;
+    std::vector<std::string> index_only_files;
+    std::vector<std::string> index_changed_file_lists;
 
     sub_index->add_option("--root", index_root, "Repository root directory")->default_val(".");
     sub_index->add_option("--db", index_db, "Database path (default: <root>/.codetopo/index.sqlite)");
@@ -54,6 +56,8 @@ int main(int argc, char** argv) {
     sub_index->add_option("--max-symbols-per-file", index_max_symbols, "Max symbols per file")->default_val(50000);
     sub_index->add_flag("--no-gitignore", index_no_gitignore, "Disable .gitignore filtering");
     sub_index->add_option("--exclude", index_exclude, "Glob patterns to exclude (repeatable, e.g. **/GlobalSuppressions.cs)");
+    sub_index->add_option("--only-files", index_only_files, "Targeted reindex path (repeatable; repo-relative or absolute)");
+    sub_index->add_option("--changed-file", index_changed_file_lists, "File containing newline-separated targeted paths (repeatable)");
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
     sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
@@ -257,6 +261,8 @@ int main(int argc, char** argv) {
         cfg.turbo = index_turbo;
         cfg.force_reindex = index_force;
         cfg.exclude_patterns = index_exclude;
+        cfg.only_files = index_only_files;
+        cfg.changed_file_lists = index_changed_file_lists;
         cfg.supervised = index_supervised;
         cfg.safe_mode = index_safe_mode;
         cfg.resume = index_resume;

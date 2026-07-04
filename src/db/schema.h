@@ -22,7 +22,7 @@ namespace codetopo {
 // Schema version 12 = drop node_vectors (semantic embedding subsystem removed).
 // Schema version 13 = files.language CHECK allows 'powershell' and 'batch'.
 static constexpr int CURRENT_SCHEMA_VERSION = 13;
-static constexpr const char* INDEXER_VERSION = "1.6.5";
+static constexpr const char* INDEXER_VERSION = "1.7.0";
 
 namespace schema {
 

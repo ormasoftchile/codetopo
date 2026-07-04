@@ -40,31 +40,7 @@ public:
 
         for (const auto& file : scanned) {
             seen_paths.insert(file.relative_path);
-
-            auto it = existing_.find(file.relative_path);
-            if (it == existing_.end()) {
-                result.new_files.push_back(file);
-                continue;
-            }
-
-            if (force_reindex_) {
-                result.changed_files.push_back(file);
-                continue;
-            }
-
-            const auto& record = it->second;
-
-            // Fast path: mtime + size unchanged → skip
-            if (record.mtime_ns == file.mtime_ns && record.size_bytes == file.size_bytes) {
-                continue;
-            }
-
-            // mtime or size changed → compute hash
-            auto new_hash = hash_file(file.absolute_path);
-            if (new_hash != record.content_hash) {
-                result.changed_files.push_back(file);
-            }
-            // If hash matches despite mtime change, still skip (touch without edit)
+            add_if_new_or_changed(file, result);
         }
 
         // Detect deleted files
@@ -77,10 +53,51 @@ public:
         return result;
     }
 
+    ChangeResult detect_targeted(const std::vector<ScannedFile>& scanned,
+                                 const std::vector<std::string>& deleted_paths) {
+        ChangeResult result;
+
+        for (const auto& file : scanned) {
+            add_if_new_or_changed(file, result);
+        }
+
+        std::unordered_set<std::string> seen_deleted;
+        for (const auto& path : deleted_paths) {
+            if (seen_deleted.insert(path).second) {
+                result.deleted_paths.push_back(path);
+            }
+        }
+
+        return result;
+    }
+
 private:
     Connection& conn_;
     bool force_reindex_ = false;
     std::unordered_map<std::string, FileRecord> existing_;
+
+    void add_if_new_or_changed(const ScannedFile& file, ChangeResult& result) {
+        auto it = existing_.find(file.relative_path);
+        if (it == existing_.end()) {
+            result.new_files.push_back(file);
+            return;
+        }
+
+        if (force_reindex_) {
+            result.changed_files.push_back(file);
+            return;
+        }
+
+        const auto& record = it->second;
+        if (record.mtime_ns == file.mtime_ns && record.size_bytes == file.size_bytes) {
+            return;
+        }
+
+        auto new_hash = hash_file(file.absolute_path);
+        if (new_hash != record.content_hash) {
+            result.changed_files.push_back(file);
+        }
+    }
 
     void load_existing() {
         sqlite3_stmt* stmt = nullptr;

@@ -11,6 +11,7 @@
 #include <functional>
 #include <array>
 #include <cstdio>
+#include <optional>
 
 namespace codetopo {
 namespace fs = std::filesystem;
@@ -165,6 +166,52 @@ public:
         return files;
     }
 
+    std::vector<ScannedFile> scan_paths(const std::vector<std::string>& paths,
+                                        std::vector<std::string>& deleted_paths) {
+        auto root = fs::canonical(config_.repo_root);
+        std::vector<ScannedFile> files;
+        std::unordered_set<std::string> seen;
+
+        for (const auto& raw : paths) {
+            auto rel_opt = normalize_target_path(root, raw);
+            if (!rel_opt) continue;
+            std::string rel = *rel_opt;
+            if (!seen.insert(rel).second) continue;
+
+            if (rel.rfind(".codetopo/", 0) == 0 || rel.rfind(".git/", 0) == 0)
+                continue;
+            if (matches_exclude(rel, config_.exclude_patterns)) continue;
+
+            auto abs_path = root / fs::path(rel);
+            std::error_code ec;
+            if (!fs::exists(abs_path, ec)) {
+                deleted_paths.push_back(rel);
+                continue;
+            }
+            if (!fs::is_regular_file(abs_path, ec)) continue;
+
+            auto language = path_util::detect_language(fs::path(rel));
+            if (language.empty()) continue;
+
+            auto size = fs::file_size(abs_path, ec);
+            if (ec) continue;
+            auto mtime = fs::last_write_time(abs_path, ec);
+            if (ec) continue;
+            auto mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                mtime.time_since_epoch()).count();
+
+            files.push_back({
+                abs_path,
+                rel,
+                language,
+                static_cast<int64_t>(size),
+                mtime_ns
+            });
+        }
+
+        return files;
+    }
+
     // Check if a relative path matches any --exclude pattern.
     // Patterns support: ** (any path segments), * (any chars except /), ? (single char).
     // A pattern without / is matched against the filename only.
@@ -189,6 +236,34 @@ public:
 
 private:
     const Config& config_;
+
+    static std::optional<std::string> normalize_target_path(const fs::path& root,
+                                                            const std::string& raw_path) {
+        if (raw_path.empty()) return std::nullopt;
+
+        fs::path input(raw_path);
+        fs::path rel;
+        if (input.is_absolute()) {
+            auto norm_root = root.lexically_normal();
+            auto norm_input = input.lexically_normal();
+            auto root_s = norm_root.generic_string();
+            auto input_s = norm_input.generic_string();
+            if (input_s != root_s &&
+                (input_s.size() <= root_s.size() || input_s.compare(0, root_s.size(), root_s) != 0 ||
+                 input_s[root_s.size()] != '/')) {
+                return std::nullopt;
+            }
+            rel = norm_input.lexically_relative(norm_root);
+        } else {
+            rel = input.lexically_normal();
+        }
+
+        auto rel_s = rel.generic_string();
+        while (rel_s.rfind("./", 0) == 0) rel_s.erase(0, 2);
+        if (rel_s.empty() || rel_s == "." || rel_s.rfind("../", 0) == 0 || rel_s == "..")
+            return std::nullopt;
+        return rel_s;
+    }
 
     // Simple glob: * matches any chars except /, ? matches single char
     static bool glob_match(const std::string& str, const std::string& pattern) {

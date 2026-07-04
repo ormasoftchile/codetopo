@@ -9,22 +9,32 @@
 #include "util/log.h"
 #include "util/lock.h"
 #include "util/process.h"
+#include "util/git.h"
 #include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <thread>
 #include <chrono>
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <unordered_set>
 
 namespace codetopo {
 
 // R8: Manages a spawned child indexer — deduplicates rapid triggers, monitors completion.
 struct ReindexState {
-    std::atomic<bool> running{false};
-    std::atomic<bool> queued{false};
+    std::mutex mutex;
+    bool running = false;
+    bool queued = false;
+    bool queued_full = false;
+    std::unordered_set<std::string> queued_paths;
     std::thread monitor_thread;
+    std::atomic<uint64_t> list_counter{0};
 
     ~ReindexState() {
         // Detached threads manage their own lifetime; if still joinable, detach.
@@ -32,21 +42,84 @@ struct ReindexState {
     }
 
     void trigger(const std::string& root, const std::string& db,
-                 std::function<void()> on_complete) {
-        if (running.exchange(true)) {
-            queued = true;  // collapse into next run
-            mcp_log("reindex: already running, queued");
-            return;
+                 std::function<void()> on_complete,
+                 const std::vector<std::string>& paths = {},
+                 bool full_reindex = false) {
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            queued = true;
+            queued_full = queued_full || full_reindex || paths.empty();
+            if (queued_full) {
+                queued_paths.clear();
+            } else {
+                queued_paths.insert(paths.begin(), paths.end());
+            }
+            if (running) {
+                mcp_log("reindex: already running, queued");
+                return;
+            }
+            running = true;
         }
+
         if (monitor_thread.joinable()) monitor_thread.detach();
         monitor_thread = std::thread([=, this]() {
-            do {
-                queued = false;
+            namespace fs = std::filesystem;
+            while (true) {
+                bool run_full = false;
+                std::unordered_set<std::string> run_paths;
+                {
+                    std::lock_guard<std::mutex> lk(mutex);
+                    if (!queued) {
+                        running = false;
+                        break;
+                    }
+                    run_full = queued_full;
+                    run_paths = queued_paths;
+                    queued = false;
+                    queued_full = false;
+                    queued_paths.clear();
+                }
+
+                if (!run_full && run_paths.empty()) run_full = true;
+
+                std::optional<fs::path> changed_file;
+                std::vector<std::string> args = {"index", "--root", root, "--db", db, "--supervised"};
+                if (!run_full) {
+                    std::error_code ec;
+                    auto dir = fs::path(root) / ".codetopo";
+                    fs::create_directories(dir, ec);
+                    if (!ec) {
+                        auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        auto seq = list_counter.fetch_add(1, std::memory_order_relaxed);
+                        auto path = dir / ("changed-files-" + std::to_string(now) + "-"
+                                           + std::to_string(seq) + ".lst");
+                        std::ofstream out(path, std::ios::trunc);
+                        if (out) {
+                            for (const auto& p : run_paths) out << p << '\n';
+                            out.close();
+                            if (out) changed_file = path;
+                        }
+                    }
+                    if (changed_file) {
+                        args.push_back("--changed-file");
+                        args.push_back(changed_file->string());
+                    } else {
+                        run_full = true;
+                        mcp_log("reindex: could not write changed-file list; falling back to full");
+                    }
+                }
+
                 auto started = std::chrono::steady_clock::now();
-                mcp_log("reindex: started");
+                mcp_log(run_full ? "reindex: started (full)"
+                                  : "reindex: started (targeted, "
+                                      + std::to_string(run_paths.size()) + " paths)");
                 auto exe = get_self_executable_path();
-                int rc = spawn_and_wait(exe,
-                    {"index", "--root", root, "--db", db, "--supervised"});
+                int rc = spawn_and_wait(exe, args);
+                if (changed_file) {
+                    std::error_code ec;
+                    fs::remove(*changed_file, ec);
+                }
                 auto elapsed = std::chrono::steady_clock::now() - started;
                 if (rc == 0) {
                     mcp_log("reindex: done (" + format_duration_seconds(elapsed) + ")");
@@ -55,12 +128,74 @@ struct ReindexState {
                     mcp_log("reindex: failed (" + format_duration_seconds(elapsed)
                             + ", exit=" + std::to_string(rc) + ")");
                 }
-            } while (queued.load());
-            running = false;
+            }
         });
         monitor_thread.detach();
     }
 };
+
+inline std::vector<std::string> split_git_paths(const std::string& output) {
+    std::vector<std::string> paths;
+    std::istringstream in(output);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) paths.push_back(line);
+    }
+    return paths;
+}
+
+inline void append_unique_paths(std::vector<std::string>& paths,
+                                std::unordered_set<std::string>& seen,
+                                const std::vector<std::string>& add) {
+    for (const auto& path : add) {
+        if (seen.insert(path).second) paths.push_back(path);
+    }
+}
+
+inline std::optional<std::string> repo_relative_watch_path(const std::filesystem::path& root,
+                                                           const std::filesystem::path& path) {
+    namespace fs = std::filesystem;
+    fs::path rel;
+    if (path.is_absolute()) {
+        auto norm_root = root.lexically_normal();
+        auto norm_path = path.lexically_normal();
+        auto root_s = norm_root.generic_string();
+        auto path_s = norm_path.generic_string();
+        if (path_s != root_s &&
+            (path_s.size() <= root_s.size() || path_s.compare(0, root_s.size(), root_s) != 0 ||
+             path_s[root_s.size()] != '/')) {
+            return std::nullopt;
+        }
+        rel = norm_path.lexically_relative(norm_root);
+    } else {
+        rel = path.lexically_normal();
+    }
+    auto rel_s = rel.generic_string();
+    while (rel_s.rfind("./", 0) == 0) rel_s.erase(0, 2);
+    if (rel_s.empty() || rel_s == "." || rel_s == ".." || rel_s.rfind("../", 0) == 0)
+        return std::nullopt;
+    return rel_s;
+}
+
+inline std::vector<std::string> git_changed_paths_for_heads(const std::string& repo_root,
+                                                            const std::string& old_head,
+                                                            const std::string& new_head,
+                                                            bool* empty_head_diff = nullptr) {
+    std::vector<std::string> paths;
+    std::unordered_set<std::string> seen;
+    if (!old_head.empty() && !new_head.empty() && old_head != new_head) {
+        auto head_paths = split_git_paths(
+            git_command(repo_root, "diff --name-only " + old_head + " " + new_head));
+        if (head_paths.empty() && empty_head_diff) *empty_head_diff = true;
+        append_unique_paths(paths, seen, head_paths);
+    }
+    append_unique_paths(paths, seen,
+        split_git_paths(git_command(repo_root, "diff --name-only")));
+    append_unique_paths(paths, seen,
+        split_git_paths(git_command(repo_root, "diff --name-only --cached")));
+    return paths;
+}
 
 // T075: Wire cmd_mcp — start MCP server over stdio.
 // R8+R9: Updated to accept freshness policy and debounce, with startup reconciliation.
@@ -150,6 +285,10 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     }
 
     auto repo_root = schema::get_kv(conn, "repo_root", ".");
+    std::string last_known_head = get_git_head(repo_root);
+    if (last_known_head.empty()) {
+        last_known_head = schema::get_kv(conn, "git_head", "");
+    }
 
     // R8: Startup reconciliation — spawn codetopo index to catch up on missed changes.
     // Behavior depends on freshness policy (R9):
@@ -382,24 +521,59 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             [&](const std::vector<WatchEvent>& events) {
                 // Filter: ignore .codetopo/ writes (our own DB) and .git/ internals
                 // (except .git/HEAD which signals branch switch)
-                bool has_relevant = false;
+                std::vector<std::string> changed_paths;
+                std::unordered_set<std::string> seen_paths;
+                bool branch_switch = false;
+                bool fallback_full = false;
+                auto root_path = fs::path(repo_root).lexically_normal();
+
                 for (const auto& ev : events) {
                     auto s = ev.path.generic_string();
                     if (s.find(".codetopo/") != std::string::npos) continue;
                     if (s.find(".codetopo\\") != std::string::npos) continue;
-                    if (ev.type == FileEvent::BranchSwitch) { has_relevant = true; break; }
+                    if (ev.type == FileEvent::BranchSwitch) {
+                        if (s.find(".git/HEAD") != std::string::npos ||
+                            s.find(".git\\HEAD") != std::string::npos) {
+                            branch_switch = true;
+                        }
+                        continue;
+                    }
                     // Skip .git/ internals (pack files, index, refs updates, etc.)
                     if (s.find(".git/") != std::string::npos || s.find(".git\\") != std::string::npos) continue;
-                    has_relevant = true;
-                    break;
+                    auto rel = repo_relative_watch_path(root_path, ev.path);
+                    if (rel && seen_paths.insert(*rel).second) {
+                        changed_paths.push_back(*rel);
+                    }
                 }
-                if (!has_relevant) return;
 
-                mcp_log("watcher: change detected, triggering reindex");
+                if (branch_switch) {
+                    auto new_head = get_git_head(repo_root);
+                    if (last_known_head.empty() || new_head.empty()) {
+                        fallback_full = true;
+                    } else {
+                        bool empty_head_diff = false;
+                        append_unique_paths(changed_paths, seen_paths,
+                            git_changed_paths_for_heads(repo_root, last_known_head, new_head,
+                                                        &empty_head_diff));
+                        if (new_head != last_known_head && empty_head_diff) {
+                            fallback_full = true;
+                        } else if (new_head != last_known_head && changed_paths.empty()) {
+                            changed_paths.push_back(".git/HEAD");
+                        }
+                    }
+                    if (!new_head.empty()) last_known_head = new_head;
+                }
+
+                if (!fallback_full && changed_paths.empty()) return;
+
+                mcp_log(fallback_full
+                    ? "watcher: change detected, triggering full reindex"
+                    : "watcher: change detected, triggering targeted reindex ("
+                        + std::to_string(changed_paths.size()) + " paths)");
                 reindex.trigger(repo_root, db_path, [&]() {
                     server.request_refresh();
                     mcp_log("watcher: reindex complete, cache invalidated");
-                });
+                }, changed_paths, fallback_full);
             },
             debounce
         );

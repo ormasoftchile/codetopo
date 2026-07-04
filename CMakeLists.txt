@@ -38,7 +38,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 
-project(codetopo VERSION 1.6.5 LANGUAGES C CXX)
+project(codetopo VERSION 1.7.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -179,6 +179,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
     tests/unit/test_trace_tools.cpp
+    tests/unit/test_targeted_reindex.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
