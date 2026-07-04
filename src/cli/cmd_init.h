@@ -23,7 +23,7 @@
 namespace codetopo {
 
 // Supported editor targets for MCP config writing.
-enum class Editor { vscode, cursor, windsurf, claude, copilot };
+enum class Editor { vscode, cursor, windsurf, copilot };
 
 // Parse a comma-separated editor list string into a vector.
 // "auto" is returned as an empty vector (caller detects).
@@ -40,7 +40,6 @@ inline std::vector<Editor> parse_editors(const std::string& input) {
             if (token == "vscode")        result.push_back(Editor::vscode);
             else if (token == "cursor")   result.push_back(Editor::cursor);
             else if (token == "windsurf") result.push_back(Editor::windsurf);
-            else if (token == "claude")   result.push_back(Editor::claude);
             else if (token == "copilot")  result.push_back(Editor::copilot);
             token.clear();
         } else {
@@ -57,8 +56,6 @@ inline std::vector<Editor> detect_editors(const std::filesystem::path& root) {
     if (fs::exists(root / ".vscode"))   found.push_back(Editor::vscode);
     if (fs::exists(root / ".cursor"))   found.push_back(Editor::cursor);
     if (fs::exists(root / ".windsurf")) found.push_back(Editor::windsurf);
-    // Claude Desktop uses a global config — always include if user asked for auto
-    // but we don't auto-detect it (no local dir to check).
 
     // Copilot CLI uses a project-local .github/mcp.json — always valid to include.
     found.push_back(Editor::copilot);
@@ -66,38 +63,14 @@ inline std::vector<Editor> detect_editors(const std::filesystem::path& root) {
 }
 
 // Get the directory for an editor's MCP config, relative to repo root.
-// Returns empty for claude (which uses a global config path).
 inline std::filesystem::path editor_config_dir(Editor e, const std::filesystem::path& root) {
     switch (e) {
         case Editor::vscode:   return root / ".vscode";
         case Editor::cursor:   return root / ".cursor";
         case Editor::windsurf: return root / ".windsurf";
-        case Editor::claude:   return {};
         case Editor::copilot:  return root / ".github";
     }
     return {};
-}
-
-// Get the Claude Desktop global config path (platform-specific).
-inline std::filesystem::path claude_config_path() {
-#ifdef _WIN32
-    char* appdata = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&appdata, &len, "APPDATA") == 0 && appdata) {
-        auto p = std::filesystem::path(appdata) / "Claude" / "claude_desktop_config.json";
-        free(appdata);
-        return p;
-    }
-    return {};
-#elif defined(__APPLE__)
-    const char* home = std::getenv("HOME");
-    if (!home) return {};
-    return std::filesystem::path(home) / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json";
-#else
-    const char* home = std::getenv("HOME");
-    if (!home) return {};
-    return std::filesystem::path(home) / ".config" / "claude" / "claude_desktop_config.json";
-#endif
 }
 
 // Read an existing JSON file into a mutable document, or create a new empty object doc.
@@ -207,13 +180,14 @@ inline bool write_workspace_mcp_config(const std::filesystem::path& config_path,
     return ok;
 }
 
-// Write/update the Claude Desktop global config.
+// Write/update the project-scoped .mcp.json at the repo root.
 // Format: { "mcpServers": { "codetopo": { "command": ..., "args": [...] } } }
-// Uses absolute path for --root since Claude runs from a different cwd.
-inline bool write_claude_mcp_config(const std::filesystem::path& repo_root,
-                                     bool watch, const std::string& freshness) {
-    auto config_path = claude_config_path();
-    if (config_path.empty()) return false;
+// This is the cross-agent standard location (Claude Code and others). Uses a
+// relative --root . since the config lives at the project root. Merges with
+// existing mcpServers entries — does not clobber them.
+inline bool write_root_mcp_config(const std::filesystem::path& repo_root,
+                                  bool watch, const std::string& freshness) {
+    auto config_path = repo_root / ".mcp.json";
 
     yyjson_mut_doc* doc = read_or_create_json(config_path);
     if (!doc) return false;
@@ -224,27 +198,27 @@ inline bool write_claude_mcp_config(const std::filesystem::path& repo_root,
         yyjson_mut_doc_set_root(doc, root);
     }
 
-    // Get or create "mcpServers" object
+    // Get or create "mcpServers" object, preserving any existing entries.
     auto* servers = yyjson_mut_obj_get(root, "mcpServers");
     if (!servers || !yyjson_mut_is_obj(servers)) {
         servers = yyjson_mut_obj(doc);
         yyjson_mut_obj_add_val(doc, root, "mcpServers", servers);
     }
 
-    // Remove existing codetopo entry if present
+    // Remove existing codetopo entry so we can write a fresh one.
     yyjson_mut_obj_remove_key(servers, "codetopo");
 
-    // Build codetopo server entry — use absolute path to current binary
+    // Build codetopo server entry — use absolute path to current binary.
     auto* entry = yyjson_mut_obj(doc);
     auto exe_path = get_self_executable_path();
     yyjson_mut_obj_add_strcpy(doc, entry, "command",
         exe_path.empty() ? "codetopo" : exe_path.c_str());
 
+    // Relative --root . — config lives at the project root.
     auto* args = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, args, "mcp");
     yyjson_mut_arr_add_str(doc, args, "--root");
-    std::string abs_root = std::filesystem::canonical(repo_root).string();
-    yyjson_mut_arr_add_strcpy(doc, args, abs_root.c_str());
+    yyjson_mut_arr_add_str(doc, args, ".");
     if (watch) {
         yyjson_mut_arr_add_str(doc, args, "--watch");
     }
@@ -491,7 +465,6 @@ inline const char* editor_name(Editor e) {
         case Editor::vscode:   return "VS Code";
         case Editor::cursor:   return "Cursor";
         case Editor::windsurf: return "Windsurf";
-        case Editor::claude:   return "Claude Desktop";
         case Editor::copilot:  return "GitHub Copilot";
     }
     return "Unknown";
@@ -503,7 +476,6 @@ inline std::string editor_config_display(Editor e, const std::filesystem::path& 
         case Editor::vscode:   return ".vscode/mcp.json";
         case Editor::cursor:   return ".cursor/mcp.json";
         case Editor::windsurf: return ".windsurf/mcp.json";
-        case Editor::claude:   return claude_config_path().string();
         case Editor::copilot:  return ".github/mcp.json";
     }
     return "";
@@ -574,22 +546,35 @@ inline int run_init(const std::string& root_str,
     if (editors.empty()) {
         // auto-detect
         editors = detect_editors(repo_root);
-        if (editors.empty()) {
-            // Default to VS Code if nothing detected
-            editors.push_back(Editor::vscode);
-        }
     }
 
     // Write MCP configs
     std::vector<std::string> written_configs;
+
+    // Always write the two project-scoped configs, regardless of --editors:
+    //   .mcp.json        — cross-agent standard at the repo root (Claude Code, etc.)
+    //   .vscode/mcp.json — VS Code
+    // Both are committed with the project and use a relative --root, so no
+    // user-level/global config is ever touched.
+    if (write_root_mcp_config(repo_root, watch, freshness)) {
+        written_configs.push_back(".mcp.json");
+    } else {
+        std::cerr << "WARNING: Could not write .mcp.json\n";
+    }
+    {
+        auto vscode_cfg = repo_root / ".vscode" / "mcp.json";
+        if (write_workspace_mcp_config(vscode_cfg, watch, freshness)) {
+            written_configs.push_back(".vscode/mcp.json");
+        } else {
+            std::cerr << "WARNING: Could not write .vscode/mcp.json\n";
+        }
+    }
+
+    // Editor-specific configs (copilot / cursor / windsurf) from --editors or
+    // auto-detect. VS Code is already handled above.
     for (auto e : editors) {
-        if (e == Editor::claude) {
-            if (write_claude_mcp_config(repo_root, watch, freshness)) {
-                written_configs.push_back(editor_config_display(e, repo_root));
-            } else {
-                std::cerr << "WARNING: Could not write Claude Desktop config\n";
-            }
-        } else if (e == Editor::copilot) {
+        if (e == Editor::vscode) continue;  // already written
+        if (e == Editor::copilot) {
             if (write_copilot_cli_mcp_config(repo_root, watch, freshness)) {
                 written_configs.push_back(editor_config_display(e, repo_root));
             } else {

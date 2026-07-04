@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
 
     sub_init->add_option("--root", init_root, "Repository root directory")->default_val(".");
     sub_init->add_option("--editors", init_editors,
-        "Comma-separated editors: vscode,cursor,windsurf,claude,copilot,auto")->default_val("auto");
+        "Comma-separated editors: vscode,cursor,windsurf,copilot,auto")->default_val("auto");
     sub_init->add_option("--threads", init_threads, "Worker thread count (0=auto)")->default_val(0);
     sub_init->add_option("--arena-size", init_arena_size, "Arena size in MB per thread")->default_val(128);
     sub_init->add_option("--large-arena-size", init_large_arena_size, "Large arena size in MB for oversized files (0=disabled)")->default_val(0);
