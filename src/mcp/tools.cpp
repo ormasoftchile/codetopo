@@ -630,8 +630,10 @@ static CandidateMode parse_candidate_mode(yyjson_val* params) {
 }
 
 static bool should_collect_candidates(CandidateMode mode, bool exact_empty) {
-    return mode == CandidateMode::ExactPlusCandidates
-        || (mode == CandidateMode::ExactThenCandidates && exact_empty);
+    // Always-on fallback: exact-only/full-output knobs must not suppress refs-backed
+    // candidate recovery when exact call edges are absent (common for overloads).
+    if (exact_empty) return true;
+    return mode == CandidateMode::ExactPlusCandidates;
 }
 
 static bool is_common_member_name(const std::string& name) {
@@ -3840,8 +3842,16 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     CandidateMode candidate_mode = parse_candidate_mode(params);
     CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
     const char* response_mode = params ? json_get_str(params, "response_mode") : nullptr;
-    bool lean_response = (response_mode && std::strcmp(response_mode, "lean") == 0) ||
-                         (params && json_get_bool(params, "lean", false));
+    bool lean_response = true;
+    if (response_mode) {
+        lean_response = std::strcmp(response_mode, "full") != 0 &&
+                        std::strcmp(response_mode, "verbose") != 0;
+    } else if (params && json_get_bool(params, "verbose", false)) {
+        lean_response = false;
+    } else if (params) {
+        auto* lean_val = yyjson_obj_get(params, "lean");
+        if (lean_val && yyjson_is_bool(lean_val)) lean_response = yyjson_get_bool(lean_val);
+    }
     bool include_buckets = !params || json_get_bool(params, "buckets", true);
     int64_t top_n = params ? json_get_int(params, "top_n", 10) : 10;
     if (top_n <= 0) top_n = 10;
@@ -3918,8 +3928,10 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
     bool has_symbol_exact_callers = std::any_of(rows.begin(), rows.end(), [](const CallerRow& row) {
         return row.kind != "file";
     });
-    bool collect_candidates = candidate_mode == CandidateMode::ExactPlusCandidates
-        || (candidate_mode == CandidateMode::ExactThenCandidates && !has_symbol_exact_callers);
+    // Always-on fallback: if exact symbol callers are absent, approximate refs-backed
+    // candidates must be present regardless of mode/include_candidates flags.
+    bool collect_candidates = !has_symbol_exact_callers
+        || candidate_mode == CandidateMode::ExactPlusCandidates;
     CallsiteCandidateSet candidates;
     if (collect_candidates)
         candidates = collect_callsite_candidates(
