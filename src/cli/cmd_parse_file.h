@@ -44,6 +44,8 @@ inline int run_parse_file(const ParseFileConfig& cfg) {
     else if (ext == ".java") lang = "java";
     else if (ext == ".go") lang = "go";
     else if (ext == ".sh" || ext == ".bash") lang = "bash";
+    else if (ext == ".ps1" || ext == ".psm1" || ext == ".psd1") lang = "powershell";
+    else if (ext == ".bat" || ext == ".cmd") lang = "batch";
     else if (ext == ".sql") lang = "sql";
     else if (ext == ".yaml" || ext == ".yml") lang = "yaml";
     else {

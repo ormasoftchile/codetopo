@@ -127,6 +127,8 @@ extern "C" {
     const TSLanguage* tree_sitter_rust(void);
     const TSLanguage* tree_sitter_java(void);
     const TSLanguage* tree_sitter_bash(void);
+    const TSLanguage* tree_sitter_powershell(void);
+    const TSLanguage* tree_sitter_batch(void);
     // tree_sitter_sql deferred — grammar has MSVC compilation issues
 }
 
@@ -202,6 +204,8 @@ private:
         if (lang == "rust") return tree_sitter_rust();
         if (lang == "java") return tree_sitter_java();
         if (lang == "bash") return tree_sitter_bash();
+        if (lang == "powershell") return tree_sitter_powershell();
+        if (lang == "batch") return tree_sitter_batch();
         if (lang == "sql") return nullptr; // Deferred — grammar MSVC issues
         if (lang == "go") return tree_sitter_go();
         if (lang == "yaml") return tree_sitter_yaml();

@@ -20,7 +20,8 @@ namespace codetopo {
 // Schema version 10 = symbol fingerprints for near-duplicate detection.
 // Schema version 11 = semantic symbol embeddings in node_vectors (removed in v12).
 // Schema version 12 = drop node_vectors (semantic embedding subsystem removed).
-static constexpr int CURRENT_SCHEMA_VERSION = 12;
+// Schema version 13 = files.language CHECK allows 'powershell' and 'batch'.
+static constexpr int CURRENT_SCHEMA_VERSION = 13;
 static constexpr const char* INDEXER_VERSION = "1.6.0";
 
 namespace schema {
@@ -116,7 +117,7 @@ inline void create_tables(Connection& conn) {
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,
-            language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','javascript','python','rust','java','go','bash','sql','yaml')),
+            language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','javascript','python','rust','java','go','bash','powershell','batch','sql','yaml')),
             size_bytes INTEGER NOT NULL,
             mtime_ns INTEGER NOT NULL,
             content_hash TEXT NOT NULL,
@@ -372,6 +373,39 @@ inline void recreate_refs_table_with_http_call(Connection& conn) {
     conn.exec("PRAGMA foreign_keys=ON");
 }
 
+inline void recreate_files_table_with_powershell(Connection& conn) {
+    if (!table_exists(conn, "files")) return;
+    conn.exec("PRAGMA foreign_keys=OFF");
+    // legacy_alter_table=ON stops RENAME from rewriting the file_id foreign-key
+    // references in child tables (nodes, refs) to point at files_old. Without it,
+    // those FKs would dangle after DROP TABLE files_old and every subsequent
+    // symbol/ref insert would fail with SQLITE_CONSTRAINT (FK failed).
+    conn.exec("PRAGMA legacy_alter_table=ON");
+    conn.exec("ALTER TABLE files RENAME TO files_old");
+    conn.exec(R"SQL(
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL,
+            language TEXT NOT NULL CHECK(language IN ('c','cpp','csharp','typescript','javascript','python','rust','java','go','bash','powershell','batch','sql','yaml')),
+            size_bytes INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            parse_status TEXT NOT NULL CHECK(parse_status IN ('ok','partial','failed','skipped')),
+            parse_error TEXT,
+            root_id INTEGER REFERENCES roots(id) ON DELETE CASCADE
+        );
+    )SQL");
+    conn.exec(
+        "INSERT INTO files(id, path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error, root_id) "
+        "SELECT id, path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error, root_id "
+        "FROM files_old");
+    conn.exec("DROP TABLE files_old");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");
+    conn.exec("PRAGMA legacy_alter_table=OFF");
+    conn.exec("PRAGMA foreign_keys=ON");
+}
+
 inline void ensure_nodes_fingerprint_schema(Connection& conn) {
     if (!table_exists(conn, "nodes")) return;
     if (!table_has_column(conn, "nodes", "fingerprint")) {
@@ -542,6 +576,13 @@ inline int ensure_schema(Connection& conn) {
         conn.exec("DROP INDEX IF EXISTS idx_node_vectors_node");
         conn.exec("DROP TABLE IF EXISTS node_vectors");
         version = 12;
+    }
+
+    // v12→v13: files.language CHECK allows 'powershell' — recreate the files
+    // table (a CHECK constraint cannot be altered in place).
+    if (version == 12) {
+        recreate_files_table_with_powershell(conn);
+        version = 13;
     }
 
     if (version == CURRENT_SCHEMA_VERSION) {
