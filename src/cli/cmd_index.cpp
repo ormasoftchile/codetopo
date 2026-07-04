@@ -161,8 +161,19 @@ int run_index(const Config& config) {
     lock_path += ".lock";
     FileLock lock(lock_path);
     if (!config.supervised) {
-        if (!lock.acquire()) {
-            std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid() << ")\n";
+        constexpr int kLockTimeoutSeconds = 30;
+        if (!lock.acquire_blocking(
+                std::chrono::seconds(kLockTimeoutSeconds),
+                std::chrono::milliseconds(250),
+                std::chrono::seconds(2),
+                [](int64_t pid, std::chrono::milliseconds timeout) {
+                    std::cerr << "Waiting for index lock held by PID " << pid
+                              << " (up to "
+                              << std::chrono::duration_cast<std::chrono::seconds>(timeout).count()
+                              << "s)...\n";
+                })) {
+            std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid()
+                      << ") (waited " << kLockTimeoutSeconds << "s)\n";
             return 1;
         }
         if (lock.was_stale_broken()) {

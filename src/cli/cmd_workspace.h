@@ -9,6 +9,8 @@
 #include <vector>
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
+#include <chrono>
 
 namespace codetopo {
 
@@ -16,8 +18,29 @@ namespace codetopo {
 // codetopo workspace remove --root /myproject /path/to/remove
 // codetopo workspace list   --root /myproject
 
+inline bool acquire_workspace_lock(FileLock& lock, int lock_timeout_s) {
+    const int timeout_s = std::max(0, lock_timeout_s);
+    return lock.acquire_blocking(
+        std::chrono::seconds(timeout_s),
+        std::chrono::milliseconds(250),
+        std::chrono::seconds(2),
+        [timeout_s](int64_t pid, std::chrono::milliseconds) {
+            std::cerr << "Waiting for index lock held by PID " << pid
+                      << " (up to " << timeout_s << "s)...\n";
+        });
+}
+
+inline void print_workspace_lock_error(const FileLock& lock, int lock_timeout_s) {
+    const int timeout_s = std::max(0, lock_timeout_s);
+    std::cerr << stderr_bold_red(
+        "ERROR: Another codetopo process holds this index (PID " +
+        std::to_string(lock.holder_pid()) + "). Stop the running "
+        "MCP/watch/index process, then retry. (waited " +
+        std::to_string(timeout_s) + "s)", stderr_is_tty()) << "\n";
+}
+
 inline int run_workspace_add(const std::string& root_str, const std::string& target_path,
-                             const Config& cfg) {
+                             const Config& cfg, int lock_timeout_s = 30) {
     namespace fs = std::filesystem;
 
     auto repo_root = fs::canonical(root_str).string();
@@ -37,11 +60,8 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
     // the DB / balloon the WAL during the merge.
     auto lock_path = db_path + ".lock";
     FileLock lock(lock_path);
-    if (!lock.acquire()) {
-        std::cerr << stderr_bold_red(
-            "ERROR: Another codetopo process holds this index (PID " +
-            std::to_string(lock.holder_pid()) + "). Stop the running "
-            "MCP/watch/index process, then retry.", stderr_is_tty()) << "\n";
+    if (!acquire_workspace_lock(lock, lock_timeout_s)) {
+        print_workspace_lock_error(lock, lock_timeout_s);
         return 1;
     }
     if (lock.was_stale_broken()) {
@@ -64,7 +84,8 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
     }
 }
 
-inline int run_workspace_remove(const std::string& root_str, const std::string& target_path) {
+inline int run_workspace_remove(const std::string& root_str, const std::string& target_path,
+                                int lock_timeout_s = 30) {
     namespace fs = std::filesystem;
 
     auto repo_root = fs::canonical(root_str).string();
@@ -77,11 +98,8 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
 
     auto lock_path = db_path + ".lock";
     FileLock lock(lock_path);
-    if (!lock.acquire()) {
-        std::cerr << stderr_bold_red(
-            "ERROR: Another codetopo process holds this index (PID " +
-            std::to_string(lock.holder_pid()) + "). Stop the running "
-            "MCP/watch/index process, then retry.", stderr_is_tty()) << "\n";
+    if (!acquire_workspace_lock(lock, lock_timeout_s)) {
+        print_workspace_lock_error(lock, lock_timeout_s);
         return 1;
     }
     if (lock.was_stale_broken()) {
