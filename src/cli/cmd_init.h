@@ -588,10 +588,9 @@ inline int run_init(const std::string& root_str,
         }
     }
 
-    // 5c. Install embedded agent skills into .codetopo/skills/. These teach the
+    // 5c. Install embedded agent skills into .github/skills/. These teach the
     // agent codetopo-driven workflows (e.g. refactor) that cut token usage and
-    // improve agentic quality. Best-effort; references are appended to
-    // .github/copilot-instructions.md above if it was written.
+    // improve agentic quality. Committed + auto-discovered by Copilot. Best-effort.
     std::vector<std::string> installed_skills;
     skills_install("all", repo_root.string(), /*quiet=*/true, &installed_skills);
 

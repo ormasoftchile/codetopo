@@ -162,10 +162,12 @@ inline int skills_install(const std::string& skill_name, const std::string& root
         return 1;
     }
 
-    // Determine install location — prefer .github/copilot-instructions.md appendage,
-    // fall back to .codetopo/skills/<name>/SKILL.md
+    // Install to .github/skills/codetopo-<name>/SKILL.md — a first-class,
+    // committed, auto-discovered skill location (Copilot CLI and other surfaces
+    // scan .github/skills/). The codetopo- prefix namespaces the skill dir.
     namespace fs = std::filesystem;
-    fs::path skill_dir = fs::path(root) / ".codetopo" / "skills" / skill->name;
+    std::string skill_slug = "codetopo-" + std::string(skill->name);
+    fs::path skill_dir = fs::path(root) / ".github" / "skills" / skill_slug;
     fs::path skill_path = skill_dir / skill->filename;
 
     fs::create_directories(skill_dir);
@@ -174,30 +176,18 @@ inline int skills_install(const std::string& skill_name, const std::string& root
         std::cerr << "Failed to write " << skill_path.string() << "\n";
         return 1;
     }
-    out << skill->content;
+    // Prepend YAML frontmatter (name + description) so the runtime indexes the
+    // skill correctly. The body content is stored without frontmatter so the
+    // metadata stays single-sourced in SkillDef.
+    out << "---\n"
+        << "name: " << skill_slug << "\n"
+        << "description: " << skill->description << "\n"
+        << "---\n\n"
+        << skill->content;
     out.close();
 
     if (!quiet) std::cout << "Installed: " << skill_path.string() << "\n";
     if (installed_paths) installed_paths->push_back(skill_path.string());
-
-    // Also append a reference to copilot-instructions.md if it exists
-    fs::path instructions = fs::path(root) / ".github" / "copilot-instructions.md";
-    if (fs::exists(instructions)) {
-        // Check if already referenced
-        std::ifstream check(instructions);
-        std::string existing((std::istreambuf_iterator<char>(check)),
-                              std::istreambuf_iterator<char>());
-        check.close();
-
-        std::string ref = ".codetopo/skills/" + std::string(skill->name) + "/" + skill->filename;
-        if (existing.find(ref) == std::string::npos) {
-            std::ofstream append(instructions, std::ios::app);
-            append << "\n\n## Skill: " << skill->name << "\n\n";
-            append << "See [" << ref << "](" << ref << ") for the full skill instructions.\n";
-            append.close();
-            if (!quiet) std::cout << "Referenced in: " << instructions.string() << "\n";
-        }
-    }
 
     return 0;
 }

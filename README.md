@@ -127,9 +127,12 @@ codetopo parse-file /path/to/file.cpp --symbols --refs --edges
 
 ### Install agent skills
 
+`codetopo init` installs agent skills automatically into `.github/skills/`
+(committed and auto-discovered by Copilot). To manage them manually:
+
 ```bash
 codetopo skills list
-codetopo skills install refactor
+codetopo skills install refactor   # writes .github/skills/codetopo-refactor/SKILL.md
 ```
 
 ### Health check
