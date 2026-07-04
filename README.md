@@ -15,7 +15,7 @@ Tested on enterprise repos with 450K+ files — indexes 100K files in ~10 minute
 - **Crash‑resilient supervisor** — automatic restart with quarantine, progress tracking, and single‑thread fallback (up to 10 retries)
 - **File watcher** — re‑indexes on save using native OS events (FSEvents / inotify / ReadDirectoryChangesW)
 - **Arena allocator** — per‑thread arena pools with overflow fallback for fast, low‑fragmentation parsing
-- **Editor integration** — one‑command setup for VS Code, Cursor, Windsurf, and Claude Desktop
+- **Editor integration** — one‑command setup writes a project‑scoped `.mcp.json` (cross‑agent standard) and `.vscode/mcp.json`, plus Cursor/Windsurf/Copilot configs. No user‑level/global config is touched.
 - **Agent skills** — installable skill files for AI agents (e.g., refactoring workflows)
 - **Cross‑platform** — macOS, Linux, Windows
 
@@ -44,10 +44,12 @@ codetopo init --root /path/to/repo
 
 This will:
 1. Scan and index the repository
-2. Auto‑detect your editor (VS Code, Cursor, Windsurf) or fall back to VS Code
-3. Write the MCP server configuration so your AI tools can use the code graph immediately
-4. Install agent skills into `.github/skills/` (auto‑discovered by Copilot)
-5. Write agent‑guidance files — `.github/copilot-instructions.md` and `AGENTS.md` —
+2. Write project‑scoped MCP configs — always `.mcp.json` (repo root, the cross‑agent
+   standard) and `.vscode/mcp.json`, plus Cursor/Windsurf/Copilot configs when those
+   editors are detected. No user‑level/global config is touched; all use a relative
+   `--root` and merge with existing entries.
+3. Install agent skills into `.github/skills/` (auto‑discovered by Copilot)
+4. Write agent‑guidance files — `.github/copilot-instructions.md` and `AGENTS.md` —
    so coding agents prefer codetopo tools over grep/glob/raw file reads. These are
    written non‑destructively: existing files get a removable `codetopo` marker block
    appended, never overwritten.
