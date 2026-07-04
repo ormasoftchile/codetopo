@@ -394,6 +394,7 @@ struct CallsiteCandidateSet {
     int64_t eligible_total = 0;
     int64_t filtered_hidden = 0;
     int64_t arity_filtered = 0;
+    int64_t receiver_type_hits = 0;
     bool budget_exceeded = false;
     bool has_more = false;
     int64_t max_bytes = 16000;
@@ -425,6 +426,39 @@ static std::string lower_copy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
+}
+
+static std::vector<std::string> split_search_terms(const std::string& query) {
+    std::vector<std::string> terms;
+    std::istringstream in(query);
+    std::string term;
+    while (in >> term) {
+        if (!term.empty()) terms.push_back(term);
+    }
+    if (terms.empty() && !query.empty()) terms.push_back(query);
+    return terms;
+}
+
+static std::string escape_fts_phrase(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '"') out += "\"\"";
+        else out.push_back(ch);
+    }
+    return out;
+}
+
+static std::string escape_like_contains(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('%');
+    for (char ch : lower_copy(value)) {
+        if (ch == '\\' || ch == '%' || ch == '_') out.push_back('\\');
+        out.push_back(ch);
+    }
+    out.push_back('%');
+    return out;
 }
 
 static bool iequals(const std::string& lhs, const std::string& rhs) {
@@ -1282,6 +1316,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
         auto* receiver_type = sqlite3_column_text(stmt, 14);
         row.receiver_type_hint = receiver_type ? reinterpret_cast<const char*>(receiver_type) : "";
         row.receiver_hint = extract_receiver_hint(row.callee_text, target.name);
+        bool receiver_type_hit = false;
 
         std::string key = row.file_path + ":" + std::to_string(row.start_line) + ":" +
                           std::to_string(row.start_col) + ":" + row.callee_text;
@@ -1290,6 +1325,9 @@ static CallsiteCandidateSet collect_callsite_candidates(
         bool raw_receiver_type_matches_target =
             receiver_owner_match_strength(canonical_type_hint(row.receiver_type_hint), target) !=
                 ReceiverMatchStrength::None;
+        receiver_type_hit = raw_receiver_type_matches_target ||
+            (!options.receiver_filter.empty() &&
+             receiver_text_matches_name(row.receiver_type_hint, options.receiver_filter));
         if (!row.receiver_type_hint.empty() &&
             !(raw_receiver_type_matches_target && !options.receiver_filter.empty())) {
             bool receiver_filter_can_match =
@@ -1310,11 +1348,13 @@ static CallsiteCandidateSet collect_callsite_candidates(
                 if (resolved.resolved) {
                     row.resolved_receiver_type = resolved.resolved_type;
                     row.receiver_type_resolution_source = resolved.source;
+                    receiver_type_hit = true;
                 } else if (resolved.ambiguous) {
                     row.receiver_type_ambiguous = true;
                 }
             }
         }
+        if (receiver_type_hit) ++result.receiver_type_hits;
         score_candidate(row, target, row.caller_name, row.caller_qualname);
         if (!apply_arity_and_pattern_score(row, target)) {
             ++result.arity_filtered;
@@ -1484,6 +1524,14 @@ static void add_callsite_candidate_buckets(JsonMutDoc& doc, yyjson_mut_val* root
     yyjson_mut_obj_add_val(doc.doc, root, "candidate_buckets", buckets);
 }
 
+static const char* callsite_resolution_status(const CallsiteCandidateSet& candidates,
+                                                  const CallsiteCandidateOptions& options) {
+    if (options.receiver_filter.empty()) return "no_receiver_type";
+    if (candidates.total == 0 || candidates.eligible_total > 0 || candidates.receiver_type_hits > 0)
+        return "resolved";
+    return "unresolved";
+}
+
 static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* root,
                                             const char* prefix,
                                             const CallsiteCandidateSet& candidates,
@@ -1494,6 +1542,7 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_receiver_type_hits", candidates.receiver_type_hits);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_budget_exceeded", true);
@@ -1504,6 +1553,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "eligible_candidates", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", candidates.max_bytes);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     } else if (p == "candidate_callers") {
@@ -1511,6 +1563,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_callers_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_callers_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_callers_budget_exceeded", true);
@@ -1521,6 +1576,9 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_eligible", candidates.eligible_total);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_filtered_hidden", candidates.filtered_hidden);
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_arity_filtered", candidates.arity_filtered);
+        yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_receiver_type_hits", candidates.receiver_type_hits);
+        yyjson_mut_obj_add_str(doc.doc, root, "candidate_impacted_resolution_status", callsite_resolution_status(candidates, options));
+        yyjson_mut_obj_add_str(doc.doc, root, "resolution_status", callsite_resolution_status(candidates, options));
         yyjson_mut_obj_add_int(doc.doc, root, "candidate_impacted_max_bytes", candidates.max_bytes);
         if (candidates.has_more) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_has_more", true);
         if (candidates.budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "candidate_impacted_budget_exceeded", true);
@@ -3066,6 +3124,8 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
 
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    const char* match_param = params ? json_get_str(params, "match") : nullptr;
+    bool match_all = match_param && std::strcmp(match_param, "all") == 0;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
     bool include_source = params ? json_get_bool(params, "include_source", false) : false;
@@ -3079,9 +3139,18 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     bool has_kind = kind && strlen(kind) > 0;
     bool fn_kind = has_kind && std::string(kind) == "function";
     bool has_file_pattern = file_pattern && strlen(file_pattern) > 0;
-    std::string fts_query = "name: \"" + std::string(query) + "\"*";
+    auto terms = wildcard ? std::vector<std::string>{} : split_search_terms(query);
+    std::string fts_query;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        if (i) fts_query += match_all ? " AND " : " OR ";
+        fts_query += "name: \"" + escape_fts_phrase(terms[i]) + "\"*";
+    }
+    if (fts_query.empty() && !wildcard)
+        fts_query = "name: \"" + escape_fts_phrase(query) + "\"*";
     std::string cache_key = std::string("symbol_search_") + (wildcard ? "wild" : "fts");
     cache_key += has_kind ? (fn_kind ? "_fn" : "_kind") : "_all";
+    if (!wildcard) cache_key += match_all ? "_all_terms" : "_any_terms";
+    if (!wildcard) cache_key += "_t" + std::to_string(terms.empty() ? 1 : terms.size());
     if (has_file_pattern) cache_key += "_fp";
 
     std::string from_sql = wildcard
@@ -3096,10 +3165,20 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     std::string select_sql =
         "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.stable_key "
         + from_sql + where_sql;
+    std::string match_score_sql;
+    if (!wildcard) {
+        for (size_t i = 0; i < terms.size(); ++i) {
+            if (i) match_score_sql += " + ";
+            match_score_sql +=
+                "CASE WHEN lower(COALESCE(n.name,'')) LIKE ? ESCAPE '\\' "
+                "OR lower(COALESCE(n.qualname,'')) LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END";
+        }
+        if (match_score_sql.empty()) match_score_sql = "0";
+    }
     if (wildcard) {
         select_sql += "ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     } else {
-        select_sql += "ORDER BY " CODETOPO_TEST_RANK("f.path")
+        select_sql += "ORDER BY (" + match_score_sql + ") DESC, " CODETOPO_TEST_RANK("f.path")
             ", length(n.name), n.name, f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     }
     std::string count_sql = "SELECT COUNT(*) " + from_sql + where_sql;
@@ -3116,6 +3195,13 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
 
     int bind_idx = bind_filters(stmt, 1);
     bind_filters(count_stmt, 1);
+    if (!wildcard) {
+        for (const auto& term : terms) {
+            auto pattern = escape_like_contains(term);
+            sqlite3_bind_text(stmt, bind_idx++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, bind_idx++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+        }
+    }
     sqlite3_bind_int64(stmt, bind_idx++, limit + 1);
     sqlite3_bind_int64(stmt, bind_idx++, offset);
 
@@ -3159,6 +3245,7 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
+    if (!wildcard) yyjson_mut_obj_add_str(doc.doc, root, "match", match_all ? "all" : "any");
     return doc.to_string();
 }
 
@@ -3196,11 +3283,13 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
 
     std::string semantic_sql = "1=1";
     bool semantic_filters = false;
+    bool explicit_method_kind = kind && std::strcmp(kind, "method") == 0;
+    bool apply_min_span_filter = min_span_lines > 0 && !explicit_method_kind;
     if (kind && strlen(kind) > 0) {
         semantic_sql += " AND n.kind = ?";
         semantic_filters = true;
     }
-    if (min_span_lines > 0) {
+    if (apply_min_span_filter) {
         semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
         semantic_sql += kPublicSymbolSql;
         semantic_sql += ")";
@@ -3238,7 +3327,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
         if (kind && strlen(kind) > 0)
             sqlite3_bind_text(s, idx++, kind, -1, SQLITE_TRANSIENT);
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             sqlite3_bind_int64(s, idx++, min_span_lines);
         return idx;
     };
@@ -3310,13 +3399,13 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
     yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
-    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
     if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
-    if (min_span_lines > 0 || hidden_public_count > 0) {
+    if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             yyjson_mut_arr_add_str(doc.doc, warnings,
                 "min_span_lines is lossy; public/API-like symbols bypass span pruning");
         if (hidden_public_count > 0)
@@ -3400,6 +3489,8 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
     std::string semantic_sql = "1=1";
     bool semantic_filters = false;
+    bool explicit_method_kind = std::find(kinds.begin(), kinds.end(), "method") != kinds.end();
+    bool apply_min_span_filter = min_span_lines > 0 && !explicit_method_kind;
     if (!kinds.empty()) {
         semantic_sql += " AND n.kind IN (";
         for (size_t i = 0; i < kinds.size(); ++i) {
@@ -3409,7 +3500,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         semantic_sql += ")";
         semantic_filters = true;
     }
-    if (min_span_lines > 0) {
+    if (apply_min_span_filter) {
         semantic_sql += " AND ((n.end_line - n.start_line + 1) >= ? OR ";
         semantic_sql += kPublicSymbolSql;
         semantic_sql += ")";
@@ -3446,7 +3537,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     auto bind_semantic = [&](sqlite3_stmt* s, int idx) {
         for (const auto& k : kinds)
             sqlite3_bind_text(s, idx++, k.c_str(), -1, SQLITE_TRANSIENT);
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             sqlite3_bind_int64(s, idx++, min_span_lines);
         return idx;
     };
@@ -3519,13 +3610,13 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "total_candidates", total_candidates);
     yyjson_mut_obj_add_int(doc.doc, root, "filtered_hidden", total_candidates > total ? total_candidates - total : 0);
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
-    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", min_span_lines > 0);
+    yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
     if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
-    if (min_span_lines > 0 || hidden_public_count > 0) {
+    if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
-        if (min_span_lines > 0)
+        if (apply_min_span_filter)
             yyjson_mut_arr_add_str(doc.doc, warnings,
                 "min_span_lines is lossy; public/API-like symbols bypass span pruning");
         if (hidden_public_count > 0)

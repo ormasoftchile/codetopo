@@ -276,3 +276,83 @@ TEST_CASE("flat lean symbol_list stays below overflow threshold",
     CHECK(json_get_bool(root, "has_more", false));
     CHECK(json_get_bool(root, "budget_exceeded", false));
 }
+
+TEST_CASE("symbol listing counters are always present without lossy filters",
+          "[unit][lean-listing]") {
+    auto db = make_lean_db("always-on-counters");
+
+    auto list_result = call_symbol_list(db, R"({"limit":20})");
+    auto list_doc = json_parse(list_result);
+    REQUIRE(list_doc);
+    auto* list_root = list_doc.root();
+    CHECK(has_field(list_root, "total_candidates"));
+    CHECK(has_field(list_root, "filtered_hidden"));
+    CHECK(has_field(list_root, "hidden_public_count"));
+    CHECK(json_get_int(list_root, "filtered_hidden", -1) == 0);
+    CHECK(json_get_int(list_root, "hidden_public_count", -1) == 0);
+
+    auto path_result = call_symbols_in_path(db, R"({"path":".","limit":20})");
+    auto path_doc = json_parse(path_result);
+    REQUIRE(path_doc);
+    auto* path_root = path_doc.root();
+    CHECK(has_field(path_root, "total_candidates"));
+    CHECK(has_field(path_root, "filtered_hidden"));
+    CHECK(has_field(path_root, "hidden_public_count"));
+    CHECK(json_get_int(path_root, "filtered_hidden", -1) == 0);
+    CHECK(json_get_int(path_root, "hidden_public_count", -1) == 0);
+}
+
+TEST_CASE("explicit kind method keeps interface methods visible under min_span",
+          "[unit][lean-listing]") {
+    TestDb db;
+    db.root = fs::path("build") / "test_lean_listing" / "interface-methods";
+    cleanup(db.root);
+    fs::create_directories(db.root / "src");
+    db.db_path = db.root / "codetopo.sqlite";
+
+    {
+        Connection conn(db.db_path);
+        schema::ensure_schema(conn);
+        conn.exec("INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status) "
+                  "VALUES('src/router.ts', 'typescript', 1000, 1000000, 'router-hash', 'ok')");
+        int64_t file_id = sqlite3_last_insert_rowid(conn.raw());
+
+        auto insert_symbol = [&](const char* kind, const char* name, const char* qualname,
+                                 int start_line, int end_line) {
+            sqlite3_stmt* stmt = nullptr;
+            REQUIRE(sqlite3_prepare_v2(conn.raw(),
+                "INSERT INTO nodes(node_type, file_id, kind, name, qualname, start_line, end_line, "
+                "visibility, stable_key) VALUES('symbol', ?, ?, ?, ?, ?, ?, 'public', ?)",
+                -1, &stmt, nullptr) == SQLITE_OK);
+            sqlite3_bind_int64(stmt, 1, file_id);
+            sqlite3_bind_text(stmt, 2, kind, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 4, qualname, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(stmt, 5, start_line);
+            sqlite3_bind_int(stmt, 6, end_line);
+            std::string stable_key = std::string("src/router.ts::") + kind + "::" + qualname;
+            sqlite3_bind_text(stmt, 7, stable_key.c_str(), -1, SQLITE_TRANSIENT);
+            REQUIRE(sqlite3_step(stmt) == SQLITE_DONE);
+            sqlite3_finalize(stmt);
+        };
+
+        insert_symbol("interface", "IRouter", "IRouter", 1, 4);
+        insert_symbol("method", "route", "IRouter.route", 2, 2);
+        insert_symbol("method", "navigate", "IRouter.navigate", 3, 3);
+        schema::set_kv(conn, "schema_version", "1");
+        schema::set_kv(conn, "indexer_version", "test");
+        schema::set_kv(conn, "repo_root", db.root.string());
+        schema::set_kv(conn, "last_index_time", "2026-06-28T22:39:24-04:00");
+    }
+
+    auto result = call_symbol_list(db, R"({"kind":"method","min_span_lines":10,"limit":20})");
+    auto doc = json_parse(result);
+    REQUIRE(doc);
+    auto* root = doc.root();
+    auto* results = require_results(root);
+    CHECK(yyjson_arr_size(results) == 2);
+    CHECK(results_have_name(results, "route"));
+    CHECK(results_have_name(results, "navigate"));
+    CHECK(has_field(root, "total_candidates"));
+    CHECK(has_field(root, "filtered_hidden"));
+}

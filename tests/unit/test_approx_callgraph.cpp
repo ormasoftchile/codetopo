@@ -749,3 +749,43 @@ TEST_CASE("callers_approx does not boost ambiguous global receiver type hints",
     REQUIRE(json_get_str(typed_receiver, "heuristic") != nullptr);
     CHECK(std::string(json_get_str(typed_receiver, "heuristic")).find("cross_file_receiver_type") == std::string::npos);
 }
+
+TEST_CASE("callers and impact report unresolved receiver-type attribution",
+          "[unit][approx-callgraph]") {
+    auto db = make_approx_db("candidate-unresolved-receiver-type");
+
+    auto callers_result = invoke_callers_raw(db,
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"limit\":20,\"include_candidates\":true,\"mode\":\"exact_plus_candidates\","
+        "\"receiver\":\"LRUCache\"}");
+    auto callers_doc = json_parse(callers_result);
+    REQUIRE(callers_doc);
+    auto* callers_root = callers_doc.root();
+    CHECK(json_get_int(callers_root, "candidate_total", -1) > 0);
+    CHECK(json_get_int(callers_root, "candidate_eligible", -1) == 0);
+    CHECK(json_get_int(callers_root, "receiver_type_hits", -1) == 0);
+    REQUIRE(json_get_str(callers_root, "resolution_status") != nullptr);
+    CHECK(std::string(json_get_str(callers_root, "resolution_status")) == "unresolved");
+
+    auto impact_result = invoke_impact_of(db, db.ids.linked_set);
+    auto impact_doc = json_parse(impact_result);
+    REQUIRE(impact_doc);
+    CHECK(json_get_int(impact_doc.root(), "candidate_impacted_receiver_type_hits", -1) == 0);
+
+    Connection conn(db.db_path, true);
+    QueryCache cache(conn);
+    auto params_doc = json_parse(
+        "{\"node_id\":" + std::to_string(db.ids.linked_set) +
+        ",\"depth\":1,\"max_nodes\":20,\"include_candidates\":true,"
+        "\"mode\":\"exact_plus_candidates\",\"receiver\":\"LRUCache\"}");
+    REQUIRE(params_doc);
+    auto filtered_impact_result = tools::impact_of(params_doc.root(), conn, cache, db.root.string());
+    auto filtered_impact_doc = json_parse(filtered_impact_result);
+    REQUIRE(filtered_impact_doc);
+    auto* impact_root = filtered_impact_doc.root();
+    CHECK(json_get_int(impact_root, "candidate_impacted_total", -1) > 0);
+    CHECK(json_get_int(impact_root, "candidate_impacted_eligible", -1) == 0);
+    CHECK(json_get_int(impact_root, "candidate_impacted_receiver_type_hits", -1) == 0);
+    REQUIRE(json_get_str(impact_root, "candidate_impacted_resolution_status") != nullptr);
+    CHECK(std::string(json_get_str(impact_root, "candidate_impacted_resolution_status")) == "unresolved");
+}
