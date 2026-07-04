@@ -37,6 +37,33 @@ inline bool is_git_head_change(const fs::path& p) {
         || s.find(".git/refs/") != std::string::npos;
 }
 
+// Directories the watcher must never descend into or fire events for. Mirrors
+// Scanner::excluded_dirs() and additionally ignores `.codetopo` — the index DB
+// lives there, and re-indexing writes index.sqlite-wal/-shm, which would
+// otherwise register as changes and re-trigger the watcher in an endless
+// no-op loop. `.git` is pruned here too; branch switches are detected via an
+// explicit .git/HEAD stat instead.
+inline bool is_ignored_watch_dir(const std::string& name) {
+    static const std::unordered_set<std::string> dirs = {
+        ".git", ".codetopo", "build", "out", "node_modules",
+        "vcpkg", "vcpkg_installed", "vendor", "third_party",
+        "__pycache__", ".venv", "target"
+    };
+    if (dirs.count(name)) return true;
+    return name.size() >= 6 && name.compare(0, 6, "bazel-") == 0;
+}
+
+// True if any path component between root and full is an ignored watch dir.
+inline bool watch_path_ignored(const fs::path& root, const fs::path& full) {
+    std::error_code ec;
+    auto rel = fs::relative(full, root, ec);
+    if (ec) return false;
+    for (const auto& part : rel) {
+        if (is_ignored_watch_dir(part.string())) return true;
+    }
+    return false;
+}
+
 using WatchCallback = std::function<void(const std::vector<WatchEvent>&)>;
 
 class Watcher {
@@ -143,11 +170,20 @@ private:
                     reinterpret_cast<char*>(info) + info->NextEntryOffset);
             }
 
-            // Classify .git/HEAD and .git/refs/ changes as branch switches
+            // Classify .git/HEAD and .git/refs/ changes as branch switches, and
+            // drop events under ignored directories (.codetopo, .git, build, …)
+            // so the watcher never re-triggers on its own index DB writes.
+            std::vector<WatchEvent> filtered;
+            filtered.reserve(events.size());
             for (auto& ev : events) {
-                if (is_git_head_change(ev.path))
+                if (is_git_head_change(ev.path)) {
                     ev.type = FileEvent::BranchSwitch;
+                    filtered.push_back(ev);
+                } else if (!watch_path_ignored(root_, ev.path)) {
+                    filtered.push_back(ev);
+                }
             }
+            events.swap(filtered);
 
             // Debounce: wait for more events before dispatching
             std::this_thread::sleep_for(debounce_);
@@ -162,74 +198,80 @@ private:
     }
 #endif
 
+    // Enumerate regular files under root_, pruning ignored directories
+    // (.codetopo, .git, build, node_modules, …). Returns path → mtime.
+    std::unordered_map<std::string, fs::file_time_type> collect_files() {
+        std::unordered_map<std::string, fs::file_time_type> out;
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root_, fs::directory_options::skip_permission_denied, ec);
+        if (ec) return out;
+        fs::recursive_directory_iterator end;
+        for (; it != end; it.increment(ec)) {
+            if (ec) break;
+            const auto& entry = *it;
+            std::error_code fec;
+            if (entry.is_directory(fec)) {
+                if (is_ignored_watch_dir(entry.path().filename().string()))
+                    it.disable_recursion_pending();  // don't descend
+                continue;
+            }
+            if (entry.is_regular_file(fec)) {
+                auto mtime = entry.last_write_time(fec);
+                if (!fec) out[entry.path().string()] = mtime;
+            }
+        }
+        return out;
+    }
+
     // Polling fallback for non-Windows platforms
     void run_polling() {
-        std::unordered_map<std::string, fs::file_time_type> known_files;
+        auto known_files = collect_files();
 
-        // Initial scan
-        std::error_code ec;
-        for (auto& entry : fs::recursive_directory_iterator(root_, ec)) {
-            if (entry.is_regular_file(ec)) {
-                known_files[entry.path().string()] = entry.last_write_time(ec);
-            }
+        // Track .git/HEAD separately for branch-switch detection (the .git dir
+        // itself is pruned from collect_files()).
+        auto git_head = root_ / ".git" / "HEAD";
+        fs::file_time_type git_head_mtime{};
+        {
+            std::error_code ec;
+            if (fs::exists(git_head, ec)) git_head_mtime = fs::last_write_time(git_head, ec);
         }
 
         while (running_) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
 
             std::vector<WatchEvent> events;
-            std::unordered_set<std::string> current_files;
 
-            // Explicit .git/HEAD stat check for branch switch detection
+            // Branch-switch detection via explicit .git/HEAD stat.
             {
-                auto git_head = root_ / ".git" / "HEAD";
-                std::error_code ec2;
-                if (fs::exists(git_head, ec2)) {
-                    auto mtime = fs::last_write_time(git_head, ec2);
-                    if (!ec2) {
-                        auto key = git_head.string();
-                        auto it = known_files.find(key);
-                        if (it != known_files.end() && it->second != mtime) {
-                            events.push_back({FileEvent::BranchSwitch, git_head});
-                            it->second = mtime;
-                        } else if (it == known_files.end()) {
-                            known_files[key] = mtime;
-                        }
+                std::error_code ec;
+                if (fs::exists(git_head, ec)) {
+                    auto mtime = fs::last_write_time(git_head, ec);
+                    if (!ec && mtime != git_head_mtime) {
+                        events.push_back({FileEvent::BranchSwitch, git_head});
+                        git_head_mtime = mtime;
                     }
                 }
             }
 
-            for (auto& entry : fs::recursive_directory_iterator(root_, ec)) {
-                if (!entry.is_regular_file(ec)) continue;
-                auto path_str = entry.path().string();
-                current_files.insert(path_str);
+            auto current = collect_files();
 
-                auto mtime = entry.last_write_time(ec);
+            // Created / Modified
+            for (const auto& [path_str, mtime] : current) {
                 auto it = known_files.find(path_str);
                 if (it == known_files.end()) {
-                    events.push_back({FileEvent::Created, entry.path()});
-                    known_files[path_str] = mtime;
+                    events.push_back({FileEvent::Created, path_str});
                 } else if (it->second != mtime) {
-                    events.push_back({FileEvent::Modified, entry.path()});
-                    it->second = mtime;
+                    events.push_back({FileEvent::Modified, path_str});
                 }
             }
-
-            // Detect deletions
-            for (auto it = known_files.begin(); it != known_files.end();) {
-                if (!current_files.count(it->first)) {
-                    events.push_back({FileEvent::Deleted, it->first});
-                    it = known_files.erase(it);
-                } else {
-                    ++it;
-                }
+            // Deleted
+            for (const auto& [path_str, mtime] : known_files) {
+                (void)mtime;
+                if (!current.count(path_str))
+                    events.push_back({FileEvent::Deleted, path_str});
             }
 
-            // Classify .git/HEAD and .git/refs/ changes as branch switches
-            for (auto& ev : events) {
-                if (is_git_head_change(ev.path))
-                    ev.type = FileEvent::BranchSwitch;
-            }
+            known_files = std::move(current);
 
             if (!events.empty() && running_.load()) {
                 callback_(events);
