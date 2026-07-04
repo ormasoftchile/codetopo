@@ -154,16 +154,20 @@ int run_index(const Config& config) {
         ? "PRAGMA wal_checkpoint(PASSIVE)"
         : "PRAGMA wal_checkpoint(TRUNCATE)";
 
-    // Acquire lock (T014/FR-036)
+    // Acquire lock (T014/FR-036). Supervised children are spawned by a --watch
+    // MCP server that already holds this lock for its lifetime and serializes
+    // reindexes internally, so they must NOT re-acquire it (would self-deadlock).
     auto lock_path = db_path;
     lock_path += ".lock";
     FileLock lock(lock_path);
-    if (!lock.acquire()) {
-        std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid() << ")\n";
-        return 1;
-    }
-    if (lock.was_stale_broken()) {
-        std::cerr << "WARN: Broke stale lock from dead process\n";
+    if (!config.supervised) {
+        if (!lock.acquire()) {
+            std::cerr << "ERROR: Another indexer is running (PID " << lock.holder_pid() << ")\n";
+            return 1;
+        }
+        if (lock.was_stale_broken()) {
+            std::cerr << "WARN: Broke stale lock from dead process\n";
+        }
     }
 
     // Register arena allocator with Tree-sitter (T008)
