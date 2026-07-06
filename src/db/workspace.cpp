@@ -1159,7 +1159,7 @@ void WorkspaceDB::populate_content_fts_for_root(int64_t root_id, bool color_outp
                 "INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)");
             sqlite3_stmt* trk = nullptr;
             prepare_or_throw(conn_.raw(), &trk,
-                "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)");
+                "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)");
 
             for (const auto& [file_id, path] : files) {
                 std::ifstream f(path, std::ios::binary);
