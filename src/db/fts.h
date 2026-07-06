@@ -68,7 +68,7 @@ namespace content_fts {
 
 // Insert all lines of a file's content into content_fts using pre-prepared statements.
 // ins: INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)
-// trk: INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)  (may be nullptr)
+// trk: INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?,?,?)  (may be nullptr)
 // Skips lines with fewer than 3 alphanumeric characters (eliminates bracket-only,
 // punctuation-only, and trivial lines that add FTS overhead with zero search value).
 // Truncates lines longer than 200 chars (code_search reads full lines from disk).
@@ -76,6 +76,11 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
                          int64_t file_id, const std::string& content) {
     if (content.empty()) return;
 
+    // Capture the rowid range of the lines we insert so delete_file can later remove
+    // them by rowid (the only index-driven delete FTS5 contentless tables allow).
+    // Lines are inserted consecutively, so the file's rows form one contiguous block.
+    sqlite3* db = sqlite3_db_handle(ins);
+    int64_t min_rowid = 0, max_rowid = 0;
     bool any_inserted = false;
     int line_no = 1;
     size_t pos = 0;
@@ -103,6 +108,9 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
                 sqlite3_bind_int64(ins, 2, file_id);
                 sqlite3_bind_int(ins, 3, line_no);
                 sqlite3_step(ins);
+                int64_t rid = sqlite3_last_insert_rowid(db);
+                if (!any_inserted) min_rowid = rid;
+                max_rowid = rid;
                 any_inserted = true;
             }
         }
@@ -114,18 +122,55 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
     if (any_inserted && trk) {
         sqlite3_reset(trk);
         sqlite3_bind_int64(trk, 1, file_id);
+        sqlite3_bind_int64(trk, 2, min_rowid);
+        sqlite3_bind_int64(trk, 3, max_rowid);
         sqlite3_step(trk);
     }
 }
 
-// Delete all entries for a given file_id (used before re-inserting updated content)
+// Delete all entries for a given file_id (used before re-inserting updated content).
+// content_fts is a contentless FTS5 table with file_id UNINDEXED, so deleting by
+// file_id would scan the ENTIRE trigram index (every line of every file). Instead we
+// look up the file's stored rowid range (recorded by insert_lines) and delete by
+// rowid — the only index-driven delete FTS5 contentless tables support. A file's
+// lines are always inserted as one contiguous rowid block, so [min,max] is exact.
 inline void delete_file(Connection& conn, int64_t file_id) {
+    int64_t min_rowid = 0, max_rowid = 0;
+    bool have_range = false;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(),
+                "SELECT min_rowid, max_rowid FROM content_fts_tracker WHERE file_id = ?",
+                -1, &q, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(q, 1, file_id);
+            if (sqlite3_step(q) == SQLITE_ROW &&
+                sqlite3_column_type(q, 0) != SQLITE_NULL &&
+                sqlite3_column_type(q, 1) != SQLITE_NULL) {
+                min_rowid = sqlite3_column_int64(q, 0);
+                max_rowid = sqlite3_column_int64(q, 1);
+                have_range = true;
+            }
+        }
+        sqlite3_finalize(q);
+    }
+
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(conn.raw(),
-        "DELETE FROM content_fts WHERE file_id = ?", -1, &stmt, nullptr);
-    sqlite3_bind_int64(stmt, 1, file_id);
+    if (have_range) {
+        sqlite3_prepare_v2(conn.raw(),
+            "DELETE FROM content_fts WHERE rowid >= ? AND rowid <= ?", -1, &stmt, nullptr);
+        sqlite3_bind_int64(stmt, 1, min_rowid);
+        sqlite3_bind_int64(stmt, 2, max_rowid);
+    } else {
+        // Legacy fallback: rows indexed before rowid ranges were tracked (NULL range).
+        // This scans the FTS index once; the subsequent re-insert records a range so
+        // future deletes of this file are fast. A --force reindex populates all ranges.
+        sqlite3_prepare_v2(conn.raw(),
+            "DELETE FROM content_fts WHERE file_id = ?", -1, &stmt, nullptr);
+        sqlite3_bind_int64(stmt, 1, file_id);
+    }
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+
     // Remove from tracker
     sqlite3_stmt* trk = nullptr;
     sqlite3_prepare_v2(conn.raw(),
@@ -144,7 +189,7 @@ inline void insert_file(Connection& conn, int64_t file_id, const std::string& co
         -1, &ins, nullptr);
     sqlite3_stmt* trk = nullptr;
     sqlite3_prepare_v2(conn.raw(),
-        "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)",
+        "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)",
         -1, &trk, nullptr);
     insert_lines(ins, trk, file_id, content);
     sqlite3_finalize(ins);
@@ -156,7 +201,7 @@ inline void rebuild_from_disk(Connection& conn, const std::string& repo_root) {
     namespace fs = std::filesystem;
 
     conn.exec("INSERT INTO content_fts(content_fts) VALUES('delete-all')");
-    conn.exec("CREATE TABLE IF NOT EXISTS content_fts_tracker (file_id INTEGER PRIMARY KEY)");
+    conn.exec("CREATE TABLE IF NOT EXISTS content_fts_tracker (file_id INTEGER PRIMARY KEY, min_rowid INTEGER, max_rowid INTEGER)");
     conn.exec("DELETE FROM content_fts_tracker");
 
     sqlite3_stmt* stmt = nullptr;
@@ -171,7 +216,7 @@ inline void rebuild_from_disk(Connection& conn, const std::string& repo_root) {
 
     sqlite3_stmt* trk = nullptr;
     sqlite3_prepare_v2(conn.raw(),
-        "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)",
+        "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)",
         -1, &trk, nullptr);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -202,7 +247,7 @@ inline void rebuild_from_disk(Connection& conn, const std::string& repo_root) {
 inline int backfill_missing(Connection& conn, const std::string& repo_root) {
     namespace fs = std::filesystem;
 
-    conn.exec("CREATE TABLE IF NOT EXISTS content_fts_tracker (file_id INTEGER PRIMARY KEY)");
+    conn.exec("CREATE TABLE IF NOT EXISTS content_fts_tracker (file_id INTEGER PRIMARY KEY, min_rowid INTEGER, max_rowid INTEGER)");
 
     sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(conn.raw(),
@@ -218,7 +263,7 @@ inline int backfill_missing(Connection& conn, const std::string& repo_root) {
 
     sqlite3_stmt* trk = nullptr;
     sqlite3_prepare_v2(conn.raw(),
-        "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)",
+        "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)",
         -1, &trk, nullptr);
 
     int count = 0;

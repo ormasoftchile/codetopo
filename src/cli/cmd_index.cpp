@@ -885,7 +885,7 @@ int run_index(const Config& config) {
                 -1, &cfts_ins, nullptr);
             sqlite3_stmt* cfts_trk = nullptr;
             sqlite3_prepare_v2(conn.raw(),
-                "INSERT OR IGNORE INTO content_fts_tracker(file_id) VALUES(?)",
+                "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)",
                 -1, &cfts_trk, nullptr);
 
             const int fts_batch = 10000;
@@ -1022,7 +1022,15 @@ int run_index(const Config& config) {
         ScopedPhase _rr(profiler.resolve_refs);
         auto resolve_start = std::chrono::steady_clock::now();
         conn.exec("PRAGMA foreign_keys=OFF");
-        auto [refs_resolved, edges_created] = persister.resolve_references();
+        // Targeted/watch reindex: scope symbol lookup + ref resolution to the changed files'
+        // names, and skip the global name-match edge wipe, so a 1-file change resolves in
+        // seconds instead of reloading and re-resolving the whole graph.
+        std::vector<std::string> changed_paths;
+        if (targeted_mode) {
+            changed_paths.reserve(work_list.size());
+            for (const auto& f : work_list) changed_paths.push_back(f.relative_path);
+        }
+        auto [refs_resolved, edges_created] = persister.resolve_references(targeted_mode, changed_paths);
         conn.exec("PRAGMA foreign_keys=ON");
         auto resolve_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - resolve_start).count();

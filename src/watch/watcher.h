@@ -123,32 +123,71 @@ private:
 
         alignas(DWORD) char buffer[64 * 1024];
 
-        while (running_) {
-            DWORD bytes_returned = 0;
+        // Arm a single overlapped ReadDirectoryChangesW. Re-armed only AFTER a
+        // completion is consumed — never issue a second read while one is still
+        // outstanding on the same OVERLAPPED/buffer.
+        auto arm_read = [&]() -> bool {
             ResetEvent(overlapped.hEvent);
-
-            BOOL success = ReadDirectoryChangesW(
+            return ReadDirectoryChangesW(
                 dir_handle, buffer, sizeof(buffer), TRUE,
                 FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
                 FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_CREATION,
-                nullptr, &overlapped, nullptr
-            );
+                nullptr, &overlapped, nullptr) == TRUE;
+        };
 
-            if (!success) break;
+        if (!arm_read()) {
+            CloseHandle(overlapped.hEvent);
+            CloseHandle(dir_handle);
+            return;
+        }
 
-            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, 1000);
-            if (wait_result == WAIT_TIMEOUT) continue;
+        // Coalescing debounce: accumulate events across reads and only dispatch
+        // ONE batch after the filesystem has been quiet for `debounce_`. A branch
+        // switch (`git checkout`) writes many files over several seconds, producing
+        // many ReadDirectoryChangesW completions; without coalescing each one would
+        // fire its own reindex. We buffer them and flush a single combined batch
+        // once the churn settles, so a whole checkout maps to one reindex.
+        std::vector<WatchEvent> pending;
+        auto last_event_time = std::chrono::steady_clock::now();
+
+        while (running_) {
+            // Poll frequently while events are pending so we can detect the quiet
+            // period; wait longer when idle to stay cheap.
+            DWORD wait_ms = pending.empty() ? 1000 : 50;
+            DWORD wait_result = WaitForSingleObject(overlapped.hEvent, wait_ms);
+
+            if (wait_result == WAIT_TIMEOUT) {
+                // No new completion in this slice. If we have buffered events and
+                // the filesystem has stayed quiet for the full debounce window,
+                // dispatch the coalesced batch. The read stays armed meanwhile.
+                if (!pending.empty() && running_.load() &&
+                    (std::chrono::steady_clock::now() - last_event_time) >= debounce_) {
+                    std::vector<WatchEvent> batch;
+                    batch.swap(pending);
+                    callback_(batch);
+                }
+                continue;
+            }
             if (wait_result != WAIT_OBJECT_0) break;
 
+            DWORD bytes_returned = 0;
             if (!GetOverlappedResult(dir_handle, &overlapped, &bytes_returned, FALSE))
                 break;
 
-            if (bytes_returned == 0) continue;
+            if (bytes_returned == 0) {
+                // Notification buffer overflowed — the OS dropped the individual
+                // events (happens on very large bursts, e.g. a big checkout). Inject
+                // a synthetic BranchSwitch so the consumer re-derives the change set
+                // from `git diff` instead of a lossy partial list.
+                pending.push_back({FileEvent::BranchSwitch, root_ / ".git" / "HEAD"});
+                last_event_time = std::chrono::steady_clock::now();
+                if (!arm_read()) break;
+                continue;
+            }
 
-            // Parse the notification buffer
-            std::vector<WatchEvent> events;
+            // Parse the notification buffer, classifying and filtering as we go,
+            // appending survivors to the pending batch.
             auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
-
             while (true) {
                 std::wstring filename(info->FileName, info->FileNameLength / sizeof(WCHAR));
                 fs::path full_path = root_ / filename;
@@ -163,36 +202,27 @@ private:
                     default: type = FileEvent::Modified; break;
                 }
 
-                events.push_back({type, full_path});
+                // Classify .git/HEAD and .git/refs/ changes as branch switches, and
+                // drop events under ignored directories (.codetopo, .git, build, …)
+                // so the watcher never re-triggers on its own index DB writes.
+                if (is_git_head_change(full_path)) {
+                    pending.push_back({FileEvent::BranchSwitch, full_path});
+                } else if (!watch_path_ignored(root_, full_path)) {
+                    pending.push_back({type, full_path});
+                }
 
                 if (info->NextEntryOffset == 0) break;
                 info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
                     reinterpret_cast<char*>(info) + info->NextEntryOffset);
             }
 
-            // Classify .git/HEAD and .git/refs/ changes as branch switches, and
-            // drop events under ignored directories (.codetopo, .git, build, …)
-            // so the watcher never re-triggers on its own index DB writes.
-            std::vector<WatchEvent> filtered;
-            filtered.reserve(events.size());
-            for (auto& ev : events) {
-                if (is_git_head_change(ev.path)) {
-                    ev.type = FileEvent::BranchSwitch;
-                    filtered.push_back(ev);
-                } else if (!watch_path_ignored(root_, ev.path)) {
-                    filtered.push_back(ev);
-                }
-            }
-            events.swap(filtered);
-
-            // Debounce: wait for more events before dispatching
-            std::this_thread::sleep_for(debounce_);
-
-            if (!events.empty() && running_.load()) {
-                callback_(events);
-            }
+            // Fresh activity: reset the quiet-period timer and re-arm for the next
+            // burst. Dispatch happens later, once things settle (WAIT_TIMEOUT path).
+            last_event_time = std::chrono::steady_clock::now();
+            if (!arm_read()) break;
         }
 
+        CancelIo(dir_handle);
         CloseHandle(overlapped.hEvent);
         CloseHandle(dir_handle);
     }

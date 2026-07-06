@@ -237,6 +237,10 @@ inline void create_fts(Connection& conn) {
     )SQL");
 }
 
+// Forward declarations for schema introspection helpers defined further below.
+inline bool table_exists(Connection& conn, const char* table);
+inline bool table_has_column(Connection& conn, const char* table, const char* column);
+
 // Content FTS: trigram index for arbitrary substring search across source files.
 // Uses contentless-delete so we can update/delete without storing full content in SQLite.
 // file_id is UNINDEXED but stored (contentless_unindexed=1) for joining back to files table.
@@ -253,12 +257,29 @@ inline void create_content_fts(Connection& conn) {
         );
     )SQL");
     // Tracker table: contentless FTS5 tables cannot be scanned without MATCH,
-    // so we track which file_ids have been indexed in a regular table.
+    // so we track which file_ids have been indexed in a regular table. The
+    // min_rowid/max_rowid columns record each file's contiguous content_fts rowid
+    // block so delete_file can delete by rowid instead of scanning the whole index.
     conn.exec(R"SQL(
         CREATE TABLE IF NOT EXISTS content_fts_tracker (
-            file_id INTEGER PRIMARY KEY
+            file_id INTEGER PRIMARY KEY,
+            min_rowid INTEGER,
+            max_rowid INTEGER
         );
     )SQL");
+}
+
+// Idempotently add the min_rowid/max_rowid columns to content_fts_tracker for
+// databases created before rowid-range tracking existed. Follows the same
+// additive ALTER pattern as the other ensure_*_schema helpers (no version bump).
+inline void ensure_content_fts_tracker_rowid_schema(Connection& conn) {
+    if (!table_exists(conn, "content_fts_tracker")) return;
+    if (!table_has_column(conn, "content_fts_tracker", "min_rowid")) {
+        conn.exec("ALTER TABLE content_fts_tracker ADD COLUMN min_rowid INTEGER");
+    }
+    if (!table_has_column(conn, "content_fts_tracker", "max_rowid")) {
+        conn.exec("ALTER TABLE content_fts_tracker ADD COLUMN max_rowid INTEGER");
+    }
 }
 
 // Check schema version. Returns:
@@ -470,6 +491,7 @@ inline int ensure_schema(Connection& conn) {
 
     if (version == CURRENT_SCHEMA_VERSION) {
         ensure_nodes_fingerprint_schema(conn);
+        ensure_content_fts_tracker_rowid_schema(conn);
         return 0;  // Compatible
     }
 
@@ -594,6 +616,7 @@ inline int ensure_schema(Connection& conn) {
                 "FROM nodes WHERE node_type = 'symbol'");
         }
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
+        ensure_content_fts_tracker_rowid_schema(conn);
         return 0;
     }
 

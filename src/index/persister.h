@@ -545,7 +545,26 @@ public:
     // T039: Post-index cross-file reference resolution.
     // Uses in-memory hash map for O(N) resolution instead of O(N*M) correlated subqueries.
     // Returns {refs_resolved, edges_created}.
-    std::pair<int,int> resolve_references() {
+    //
+    // incremental=true (targeted/watch reindex): the DB always carries a large permanent
+    // backlog of unresolved refs (every external/stdlib symbol that never had a definition
+    // stays resolved_node_id IS NULL forever — millions of rows). Re-resolving that whole
+    // backlog on a 1-file save is what made targeted reindex take minutes. So in incremental
+    // mode we compute the EXACT set of ref ids to re-resolve, entirely index-driven, and
+    // never scan the NULL backlog:
+    //   affected_refs = { the changed files' OWN unresolved refs (via idx_refs_file_id) }
+    //               ∪ { repo-wide unresolved refs whose (kind,name) is attracted by a name
+    //                   the changed files (re)DEFINE (via idx_refs_kind_name) — this
+    //                   re-attaches incoming refs whose target node was just deleted → SET
+    //                   NULL, and picks up previously-unresolvable same-name refs too }
+    // Only those refs are re-resolved; symbols are loaded only for the affected refs' names
+    // plus their bare suffixes. We also (b) do NOT globally delete name-match edges — the
+    // cascade already removed exactly the edges touching the changed files, and surviving
+    // fan-out edges are preserved via a pre-seeded dedup set. changed_paths are the
+    // repo-relative paths of the re-persisted files. Full reindex (incremental=false) is
+    // unchanged: it loads every symbol and re-resolves the entire ref table.
+    std::pair<int,int> resolve_references(bool incremental = false,
+                                          const std::vector<std::string>& changed_paths = {}) {
         int total_resolved = 0;
         int edges_created = 0;
 
@@ -605,10 +624,133 @@ public:
         // used to resolve 'type_ref' refs so type usages become queryable references.
         std::unordered_map<std::string, ClassEntry> type_map;
 
+        // Incremental (targeted) mode: the unresolved-ref set spans the WHOLE repo (every
+        // external/stdlib symbol that never had a definition stays resolved_node_id IS NULL
+        // forever — millions of rows). Re-resolving that whole backlog on a 1-file save is
+        // what made targeted reindex take minutes. So we compute the EXACT set of ref ids to
+        // re-resolve, index-driven, and never touch the NULL backlog:
+        //   __ct_changed  : the changed files' repo-relative paths.
+        //   __ct_defnames : names the changed files define (definitions).
+        //   __ct_kinds    : the ref kinds that produce edges (call/include/inherit/type_ref).
+        //   __ct_affected : the ref ids to re-resolve =
+        //       (a) the changed files' own unresolved refs (via idx_refs_file_id), ∪
+        //       (c) repo-wide unresolved refs whose (kind,name) is attracted by a name the
+        //           changed files (re)define (via idx_refs_kind_name) — this re-attaches
+        //           incoming refs whose target was just deleted & SET NULL, and picks up
+        //           previously-unresolvable same-name refs.
+        //   __ct_want     : names of the affected refs ∪ bare suffixes — scopes the
+        //                   symbol_map load (find_cross_file_symbols does a bare-name lookup).
+        // Every population query is pinned with CROSS JOIN so the tiny temp table drives and
+        // refs is reached by idx_refs_file_id / idx_refs_kind_name / rowid — NEVER via
+        // idx_refs_resolved (which would drive from the whole NULL backlog). Verified with
+        // EXPLAIN QUERY PLAN against the DsMainDev index (no ANALYZE stats exist).
+        if (incremental) {
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_changed");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_defnames");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_kinds");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_affected");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_want");
+            conn_.exec("CREATE TEMP TABLE __ct_changed(path TEXT PRIMARY KEY)");
+            conn_.exec("CREATE TEMP TABLE __ct_defnames(name TEXT PRIMARY KEY)");
+            conn_.exec("CREATE TEMP TABLE __ct_kinds(kind TEXT PRIMARY KEY)");
+            conn_.exec("CREATE TEMP TABLE __ct_affected(id INTEGER PRIMARY KEY)");
+            conn_.exec("CREATE TEMP TABLE __ct_want(name TEXT PRIMARY KEY)");
+
+            conn_.exec("BEGIN TRANSACTION");
+            // 1. Changed file paths (tiny — one row per re-persisted file).
+            {
+                sqlite3_stmt* ins = nullptr;
+                sqlite3_prepare_v2(conn_.raw(),
+                    "INSERT OR IGNORE INTO temp.__ct_changed(path) VALUES(?)", -1, &ins, nullptr);
+                for (const auto& p : changed_paths) {
+                    sqlite3_reset(ins);
+                    sqlite3_bind_text(ins, 1, p.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_step(ins);
+                }
+                sqlite3_finalize(ins);
+            }
+            // The ref kinds that produce resolvable edges (used by the (c) attraction probe).
+            conn_.exec(
+                "INSERT OR IGNORE INTO temp.__ct_kinds(kind) "
+                "VALUES('call'),('include'),('inherit'),('type_ref')");
+            // 2. Names the changed files define. CROSS JOIN pins nodes last so it is probed
+            //    via idx_nodes_file_id from the tiny file set — never a full nodes scan.
+            conn_.exec(
+                "INSERT OR IGNORE INTO temp.__ct_defnames(name) "
+                "SELECT DISTINCT n.name FROM temp.__ct_changed c "
+                "JOIN files f ON f.path = c.path "
+                "CROSS JOIN nodes n "
+                "WHERE n.file_id = f.id AND n.node_type = 'symbol' "
+                "AND n.is_definition = 1 AND n.name IS NOT NULL");
+            // 3a. (a) The changed files' OWN unresolved refs. CROSS JOIN pins __ct_changed
+            //     first so refs is reached via idx_refs_file_id (NOT idx_refs_resolved).
+            conn_.exec(
+                "INSERT OR IGNORE INTO temp.__ct_affected(id) "
+                "SELECT r.id FROM temp.__ct_changed c "
+                "CROSS JOIN files f ON f.path = c.path "
+                "CROSS JOIN refs r ON r.file_id = f.id "
+                "WHERE r.resolved_node_id IS NULL");
+            // 3b. (c) Repo-wide unresolved refs attracted by a name the changed files
+            //     (re)define. idx_refs_kind_name makes each (kind,name) probe index-driven,
+            //     so this is bounded by (def-names × 4 kinds), never the NULL backlog.
+            conn_.exec(
+                "INSERT OR IGNORE INTO temp.__ct_affected(id) "
+                "SELECT r.id FROM temp.__ct_defnames d "
+                "CROSS JOIN temp.__ct_kinds k "
+                "CROSS JOIN refs r ON r.kind = k.kind AND r.name = d.name "
+                "WHERE r.resolved_node_id IS NULL");
+            // 4. want = names of the affected refs ∪ their bare suffixes. Collect names first
+            //    (CROSS JOIN pins __ct_affected → refs by rowid), then add suffixes.
+            std::vector<std::string> affected_names;
+            {
+                sqlite3_stmt* qn = nullptr;
+                sqlite3_prepare_v2(conn_.raw(),
+                    "SELECT DISTINCT r.name FROM temp.__ct_affected a "
+                    "CROSS JOIN refs r ON r.id = a.id WHERE r.name IS NOT NULL",
+                    -1, &qn, nullptr);
+                while (qn && sqlite3_step(qn) == SQLITE_ROW) {
+                    const char* nm = reinterpret_cast<const char*>(sqlite3_column_text(qn, 0));
+                    if (nm) affected_names.emplace_back(nm);
+                }
+                sqlite3_finalize(qn);
+            }
+            {
+                sqlite3_stmt* insw = nullptr;
+                sqlite3_prepare_v2(conn_.raw(),
+                    "INSERT OR IGNORE INTO temp.__ct_want(name) VALUES(?)", -1, &insw, nullptr);
+                auto want_add = [&](const std::string& s) {
+                    sqlite3_reset(insw);
+                    sqlite3_bind_text(insw, 1, s.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_step(insw);
+                };
+                for (const auto& full : affected_names) {
+                    want_add(full);
+                    size_t suffix = std::string::npos;
+                    if (size_t p = full.rfind('.'); p != std::string::npos) suffix = p + 1;
+                    if (size_t p = full.rfind("::"); p != std::string::npos &&
+                        (suffix == std::string::npos || p + 2 > suffix)) suffix = p + 2;
+                    if (size_t p = full.rfind("->"); p != std::string::npos &&
+                        (suffix == std::string::npos || p + 2 > suffix)) suffix = p + 2;
+                    if (suffix != std::string::npos && suffix < full.size()) {
+                        want_add(full.substr(suffix));
+                    }
+                }
+                sqlite3_finalize(insw);
+            }
+            conn_.exec("COMMIT");
+        }
+
         {
             sqlite3_stmt* stmt = nullptr;
             sqlite3_prepare_v2(conn_.raw(),
-                "SELECT id, name, file_id, is_definition, kind FROM nodes WHERE node_type = 'symbol'",
+                incremental
+                    // Scoped to names referenced/defined by the changed files. CROSS JOIN
+                    // pins the tiny temp table as the outer driver (no ANALYZE stats exist,
+                    // so the planner would otherwise scan every symbol node).
+                    ? "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind "
+                      "FROM temp.__ct_want w CROSS JOIN nodes n "
+                      "ON n.name = w.name AND n.node_type = 'symbol'"
+                    : "SELECT id, name, file_id, is_definition, kind FROM nodes WHERE node_type = 'symbol'",
                 -1, &stmt, nullptr);
 
             int loaded = 0;
@@ -724,8 +866,15 @@ public:
         // Scan all unresolved refs and resolve, collecting edge tuples in memory
         sqlite3_stmt* ref_stmt = nullptr;
         sqlite3_prepare_v2(conn_.raw(),
-            "SELECT id, file_id, kind, name, containing_node_id, receiver_type_hint "
-            "FROM refs WHERE resolved_node_id IS NULL",
+            incremental
+                // Re-resolve ONLY the pre-computed affected ref ids. CROSS JOIN pins the tiny
+                // __ct_affected as the driver so refs is reached by rowid — the repo-wide NULL
+                // backlog is never scanned. (Verified index-driven via EXPLAIN QUERY PLAN.)
+                ? "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint "
+                  "FROM temp.__ct_affected a CROSS JOIN refs r ON r.id = a.id "
+                  "WHERE r.resolved_node_id IS NULL"
+                : "SELECT id, file_id, kind, name, containing_node_id, receiver_type_hint "
+                  "FROM refs WHERE resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
         // Edge tuples collected during resolution — avoids expensive SQL join in Step 6
@@ -739,6 +888,34 @@ public:
         edge_tuples.reserve(1000000);
         std::unordered_set<std::string> seen_edge_keys;
         seen_edge_keys.reserve(1000000);
+
+        // Incremental mode skips the global name-match edge wipe below. The cascade delete
+        // already removed every edge touching the re-persisted files. Some name-match edges
+        // from the source nodes we're about to re-resolve SURVIVED (e.g. call fan-out edges
+        // whose target is in an unchanged file). Pre-seed the dedup set with them so we do
+        // not insert duplicates when those refs are re-resolved.
+        if (incremental) {
+            sqlite3_stmt* pe = nullptr;
+            sqlite3_prepare_v2(conn_.raw(),
+                "SELECT e.src_id, e.dst_id, e.kind FROM edges e "
+                "WHERE e.evidence = 'name-match' AND e.src_id IN ("
+                "  SELECT COALESCE(r.containing_node_id, fn.id) "
+                "  FROM temp.__ct_affected a CROSS JOIN refs r ON r.id = a.id "
+                "  LEFT JOIN files f ON f.id = r.file_id "
+                "  LEFT JOIN nodes fn ON fn.node_type = 'file' AND fn.name = f.path "
+                "  WHERE r.resolved_node_id IS NULL)",
+                -1, &pe, nullptr);
+            while (pe && sqlite3_step(pe) == SQLITE_ROW) {
+                std::string key = std::to_string(sqlite3_column_int64(pe, 0));
+                key.push_back('|');
+                key += std::to_string(sqlite3_column_int64(pe, 1));
+                key.push_back('|');
+                const char* k = reinterpret_cast<const char*>(sqlite3_column_text(pe, 2));
+                if (k) key += k;
+                seen_edge_keys.insert(std::move(key));
+            }
+            sqlite3_finalize(pe);
+        }
 
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
@@ -957,7 +1134,7 @@ public:
         // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
         // Without a unique constraint, re-runs would accumulate duplicate edges.
         // Delete only resolver-created edges (confidence=0.7, name-match evidence).
-        if (!cold_index_) {
+        if (!cold_index_ && !incremental) {
             std::cerr << "  " << stderr_bold("Clearing old cross-ref edges...", color_output) << "\n";
             conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
         }
@@ -1027,6 +1204,14 @@ public:
         sqlite3_finalize(single_edge_stmt);
         std::cerr << "  Created " << stderr_cyan(format_with_commas(edges_created), color_output)
                   << " edges\n";
+
+        if (incremental) {
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_changed");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_defnames");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_kinds");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_affected");
+            conn_.exec("DROP TABLE IF EXISTS temp.__ct_want");
+        }
 
         conn_.exec("PRAGMA foreign_keys = ON");
         return {total_resolved, edges_created};
