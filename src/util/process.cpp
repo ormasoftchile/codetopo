@@ -45,6 +45,7 @@ std::string get_self_executable_path() {
 }
 
 int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args) {
+    const auto started = std::chrono::steady_clock::now();
 #ifdef _WIN32
     // Build command line
     std::string cmdline = "\"" + exe + "\"";
@@ -66,31 +67,51 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
         SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
     }
 
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
-
-    // Spawn WITHOUT inheriting handles (bInheritHandles = FALSE). Rationale:
-    //  * MCP correctness: when the parent is the MCP server, its stdin carries
-    //    JSON-RPC and the child must never consume it. A non-inheriting spawn
-    //    guarantees that without handing the child an explicit NUL stdin.
-    //  * Robustness: STARTF_USESTDHANDLES requires every std handle to be valid
-    //    AND inheritable, else CreateProcess fails with ERROR_INVALID_PARAMETER
-    //    (87). That happens whenever codetopo itself runs with redirected/absent
-    //    streams (under ctest, `>NUL`, or as a service) — exactly how the
-    //    supervised reindex worker is launched. The supervisor only needs the
-    //    child's exit code, so inheriting std handles buys nothing.
-    // The child is still bound to the supervisor's lifetime via the kill-on-close
-    // job object created above.
+    STARTUPINFOEXA si = {};
+    si.StartupInfo.cb = sizeof(STARTUPINFOA);
+    HANDLE child_input = nullptr, input_writer = nullptr, child_log = nullptr;
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    bool redirect = CreatePipe(&child_input, &input_writer, &security, 0) &&
+        DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
+            GetCurrentProcess(), &child_log, 0, TRUE, DUPLICATE_SAME_ACCESS);
+    if (input_writer) CloseHandle(input_writer); // Child sees EOF, never MCP input.
+    SIZE_T attribute_size = 0;
+    std::vector<unsigned char> attribute_storage;
+    bool attributes_initialized = false;
+    HANDLE inherited[] = {child_input, child_log};
+    if (redirect) {
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+        attribute_storage.resize(attribute_size);
+        si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage.data());
+        attributes_initialized = InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attribute_size);
+        redirect = attributes_initialized && UpdateProcThreadAttribute(si.lpAttributeList, 0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr);
+        if (redirect) {
+            si.StartupInfo.cb = sizeof(si);
+            si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            si.StartupInfo.hStdInput = child_input;
+            si.StartupInfo.hStdOutput = child_log;
+            si.StartupInfo.hStdError = child_log;
+        }
+    }
+    // Inherit only EOF input and stderr diagnostics, never MCP stdout or other handles.
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
-                        FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-        std::cerr << "ERROR: Failed to spawn child process (error " << GetLastError() << ")\n";
+    bool spawned = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
+        redirect, CREATE_SUSPENDED | (redirect ? EXTENDED_STARTUPINFO_PRESENT : 0),
+        nullptr, nullptr, &si.StartupInfo, &pi);
+    DWORD spawn_error = spawned ? 0 : GetLastError();
+    if (attributes_initialized) DeleteProcThreadAttributeList(si.lpAttributeList);
+    if (child_input) CloseHandle(child_input);
+    if (child_log) CloseHandle(child_log);
+    if (!spawned) {
+        std::cerr << "ERROR: Failed to spawn child process (error " << spawn_error << ")\n";
         if (hJob) CloseHandle(hJob);
         return 1;
     }
 
     // Assign to job object before resuming
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
+    std::cerr << "[child] started pid=" << pi.dwProcessId << "\n";
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
@@ -100,6 +121,9 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     if (hJob) CloseHandle(hJob);
+    std::cerr << "[child] exited pid=" << pi.dwProcessId << " exit=" << static_cast<int>(exit_code)
+              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - started).count() << "\n";
 
     return static_cast<int>(exit_code);
 
@@ -111,15 +135,24 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     for (const auto& arg : args) argv.push_back(arg.c_str());
     argv.push_back(nullptr);
 
-    int rc = posix_spawn(&pid, exe.c_str(), nullptr, nullptr,
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
+    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
                          const_cast<char* const*>(argv.data()), environ);
+    posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         std::cerr << "ERROR: posix_spawn failed (rc=" << rc << ")\n";
         return 1;
     }
 
     int status = 0;
+    std::cerr << "[child] started pid=" << pid << "\n";
     waitpid(pid, &status, 0);
+    std::cerr << "[child] exited pid=" << pid << " wait_status=" << status
+              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - started).count() << "\n";
 
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);  // Convention: 128+signal
@@ -144,8 +177,13 @@ int spawn_and_wait_with_stall_timeout(
     for (const auto& arg : args) argv.push_back(arg.c_str());
     argv.push_back(nullptr);
 
-    int rc = posix_spawn(&pid, exe.c_str(), nullptr, nullptr,
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
+    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
                          const_cast<char* const*>(argv.data()), environ);
+    posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         std::cerr << "ERROR: posix_spawn failed (rc=" << rc << ")\n";
         return 1;
@@ -155,6 +193,7 @@ int spawn_and_wait_with_stall_timeout(
     // We only reset the stall clock when the mtime actually CHANGES.
     std::filesystem::file_time_type last_known_mtime = {};
     auto start_time = std::chrono::steady_clock::now();
+    std::cerr << "[child] started pid=" << pid << "\n";
     auto last_progress_seen = start_time;
     const auto stall_limit = std::chrono::seconds(stall_timeout_s);
 
@@ -163,6 +202,9 @@ int spawn_and_wait_with_stall_timeout(
         int status = 0;
         pid_t result = waitpid(pid, &status, WNOHANG);
         if (result == pid) {
+            std::cerr << "[child] exited pid=" << pid << " wait_status=" << status
+                      << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start_time).count() << "\n";
             if (WIFEXITED(status)) return WEXITSTATUS(status);
             if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
             return 1;

@@ -435,26 +435,7 @@ inline void ensure_nodes_fingerprint_schema(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
 }
 
-// Drop secondary indexes for bulk loading. Leaves PRIMARY KEY and UNIQUE constraints.
-inline void drop_bulk_indexes(Connection& conn) {
-    conn.exec("DROP INDEX IF EXISTS idx_files_content_hash");
-    conn.exec("DROP INDEX IF EXISTS idx_files_root");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_file_id");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_type_kind_name");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_qualname");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_name_type");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_fingerprint");
-    conn.exec("DROP INDEX IF EXISTS idx_refs_file_id");
-    conn.exec("DROP INDEX IF EXISTS idx_refs_kind_name");
-    conn.exec("DROP INDEX IF EXISTS idx_refs_resolved");
-    conn.exec("DROP INDEX IF EXISTS idx_refs_containing");
-    conn.exec("DROP INDEX IF EXISTS idx_edges_src");
-    conn.exec("DROP INDEX IF EXISTS idx_edges_dst");
-    conn.exec("DROP INDEX IF EXISTS idx_edges_dst_conf");
-    conn.exec("DROP INDEX IF EXISTS idx_nodes_stable_key");
-}
-
-// Rebuild secondary indexes after bulk loading.
+// Restore secondary indexes without invalidating concurrent readers.
 inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_root ON files(root_id)");

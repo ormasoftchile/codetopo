@@ -5,6 +5,9 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <atomic>
+#include <barrier>
+#include <thread>
 
 namespace fs = std::filesystem;
 using namespace codetopo;
@@ -58,6 +61,7 @@ TEST_CASE("Lock breaks stale lock from dead PID", "[unit][lock]") {
     REQUIRE(lock.acquire());
     REQUIRE(lock.was_stale_broken());
 
+    lock.release();
     fs::remove_all(tmp);
 }
 
@@ -79,6 +83,7 @@ TEST_CASE("Blocking acquire breaks stale lock immediately", "[unit][lock]") {
     REQUIRE(lock.was_stale_broken());
     REQUIRE(elapsed < std::chrono::seconds(1));
 
+    lock.release();
     fs::remove_all(tmp);
 }
 
@@ -110,5 +115,31 @@ TEST_CASE("Blocking acquire waits for live holder then times out", "[unit][lock]
         REQUIRE(elapsed < std::chrono::seconds(2));
     }
 
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("Simultaneous writer admission has exactly one owner", "[unit][lock][workspace]") {
+    auto tmp = lock_test_dir("atomic_admission");
+    for (int iteration = 0; iteration < 20; ++iteration) {
+        auto path = tmp / ("race-" + std::to_string(iteration) + ".lock");
+        std::barrier rendezvous(3);
+        std::atomic<int> admitted{0};
+        auto compete = [&] {
+            FileLock lock(path);
+            rendezvous.arrive_and_wait();
+            if (lock.acquire()) ++admitted;
+            rendezvous.arrive_and_wait();
+            rendezvous.arrive_and_wait();
+        };
+        std::thread first(compete), second(compete);
+        rendezvous.arrive_and_wait();
+        rendezvous.arrive_and_wait();
+        auto owners = admitted.load();
+        rendezvous.arrive_and_wait();
+        first.join();
+        second.join();
+        REQUIRE(owners == 1);
+        REQUIRE_FALSE(fs::exists(path));
+    }
     fs::remove_all(tmp);
 }

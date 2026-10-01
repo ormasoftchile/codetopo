@@ -41,7 +41,7 @@ struct Config {
 
     // MCP server settings
     int tool_timeout_s = 10;
-    int idle_timeout_s = 1800;  // 30 minutes
+    int idle_timeout_s = 0;  // Editor stdio sessions live until EOF by default.
     FreshnessPolicy freshness = FreshnessPolicy::normal;
     int debounce_ms = 1000;
 

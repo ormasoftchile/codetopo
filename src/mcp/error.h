@@ -43,6 +43,8 @@ struct McpError {
 
         auto* data = doc.new_obj();
         yyjson_mut_obj_add_strcpy(doc.doc, data, "error_code", error_code.c_str());
+        if (error_code == "busy")
+            yyjson_mut_obj_add_bool(doc.doc, data, "retryable", true);
         yyjson_mut_obj_add_val(doc.doc, err, "data", data);
 
         yyjson_mut_obj_add_val(doc.doc, root, "error", err);

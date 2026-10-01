@@ -1,6 +1,6 @@
 // Multi-root workspace database implementation.
 // Merges per-root index.sqlite databases directly into the main index.sqlite
-// with globally unique node IDs (root_id * 10^9 + local_id) and absolute file paths.
+// with transaction-allocated IDs and absolute file paths.
 // Uses identical table names so the MCP server works unchanged.
 
 #include "db/workspace.h"
@@ -9,6 +9,7 @@
 #include "index/supervisor.h"
 #include "util/log.h"
 #include "util/repo.h"
+#include "util/lock.h"
 #include <sqlite3.h>
 #include <algorithm>
 #include <cctype>
@@ -23,11 +24,9 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <limits>
 
 namespace codetopo {
-
-// ID re-keying constant: each root gets a 10^9 ID space.
-static constexpr int64_t ID_SPACE = 1000000000LL;
 
 namespace {
 
@@ -96,7 +95,9 @@ void prepare_or_throw(sqlite3* db, sqlite3_stmt** stmt, const std::string& sql) 
 void step_done_or_throw(sqlite3* db, sqlite3_stmt* stmt, const std::string& context) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
-        throw std::runtime_error(sqlite_error(db, context));
+        const auto message = sqlite_error(db, context);
+        sqlite3_finalize(stmt);
+        throw SqliteError(rc, message);
     }
 }
 
@@ -183,12 +184,9 @@ bool exists_int64_range(Connection& conn, const std::string& sql,
 }
 
 int64_t count_edges_for_root(Connection& conn, int64_t root_id) {
-    int64_t offset = root_id * ID_SPACE;
     sqlite3_stmt* stmt = nullptr;
     prepare_or_throw(conn.raw(), &stmt,
-        "SELECT COUNT(*) FROM edges WHERE src_id >= ? AND src_id < ?");
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, offset + ID_SPACE);
+        "SELECT " + workspace_edge_count_sql(std::to_string(root_id)));
     int64_t count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         count = sqlite3_column_int64(stmt, 0);
@@ -305,7 +303,8 @@ void WorkspaceDB::ensure_schema() {
     resume_pending_content_fts();
 }
 
-WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const Config& cfg) {
+WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const Config& cfg,
+    bool refresh, const std::function<void(const std::string&)>& phase) {
     namespace fs = std::filesystem;
     const auto overall_phase = WorkspaceClock::now();
     const bool color_output = stderr_is_tty();
@@ -317,39 +316,52 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
     // Ensure the root is indexed (run supervisor if index.sqlite missing)
     std::string root_index = default_db(abs_root);
-    if (!fs::exists(root_index)) {
+    if (refresh || !fs::exists(root_index)) {
+        if (phase) phase("indexing_extra_root");
         std::cerr << "Indexing " << abs_root << "...\n";
         Config index_cfg = cfg;
         index_cfg.repo_root = abs_root;
         index_cfg.db_path = root_index;
+        index_cfg.force_reindex = false;
+        index_cfg.only_files.clear();
+        index_cfg.changed_file_lists.clear();
         ensure_codetopo_dir(abs_root);
         int rc = run_index_supervisor(index_cfg);
-        if (rc != 0 && rc != 1) {
+        if (rc != 0) {
             throw std::runtime_error("Failed to index root: " + abs_root + " (exit " + std::to_string(rc) + ")");
         }
     }
 
-    // Checkpoint WAL on source DB so ATTACH gets a clean read
-    {
-        sqlite3* src_db = nullptr;
-        if (sqlite3_open_v2(root_index.c_str(), &src_db,
-                            SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK) {
-            sqlite3_busy_timeout(src_db, 30000);
-            sqlite3_exec(src_db, "PRAGMA wal_checkpoint(TRUNCATE)", nullptr, nullptr, nullptr);
-            sqlite3_close(src_db);
-        }
-    }
+    // Cached and freshly indexed sources need the same admission through DETACH.
+    FileLock source_writer(root_index + ".lock");
+    if (!source_writer.acquire())
+        throw std::runtime_error("Source index busy: another indexer holds the writer lock");
+    if (phase) phase("merging");
+
+    // ATTACH reads the source WAL snapshot; no blocking truncation is required.
 
     ScopedWorkspacePragmas bulk_pragmas(conn_, cfg.turbo);
 
     // ATTACH source DB BEFORE the transaction (SQLite disallows ATTACH inside exclusive tx)
     std::string attach_sql = "ATTACH DATABASE " + sql_quote(root_index) + " AS src";
     conn_.exec(attach_sql);
+    try {
+        sqlite3_stmt* source_scope = nullptr;
+        prepare_or_throw(conn_.raw(), &source_scope,
+            "SELECT 1 FROM src.roots LIMIT 1");
+        bool nested_workspace = sqlite3_step(source_scope) == SQLITE_ROW;
+        sqlite3_finalize(source_scope);
+        if (nested_workspace)
+            throw std::runtime_error("Source index contains extra workspace roots; use a standalone extra-root index");
+    } catch (...) {
+        conn_.exec("DETACH DATABASE src");
+        throw;
+    }
 
     // Insert root (or get existing)
     int64_t root_id = 0;
-    conn_.exec("BEGIN EXCLUSIVE");
     try {
+        conn_.exec("BEGIN EXCLUSIVE");
         conn_.exec("PRAGMA defer_foreign_keys=ON");
 
         sqlite3_stmt* stmt = nullptr;
@@ -378,67 +390,12 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
         // pay per-row FTS trigger cost. Rollback restores the pre-merge trigger state.
         fts::drop_sync_triggers(conn_);
 
-        int64_t offset = root_id * ID_SPACE;
-        bool had_nodes = exists_int64_range(conn_,
-            "SELECT 1 FROM nodes WHERE id >= ? AND id < ? LIMIT 1",
-            offset, offset + ID_SPACE, true);
-        bool had_files = exists_int64_range(conn_,
-            "SELECT 1 FROM files WHERE root_id = ? LIMIT 1",
-            root_id);
-
-        if (had_nodes) {
-            std::string fts_del =
-                "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc) "
-                "SELECT 'delete', id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
-                "WHERE node_type = 'symbol' AND id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
-            conn_.exec(fts_del);
-
-            // Delete all nodes in this root's ID range (covers file-type nodes which
-            // have file_id=NULL and are NOT cascade-deleted when files are removed).
-            std::string del_nodes =
-                "DELETE FROM nodes WHERE id >= " + std::to_string(offset) +
-                " AND id < " + std::to_string(offset + ID_SPACE);
-            conn_.exec(del_nodes);
-        }
-
-        if (had_files) {
-            // Clear content_fts only when this root actually had indexed content.
-            // file_id is UNINDEXED in FTS5; skipping this scan on first-add avoids
-            // walking the existing workspace content index just to delete zero rows.
-            bool had_content = exists_int64_range(conn_,
-                "SELECT 1 FROM content_fts_tracker WHERE file_id >= ? AND file_id < ? LIMIT 1",
-                offset, offset + ID_SPACE, true);
-            if (had_content) {
-                conn_.exec("DELETE FROM content_fts WHERE file_id >= " + std::to_string(offset) +
-                    " AND file_id < " + std::to_string(offset + ID_SPACE));
-                conn_.exec("DELETE FROM content_fts_tracker WHERE file_id >= " + std::to_string(offset) +
-                    " AND file_id < " + std::to_string(offset + ID_SPACE));
-            }
-
-            // Delete files for this root (cascades symbol nodes, edges, refs via FK).
-            stmt = nullptr;
-            prepare_or_throw(conn_.raw(), &stmt,
-                "DELETE FROM files WHERE root_id = ?");
-            sqlite3_bind_int64(stmt, 1, root_id);
-            step_done_or_throw(conn_.raw(), stmt, "Delete workspace files failed");
-            sqlite3_finalize(stmt);
-        }
-
-        // Maintaining secondary indexes per copied row is expensive for large roots.
-        // Drop/rebuild them inside this transaction so crash rollback restores them.
-        log_workspace_line("dropping indexes...", color_output);
-        auto drop_phase = WorkspaceClock::now();
-        schema::drop_bulk_indexes(conn_);
-        log_workspace_phase("indexes dropped", drop_phase, color_output);
+        clear_root_rows(root_id);
 
         // Merge from the already-attached src DB
         log_workspace_line("merging from src...", color_output);
         merge_root_attached(root_id, abs_root, color_output);
 
-        auto index_phase = WorkspaceClock::now();
-        log_workspace_line("rebuilding indexes...", color_output);
-        schema::rebuild_indexes(conn_);
-        log_workspace_phase("indexes rebuilt", index_phase, color_output);
         auto cross_root_phase = WorkspaceClock::now();
         log_workspace_line("resolving cross-root refs...", color_output);
         resolve_workspace_refs(root_id);
@@ -451,21 +408,16 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
             conn_.exec("DELETE FROM kv WHERE key = " + sql_quote(content_pending_key));
         }
 
-        int fk_violations = conn_.foreign_key_check();
-        if (fk_violations != 0) {
-            throw std::runtime_error("Workspace merge failed foreign_key_check: " +
-                                     std::to_string(fk_violations) + " violations");
-        }
-
         conn_.exec("COMMIT");
     } catch (...) {
-        conn_.exec("ROLLBACK");
+        if (!sqlite3_get_autocommit(conn_.raw())) conn_.exec("ROLLBACK");
         conn_.exec("DETACH DATABASE src");
         throw;
     }
 
     // DETACH AFTER commit (outside transaction)
     conn_.exec("DETACH DATABASE src");
+    source_writer.release();
     conn_.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 
     // Content FTS is intentionally populated after the structural merge in
@@ -502,7 +454,7 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
     stmt = nullptr;
     sqlite3_prepare_v2(conn_.raw(),
-        "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = ?", -1, &stmt, nullptr);
+        "SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id = f.id WHERE f.root_id = ?", -1, &stmt, nullptr);
     sqlite3_bind_int64(stmt, 1, root_id);
     if (sqlite3_step(stmt) == SQLITE_ROW) result.symbols = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
@@ -521,17 +473,9 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     if (sqlite3_step(stmt) == SQLITE_ROW) result.files_total = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
 
-    stmt = nullptr;
-    sqlite3_prepare_v2(conn_.raw(),
-        "SELECT COUNT(*) FROM nodes WHERE file_id IS NOT NULL", -1, &stmt, nullptr);
-    if (sqlite3_step(stmt) == SQLITE_ROW) result.symbols_total = sqlite3_column_int64(stmt, 0);
-    sqlite3_finalize(stmt);
-
-    stmt = nullptr;
-    sqlite3_prepare_v2(conn_.raw(),
-        "SELECT COUNT(*) FROM edges", -1, &stmt, nullptr);
-    if (sqlite3_step(stmt) == SQLITE_ROW) result.edges_total = sqlite3_column_int64(stmt, 0);
-    sqlite3_finalize(stmt);
+    // Global graph counts are deliberately not collected during a scoped merge.
+    result.symbols_total = -1;
+    result.edges_total = -1;
 
     stmt = nullptr;
     sqlite3_prepare_v2(conn_.raw(),
@@ -549,8 +493,8 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
             << stderr_bold_green("✓ done", color_output)
             << " — " << format_with_commas(result.roots_total) << " roots | "
             << format_with_commas(result.files_total) << " files | "
-            << format_with_commas(result.symbols_total) << " nodes | "
-            << format_with_commas(result.edges_total) << " edges | "
+            << format_with_commas(result.symbols) << " root nodes | "
+            << format_with_commas(result.edges) << " root edges | "
             << format_with_commas(result.http_call_refs) << " http refs  ("
             << stderr_cyan(format_seconds(overall_phase) + "s total", color_output) << ")";
     std::cerr << summary.str() << "\n";
@@ -575,8 +519,6 @@ WorkspaceDB::RemoveResult WorkspaceDB::remove_root(const std::string& root_path)
     }
     sqlite3_finalize(stmt);
 
-    int64_t offset = root_id * ID_SPACE;
-
     if (root_id == 0) {
         std::cerr << stderr_yellow("WARNING: Root not found in workspace: " + abs_root,
                                    stderr_is_tty())
@@ -594,7 +536,7 @@ WorkspaceDB::RemoveResult WorkspaceDB::remove_root(const std::string& root_path)
 
     stmt = nullptr;
     sqlite3_prepare_v2(conn_.raw(),
-        "SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = ?", -1, &stmt, nullptr);
+        "SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id = f.id WHERE f.root_id = ?", -1, &stmt, nullptr);
     sqlite3_bind_int64(stmt, 1, root_id);
     if (sqlite3_step(stmt) == SQLITE_ROW) result.symbols = sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
@@ -607,29 +549,7 @@ WorkspaceDB::RemoveResult WorkspaceDB::remove_root(const std::string& root_path)
         // perform one FTS delete per node after the bulk delete below.
         fts::drop_sync_triggers(conn_);
 
-        bool had_nodes = exists_int64_range(conn_,
-            "SELECT 1 FROM nodes WHERE id >= ? AND id < ? LIMIT 1",
-            offset, offset + ID_SPACE, true);
-        if (had_nodes) {
-            std::string fts_del =
-                "INSERT INTO nodes_fts(nodes_fts, rowid, name, qualname, signature, doc) "
-                "SELECT 'delete', id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
-                "WHERE node_type = 'symbol' AND id >= " + std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
-            conn_.exec(fts_del);
-
-            conn_.exec("DELETE FROM nodes WHERE id >= " + std::to_string(offset) +
-                " AND id < " + std::to_string(offset + ID_SPACE));
-        }
-
-        bool had_content = exists_int64_range(conn_,
-            "SELECT 1 FROM content_fts_tracker WHERE file_id >= ? AND file_id < ? LIMIT 1",
-            offset, offset + ID_SPACE, true);
-        if (had_content) {
-            conn_.exec("DELETE FROM content_fts WHERE file_id >= " + std::to_string(offset) +
-                " AND file_id < " + std::to_string(offset + ID_SPACE));
-            conn_.exec("DELETE FROM content_fts_tracker WHERE file_id >= " + std::to_string(offset) +
-                " AND file_id < " + std::to_string(offset + ID_SPACE));
-        }
+        clear_root_rows(root_id);
 
         // CASCADE delete: DELETE FROM roots → files → nodes → edges/refs
         stmt = nullptr;
@@ -659,9 +579,8 @@ std::vector<WorkspaceDB::RootInfo> WorkspaceDB::list_roots() {
     std::string sql =
         "SELECT r.id, r.path, "
         "(SELECT COUNT(*) FROM files WHERE root_id = r.id), "
-        "(SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = r.id), "
-        "(SELECT COUNT(*) FROM edges e WHERE e.src_id >= r.id * " + std::to_string(ID_SPACE) +
-        " AND e.src_id < (r.id + 1) * " + std::to_string(ID_SPACE) + ") "
+        "(SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id = f.id WHERE f.root_id = r.id), "
+        + workspace_edge_count_sql("r.id") + " "
         "FROM roots r ORDER BY r.id";
     sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt, nullptr);
 
@@ -676,6 +595,15 @@ std::vector<WorkspaceDB::RootInfo> WorkspaceDB::list_roots() {
     }
     sqlite3_finalize(stmt);
     return roots;
+}
+
+bool WorkspaceDB::has_root(const std::string& path) {
+    sqlite3_stmt* stmt = nullptr;
+    prepare_or_throw(conn_.raw(), &stmt, "SELECT 1 FROM roots WHERE path = ?");
+    sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
 }
 
 void WorkspaceDB::check_overlap(const std::string& new_root_path) {
@@ -705,32 +633,94 @@ void WorkspaceDB::check_overlap(const std::string& new_root_path) {
     sqlite3_finalize(stmt);
 }
 
+void WorkspaceDB::clear_root_rows(int64_t root_id) {
+    const auto root = std::to_string(root_id);
+    conn_.exec("CREATE TEMP TABLE __ct_root_nodes(id INTEGER PRIMARY KEY)");
+    conn_.exec("INSERT INTO temp.__ct_root_nodes " + workspace_node_ids_sql(root));
+    conn_.exec(
+        "INSERT INTO nodes_fts(nodes_fts,rowid,name,qualname,signature,doc) "
+        "SELECT 'delete',n.id,codetopo_camel_split(n.name),n.qualname,n.signature,n.doc "
+        "FROM temp.__ct_root_nodes t CROSS JOIN nodes n ON n.id=t.id WHERE n.node_type='symbol'");
+    conn_.exec("DELETE FROM nodes WHERE id IN (SELECT id FROM temp.__ct_root_nodes)");
+    sqlite3_stmt* stmt = nullptr;
+    prepare_or_throw(conn_.raw(), &stmt,
+        "SELECT t.file_id FROM files f CROSS JOIN content_fts_tracker t "
+        "ON t.file_id=f.id WHERE f.root_id=" + root);
+    std::vector<int64_t> content_files;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+        content_files.push_back(sqlite3_column_int64(stmt, 0));
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) throw std::runtime_error(sqlite_error(conn_.raw(), "Read content ranges failed"));
+    for (const auto file_id : content_files) content_fts::delete_file(conn_, file_id);
+    conn_.exec("DELETE FROM files WHERE root_id=" + root);
+    conn_.exec("DROP TABLE temp.__ct_root_nodes");
+}
+
 void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_path,
                                       bool color_output) {
     // Assumes 'src' is already ATTACHed by the caller before the transaction.
     std::string root_prefix = root_path;
     if (!root_prefix.empty() && root_prefix.back() != '/') root_prefix += '/';
 
-    int64_t offset = root_id * ID_SPACE;
+    // The writer transaction owns allocation. Indexed MAX seeks avoid the old
+    // fixed-offset collisions with primary growth, including legacy high IDs.
+    for (const auto& table : {"files", "nodes", "refs"}) {
+        sqlite3_stmt* bounds = nullptr;
+        const std::string name(table);
+        prepare_or_throw(conn_.raw(), &bounds,
+            "SELECT COALESCE((SELECT MAX(id) FROM main." + name + "),0), "
+            "(SELECT COUNT(*) FROM src." + name +
+            " WHERE id >= (SELECT MIN(id) FROM src." + name + "))");
+        if (sqlite3_step(bounds) != SQLITE_ROW) {
+            sqlite3_finalize(bounds);
+            throw std::runtime_error(sqlite_error(conn_.raw(), "Read ID allocation bounds failed"));
+        }
+        const auto high = sqlite3_column_int64(bounds, 0);
+        const auto count = sqlite3_column_int64(bounds, 1);
+        sqlite3_finalize(bounds);
+        if (high < 0 || count > std::numeric_limits<int64_t>::max() - high)
+            throw std::runtime_error("Workspace ID allocation exhausted for " + name);
+        conn_.exec("CREATE TEMP TABLE __ct_map_" + name +
+                   "(source_id INTEGER PRIMARY KEY, target_id INTEGER NOT NULL UNIQUE)");
+        conn_.exec("INSERT INTO temp.__ct_map_" + name +
+                   " SELECT id," + std::to_string(high) +
+                   "+ROW_NUMBER() OVER (ORDER BY id) FROM src." + name +
+                   " WHERE id >= (SELECT MIN(id) FROM src." + name + ")");
+    }
+    for (const auto& invalid_sql : {
+        "SELECT 1 FROM temp.__ct_map_nodes m CROSS JOIN src.nodes n ON n.id=m.source_id "
+        "WHERE (n.node_type='symbol' AND n.file_id IS NULL) OR "
+        "(n.file_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM temp.__ct_map_files WHERE source_id=n.file_id)) LIMIT 1",
+        "SELECT 1 FROM temp.__ct_map_refs m CROSS JOIN src.refs r ON r.id=m.source_id "
+        "WHERE (r.resolved_node_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM temp.__ct_map_nodes WHERE source_id=r.resolved_node_id)) OR "
+        "(r.containing_node_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM temp.__ct_map_nodes WHERE source_id=r.containing_node_id)) LIMIT 1"
+    }) {
+        sqlite3_stmt* validation = nullptr;
+        prepare_or_throw(conn_.raw(), &validation, invalid_sql);
+        const int rc = sqlite3_step(validation);
+        sqlite3_finalize(validation);
+        if (rc == SQLITE_ROW) throw std::runtime_error("Source index has invalid node/file foreign keys");
+        if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite_error(conn_.raw(), "Source ID validation failed"));
+    }
 
-    // 1. Files — map id → offset+id, path → absolute, with root_id
+    // 1. Files — map IDs and make paths absolute.
     log_workspace_line("copying files...", color_output);
     auto phase = WorkspaceClock::now();
     sqlite3_stmt* stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
         "INSERT INTO files (id, root_id, path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
-        "SELECT (? + id), ?, (? || path), language, size_bytes, mtime_ns, content_hash, parse_status, parse_error "
-        "FROM src.files");
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, root_id);
-    sqlite3_bind_text(stmt, 3, root_prefix.c_str(), -1, SQLITE_TRANSIENT);
+        "SELECT m.target_id, ?, (? || f.path), f.language, f.size_bytes, f.mtime_ns, f.content_hash, f.parse_status, f.parse_error "
+        "FROM temp.__ct_map_files m CROSS JOIN src.files f ON f.id=m.source_id");
+    sqlite3_bind_int64(stmt, 1, root_id);
+    sqlite3_bind_text(stmt, 2, root_prefix.c_str(), -1, SQLITE_TRANSIENT);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace files failed");
     sqlite3_int64 copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
     log_workspace_phase("files copied", phase, color_output,
                         "(" + format_with_commas(copied) + " rows)");
 
-    // 2. Nodes — map id → offset+id, file_id → offset+file_id
+    // 2. Nodes — map IDs and foreign keys.
     log_workspace_line("copying nodes...", color_output);
     phase = WorkspaceClock::now();
     stmt = nullptr;
@@ -738,17 +728,15 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     std::string node_sql =
         "INSERT INTO nodes (id, node_type, file_id, kind, name, qualname, signature, "
         "start_line, start_col, end_line, end_col, is_definition, visibility, doc, fingerprint, stable_key) "
-        "SELECT (? + id), node_type, "
-        "CASE WHEN file_id IS NOT NULL THEN (? + file_id) ELSE NULL END, "
+        "SELECT m.target_id, node_type, "
+        "(SELECT target_id FROM temp.__ct_map_files WHERE source_id=n.file_id), "
         "kind, name, qualname, signature, start_line, start_col, end_line, end_col, "
         "is_definition, visibility, doc, ";
     node_sql += src_has_fingerprint ? "fingerprint" : "NULL";
-    node_sql += ", (? || ':' || stable_key) FROM src.nodes";
+    node_sql += ", (? || ':' || stable_key) FROM temp.__ct_map_nodes m CROSS JOIN src.nodes n ON n.id=m.source_id";
     prepare_or_throw(conn_.raw(), &stmt, node_sql);
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, offset);
     std::string root_id_prefix = std::to_string(root_id);
-    sqlite3_bind_text(stmt, 3, root_id_prefix.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 1, root_id_prefix.c_str(), -1, SQLITE_TRANSIENT);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace nodes failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
@@ -760,11 +748,10 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     phase = WorkspaceClock::now();
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt,
-        "INSERT OR IGNORE INTO edges (src_id, dst_id, kind, confidence, evidence) "
-        "SELECT (? + src_id), (? + dst_id), kind, confidence, evidence "
-        "FROM src.edges");
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, offset);
+        "INSERT INTO edges (src_id, dst_id, kind, confidence, evidence) "
+        "SELECT (SELECT target_id FROM temp.__ct_map_nodes WHERE source_id=e.src_id), "
+        "(SELECT target_id FROM temp.__ct_map_nodes WHERE source_id=e.dst_id), e.kind, e.confidence, e.evidence "
+        "FROM src.edges e WHERE e.id >= (SELECT MIN(id) FROM src.edges)");
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace edges failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
@@ -780,20 +767,16 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     std::string ref_sql =
         "INSERT INTO refs (id, file_id, kind, name, start_line, start_col, end_line, end_col, "
         "resolved_node_id, evidence, containing_node_id, arg_count, arg_pattern, receiver_type_hint) "
-        "SELECT (? + id), (? + file_id), kind, name, start_line, start_col, end_line, end_col, "
-        "CASE WHEN resolved_node_id IS NOT NULL THEN (? + resolved_node_id) ELSE NULL END, "
+        "SELECT m.target_id, (SELECT target_id FROM temp.__ct_map_files WHERE source_id=r.file_id), kind, name, start_line, start_col, end_line, end_col, "
+        "(SELECT target_id FROM temp.__ct_map_nodes WHERE source_id=r.resolved_node_id), "
         "evidence, "
-        "CASE WHEN containing_node_id IS NOT NULL THEN (? + containing_node_id) ELSE NULL END, " +
+        "(SELECT target_id FROM temp.__ct_map_nodes WHERE source_id=r.containing_node_id), " +
         std::string(src_has_arg_count ? "arg_count" : "NULL") + ", " +
         std::string(src_has_arg_pattern ? "arg_pattern" : "NULL") + ", " +
         std::string(src_has_receiver_type ? "receiver_type_hint" : "NULL") +
-        " FROM src.refs";
+        " FROM temp.__ct_map_refs m CROSS JOIN src.refs r ON r.id=m.source_id";
     stmt = nullptr;
     prepare_or_throw(conn_.raw(), &stmt, ref_sql);
-    sqlite3_bind_int64(stmt, 1, offset);
-    sqlite3_bind_int64(stmt, 2, offset);
-    sqlite3_bind_int64(stmt, 3, offset);
-    sqlite3_bind_int64(stmt, 4, offset);
     step_done_or_throw(conn_.raw(), stmt, "Copy workspace refs failed");
     copied = sqlite3_changes64(conn_.raw());
     sqlite3_finalize(stmt);
@@ -804,10 +787,11 @@ void WorkspaceDB::merge_root_attached(int64_t root_id, const std::string& root_p
     phase = WorkspaceClock::now();
     std::string fts_sql =
         "INSERT INTO nodes_fts(rowid, name, qualname, signature, doc) "
-        "SELECT id, codetopo_camel_split(name), qualname, signature, doc FROM nodes "
-        "WHERE node_type = 'symbol' AND id >= " +
-        std::to_string(offset) + " AND id < " + std::to_string(offset + ID_SPACE);
+        "SELECT n.id, codetopo_camel_split(n.name), n.qualname, n.signature, n.doc "
+        "FROM temp.__ct_map_nodes m CROSS JOIN nodes n ON n.id=m.target_id WHERE n.node_type='symbol'";
     conn_.exec(fts_sql);
+    for (const auto& table : {"files", "nodes", "refs"})
+        conn_.exec(std::string("DROP TABLE temp.__ct_map_") + table);
     log_workspace_phase("nodes_fts", phase, color_output);
 }
 
@@ -901,12 +885,41 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
     sqlite3_stmt* select_reverse_refs_stmt = nullptr;
     sqlite3_stmt* insert_edge_stmt = nullptr;
     sqlite3_stmt* update_ref_stmt = nullptr;
+    sqlite3_stmt* names = nullptr;
+    sqlite3_stmt* insert_name = nullptr;
 
     try {
+        conn_.exec("CREATE TEMP TABLE IF NOT EXISTS workspace_lookup_names(name TEXT PRIMARY KEY)");
+        conn_.exec("DELETE FROM workspace_lookup_names");
+        prepare_or_throw(conn_.raw(), &names,
+            "SELECT r.name FROM files f CROSS JOIN refs r ON r.file_id=f.id "
+            "WHERE f.root_id=? AND r.kind='call' AND r.resolved_node_id IS NULL "
+            "AND r.containing_node_id IS NOT NULL");
+        sqlite3_bind_int64(names, 1, added_root_id);
+        prepare_or_throw(conn_.raw(), &insert_name,
+            "INSERT OR IGNORE INTO workspace_lookup_names(name) VALUES(?)");
+        int names_rc;
+        while ((names_rc = sqlite3_step(names)) == SQLITE_ROW) {
+            auto* text = reinterpret_cast<const char*>(sqlite3_column_text(names, 0));
+            std::string full = text ? text : "";
+            auto bare = workspace_lookup_bare_name(full);
+            for (const auto& name : {full, bare.size() >= 4 ? bare : full}) {
+                sqlite3_reset(insert_name);
+                sqlite3_bind_text(insert_name, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+                step_done_or_throw(conn_.raw(), insert_name, "Collect workspace lookup name failed");
+            }
+        }
+        if (names_rc != SQLITE_DONE)
+            throw std::runtime_error(sqlite_error(conn_.raw(), "Collect workspace lookup names failed"));
+        sqlite3_finalize(names);
+        sqlite3_finalize(insert_name);
+        names = nullptr;
+        insert_name = nullptr;
         prepare_or_throw(conn_.raw(), &preload_candidates_stmt,
             "SELECT n.name, n.id, f.language, n.is_definition, COALESCE(n.qualname, '') "
-            "FROM nodes n "
-            "JOIN files f ON n.file_id = f.id "
+            "FROM workspace_lookup_names w "
+            "CROSS JOIN nodes n INDEXED BY idx_nodes_name_type ON n.name = w.name "
+            "CROSS JOIN files f ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' "
             "  AND n.kind IN ('function', 'method', 'constructor_fn') "
             "  AND COALESCE(f.root_id, 0) != ?1 "
@@ -938,11 +951,11 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
 
         prepare_or_throw(conn_.raw(), &preload_new_root_candidates_stmt,
             "SELECT n.name, n.id, f.language, n.is_definition, COALESCE(n.qualname, '') "
-            "FROM nodes n "
-            "JOIN files f ON n.file_id = f.id "
+            "FROM files f "
+            "CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' "
             "  AND n.kind IN ('function', 'method', 'constructor_fn') "
-            "  AND COALESCE(f.root_id, 0) = ?1 "
+            "  AND f.root_id = ?1 "
             "ORDER BY n.name, n.is_definition DESC, n.id");
         sqlite3_bind_int64(preload_new_root_candidates_stmt, 1, added_root_id);
 
@@ -976,12 +989,12 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
             "       COALESCE(cf.root_id, 0) AS caller_root, "
             "       cf.language AS caller_language, "
             "       COALESCE(r.receiver_type_hint, '') AS receiver_type_hint "
-            "FROM refs r "
-            "JOIN files cf ON cf.id = r.file_id "
+            "FROM files cf "
+            "CROSS JOIN refs r ON cf.id = r.file_id "
             "WHERE r.kind = 'call' "
             "  AND r.resolved_node_id IS NULL "
             "  AND r.containing_node_id IS NOT NULL "
-            "  AND COALESCE(cf.root_id, 0) = ?1 "
+            "  AND cf.root_id = ?1 "
             "ORDER BY r.id");
         sqlite3_bind_int64(select_refs_stmt, 1, added_root_id);
 
@@ -1108,6 +1121,8 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
         sqlite3_finalize(select_refs_stmt);
         return {resolved_refs + reverse_resolved_refs, edges_created + reverse_edges_created};
     } catch (...) {
+        if (names) sqlite3_finalize(names);
+        if (insert_name) sqlite3_finalize(insert_name);
         if (update_ref_stmt) sqlite3_finalize(update_ref_stmt);
         if (insert_edge_stmt) sqlite3_finalize(insert_edge_stmt);
         if (select_reverse_refs_stmt) sqlite3_finalize(select_reverse_refs_stmt);
@@ -1121,9 +1136,7 @@ std::pair<int64_t, int64_t> WorkspaceDB::resolve_workspace_refs(int64_t added_ro
 void WorkspaceDB::populate_content_fts_for_root(int64_t root_id, bool color_output) {
     auto phase = WorkspaceClock::now();
     int64_t indexed_files = 0;
-    int64_t offset = root_id * ID_SPACE;
-    int64_t end = offset + ID_SPACE;
-    int64_t last_id = offset - 1;
+    int64_t last_id = 0;
 
     while (true) {
         std::vector<std::pair<int64_t, std::string>> files;
@@ -1132,11 +1145,11 @@ void WorkspaceDB::populate_content_fts_for_root(int64_t root_id, bool color_outp
             sqlite3_stmt* sel = nullptr;
             prepare_or_throw(conn_.raw(), &sel,
                 "SELECT id, path FROM files "
-                "WHERE id > ? AND id < ? AND parse_status != 'skipped' "
+                "WHERE id > ? AND root_id = ? AND parse_status != 'skipped' "
                 "AND id NOT IN (SELECT file_id FROM content_fts_tracker) "
                 "ORDER BY id LIMIT ?");
             sqlite3_bind_int64(sel, 1, last_id);
-            sqlite3_bind_int64(sel, 2, end);
+            sqlite3_bind_int64(sel, 2, root_id);
             sqlite3_bind_int(sel, 3, kContentFtsBatchFiles);
 
             while (sqlite3_step(sel) == SQLITE_ROW) {

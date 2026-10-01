@@ -6,6 +6,36 @@
 namespace codetopo {
 namespace path_util {
 
+// Lookup normalization is lexical: indexed files need not still exist on disk.
+// JSON decoding happens at the transport boundary, never here.
+inline std::string lookup_path(std::string path) {
+#ifdef _WIN32
+    for (auto& ch : path) if (ch == '\\') ch = '/';
+#endif
+    if (path.empty() || path.find('\0') != std::string::npos) return "";
+    auto parsed = std::filesystem::path(path);
+    for (const auto& component : parsed) {
+        if (component == "..") return "";
+    }
+#ifdef _WIN32
+    if (parsed.has_root_name() && !parsed.is_absolute()) return "";
+#endif
+    auto result = parsed.lexically_normal().generic_string();
+    while (result.size() > 1 && result.back() == '/' &&
+           result != parsed.root_path().generic_string()) result.pop_back();
+    return result;
+}
+
+// An absolute lookup under a root maps to its indexed relative spelling.
+inline std::string lookup_path_in_root(const std::string& path, const std::string& repo_root) {
+    auto input = lookup_path(path);
+    auto root = lookup_path(repo_root);
+    if (input.empty() || root.empty() || !std::filesystem::path(input).is_absolute()) return {};
+    if (input == root) return ".";
+    if (root.back() != '/') root += '/';
+    return input.starts_with(root) ? input.substr(root.size()) : std::string();
+}
+
 // T012: Path normalization — forward slashes, relative to repo root,
 // symlink resolution, traversal guard.
 

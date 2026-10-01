@@ -164,10 +164,30 @@ codetopo doctor --root /path/to/repo
 
 ## MCP Tools
 
+File lookups accept repo-relative paths and absolute indexed workspace paths.
+On Windows, native backslashes, forward slashes, and mixed separators are
+equivalent. Returned paths retain their indexed spelling; relative paths resolve
+against the primary repo root, never an arbitrary suffix in another root. Paths
+with `..` components are rejected. POSIX path case remains significant.
+
+`context_for` (and the other single-symbol graph tools) accepts one of
+`{"stable_key":"..."}`, `{"node_id":42}`, or
+`{"symbol":"methodName","file":"src/example.cpp"}`. Symbol lookup is exact by name
+or qualified name, prefers definitions over declarations, and returns
+`{"ambiguous":true,"candidates":[...]}` for multiple matching definitions.
+Choose a candidate's handle to disambiguate. Missing files/symbols return
+`not_found`; malformed selectors return `invalid_input`. `stable_key` takes
+precedence over `node_id`, which takes precedence over symbol/file.
+`expected_stable_key` still guards a supplied node ID. Context options such as
+`include_source`, `max_source_lines`, and caller/callee caps work with every
+selector. In JSON, escape each backslash once, e.g.
+`{"symbol":"methodName","file":"src\\example.cpp"}`.
+
 | Tool | Description |
 |------|-------------|
 | `server_info` | Server capabilities, schema version, uptime |
-| `repo_stats` | File count, symbol count, edge count, last index time |
+| `server_health` | Prompt readiness (`ready`/`busy`), without SQLite graph queries |
+| `repo_stats` | File counts and index metadata; uncomputed graph totals are null |
 | `file_search` | Search files by GLOB path pattern |
 | `dir_list` | List files and subdirectories in a directory |
 | `symbol_search` | Search symbols by name (FTS5) |
@@ -189,6 +209,133 @@ codetopo doctor --root /path/to/repo
 | `dependency_cluster` | Group methods by shared field access for refactoring |
 | `source_at` | Read raw source lines from a file by line range |
 | `reindex` | Trigger a background re‑index |
+| `workspace_add` | Start an extra-root indexing/merge job; returns `job_id` |
+| `workspace_refresh` | Incrementally reindex an existing extra root, then merge it |
+| `workspace_remove` | Start an extra-root removal job; returns `job_id` |
+| `workspace_job_status` | Poll a job's phase, elapsed time, terminal result or error |
+| `workspace_job_cancel` | Request cancellation at the next safe phase boundary |
+| `workspace_list` | List committed extra roots and scoped counts |
+
+### Workspace jobs and editor lifecycle
+
+MCP workspace mutations are asynchronous; CLI `workspace add/remove` and `query`
+retain their synchronous behavior. For MCP, call `workspace_add` or
+`workspace_refresh` with `{"path":"C:\\projects\\reference"}`, then call
+`workspace_job_status` with the returned `{"job_id":"workspace-1"}`.
+Only one job runs at a time; only the latest job is retained in memory for the
+session. IDs are session-local, not durable across reconnections.
+
+Status contains `operation`, `path`, `status`, `phase`, `elapsed_ms`,
+`cancel_requested` and `cancellation_policy`. States are `queued`, `running`,
+`completed`, `failed`, or `cancelled`; `completed` includes `result`, and
+`failed` includes `error`. Progress is phase-level, not a fabricated percentage:
+`waiting_for_writer`, `acquiring_lock`, `opening_workspace`,
+`indexing_extra_root`, `merging` (or `removing`), and `done`.
+An add/refresh incrementally scans **only the chosen extra root**, detecting
+new, changed and deleted files in its own index before merging. It does not run
+a primary-root reindex. MCP background extra-root indexing uses at most four
+threads. Source indexes must be standalone (no nested extra workspace roots).
+Merge IDs are allocated above each destination table's indexed maximum in the
+writer transaction and foreign keys are remapped together. Primary growth and
+legacy high IDs cannot collide on refresh; cleanup uses root ownership, not ID
+ranges. Stable symbol keys retain their root prefix across refreshes.
+CLI add still reuses an existing source index; use MCP refresh or
+`codetopo index --root <extra-root>` before a synchronous CLI add to update it.
+
+`workspace_job_cancel` is explicit: client request timeouts and
+`notifications/cancelled` do **not** cancel an accepted job. Cancellation is
+observed between safe phases. An already-running index child finishes, then
+cancellation can prevent the merge; the extra root's source index may therefore
+have advanced even if the workspace job was cancelled. Merge/removal is one
+noninterruptible safe phase: cancellation during it may end in `completed`,
+with `cancel_requested:true`, rather than falsely report a rollback.
+
+MCP graph reads remain available during startup indexing, explicit reindex and
+workspace merge/removal. The stdio owner uses its own SQLite connection and a
+request-scoped committed WAL snapshot: multi-query graph results see the prior
+or new committed state, never a partially committed merge. Snapshots and cached
+statement cursors are released before writing the response. Workers never use
+or finalize the reader's statements; committed changes invalidate its cache at
+the next request, including independent CLI writer commits.
+`server_health` reports writer readiness, **not** read unavailability or a
+database integrity guarantee. Write conflicts (for example `ingest_traces`)
+still return JSON-RPC `busy` (`data.error_code:"busy"`, `data.retryable:true`).
+Genuine SQLite read lock contention uses a 250ms busy timeout per SQLite
+operation, not the writer-sized 30s timeout. No missing index is silently
+created for a read.
+Indexing and mutations retain serialized writer admission and CLI lock files;
+source locks remain held through DETACH. No global graph totals, index rebuild
+or full integrity scan is used as a health proxy. `repo_stats` reports file
+counts and metadata; `symbol_count`/`edge_count` and per-root graph totals are
+`null`, with `graph_counts_checked:false` and `graph_counts_status:"not_computed"`.
+Workspace job results and `workspace_list` retain their scoped exact counts.
+
+Editor stdio sessions default to **no idle shutdown** (`--idle-timeout 0`).
+An explicitly positive idle timeout is enforced while waiting for input,
+including an incomplete line. EOF, idle shutdown or transport error stops the
+watcher, discards queued indexing work, requests job cancellation, and joins
+owned workers before destroying their state. A running child or safe merge
+finishes before shutdown returns; shutdown is not guaranteed bounded if that
+phase stalls. Hosts opting into idle shutdown must reconnect/reinitialize.
+`--freshness normal` and `eager` reconcile in the background while reads use the
+last committed index (including unrelated extra roots). Watching stays active.
+`lazy`/`off` skip startup indexing as before. Graph snapshots cover indexed data;
+source snippets read from disk can reflect newer, not-yet-indexed file contents.
+All index writers retain secondary query indexes and symbol FTS sync triggers
+through bulk batches, including standalone CLI, watcher and workspace-refresh
+subprocesses. A writer lock does not exclude readers; there is no offline
+index-drop optimization. Symbol search tracks committed structural batches,
+including when a bulk child restarts with a small remaining worklist.
+Persistence batches acquire SQLite write admission with `BEGIN IMMEDIATE`.
+Failed persistence statements roll back and terminate the indexing child with
+an explicit error rather than letting a persistence-thread exception crash it.
+Workspace imports allocate file, node and reference IDs above the destination
+table's current maximum inside the writer transaction, remapping graph
+endpoints. Refresh/removal uses root ownership, not fixed numeric ID ranges;
+existing billion-offset IDs remain valid without a schema migration.
+
+Lifecycle, job phases, child PID/exit status and timing go to **stderr only**,
+not the protocol stdout stream. These explain observed shutdowns and failures;
+an abruptly missing process still requires external exit capture to establish
+its cause. They do not prove a historical crash, deadlock or memory leak.
+
+Regression validation:
+`codetopo_tests.exe "[workspace],[lock],[contract],[integration]"`, plus
+`node tests\integration\workspace_jobs_stdio.js <path-to-Release-codetopo.exe>`
+(Node 22+ with built-in SQLite)
+from the repository root. Keep `TEMP`/`TMP` pointed at a workspace-local fixture
+directory when running legacy tests. Query plans are validated without
+`ANALYZE` on synthetic local fixtures; external multi-million-row indexes were
+not used for this validation.
+The stdio suite also pauses real >1000-file writers after a committed bulk batch
+and checks every read tool, index availability and scoped node/edge query plans.
+Use `--bulk-only` to run just the bulk-overlap scenarios (normal startup with
+watching, watcher updates, MCP/CLI reindex, targeted/force CLI and workspace
+refresh with a separate source-root MCP reader).
+`--bulk-source-only` isolates source refresh; `--bulk-after-primary` checks source
+refresh after primary bulk growth. `--acceptance-sequence` runs one connected
+production lifecycle: an existing legacy-ID extra root, normal watched bulk
+startup with committed reads, primary growth, second-root add, bulk source
+refresh, both-root removal, and EOF during an active primary child. It checks
+every supervised child exits successfully without quarantine, complete bulk
+contents, unchanged primary identities and data across workspace mutations,
+pipelined cache traffic, and owned lock/progress/worklist cleanup. Its fixtures
+use independent Git repositories so the watcher does not inherit parent Git
+metadata.
+
+Lookup-only regressions: `codetopo_tests.exe "[lookup-api]"` checks lexical
+normalization, selector semantics, and the actual scoped SQL query plans.
+`node tests\integration\lookup_stdio.js <path-to-Release-codetopo.exe>` exercises
+the production MCP dispatcher and advertised schemas, with primary/extra-root
+fixtures entirely inside the repository. It uses a controlled symbol graph to
+isolate lookup behavior from extractor duplicate-symbol behavior.
+An explicit absolute primary-root path scopes listings to primary files;
+`.` retains its workspace-wide behavior. Absolute primary-root `*` and `**`
+patterns resolve to relative indexed paths without matching extra roots, with
+native Windows and forward-slash separators accepted. Search patterns retain
+SQLite GLOB semantics (`*` can match directory separators); they are not
+filesystem-style single-level globs. Scoped plan regressions use the production
+schema without `ANALYZE` and reject full node/edge index traversals.
 
 ## Project Structure
 

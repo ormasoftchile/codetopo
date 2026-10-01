@@ -72,3 +72,39 @@ TEST_CASE("Language detection from extension", "[path]") {
     REQUIRE(path_util::detect_language("script.sh") == "bash");
     REQUIRE(path_util::detect_language("unknown.xyz").empty());
 }
+
+TEST_CASE("Lookup normalization preserves lexical path identity", "[path][lookup-api]") {
+    REQUIRE(path_util::lookup_path("./src/main.cpp") == "src/main.cpp");
+    REQUIRE(path_util::lookup_path("src/./main.cpp") == "src/main.cpp");
+    REQUIRE(path_util::lookup_path("src/") == "src");
+    REQUIRE(path_util::lookup_path("src/name..cpp") == "src/name..cpp");
+    REQUIRE(path_util::lookup_path("../src/main.cpp").empty());
+    REQUIRE(path_util::lookup_path("src/../main.cpp").empty());
+    REQUIRE(path_util::lookup_path(std::string("src\0/main.cpp", 13)).empty());
+#ifdef _WIN32
+    REQUIRE(path_util::lookup_path(R"(src\main.cpp)") == "src/main.cpp");
+    REQUIRE(path_util::lookup_path(R"(C:\repo/src\main.cpp)") == "C:/repo/src/main.cpp");
+    REQUIRE(path_util::lookup_path(R"(src\new\test.cpp)") == "src/new/test.cpp");
+    REQUIRE(path_util::lookup_path(R"(C:src\main.cpp)").empty());
+    REQUIRE(path_util::lookup_path(R"(src\..\main.cpp)").empty());
+#else
+    REQUIRE(path_util::lookup_path(R"(src\main.cpp)") == R"(src\main.cpp)");
+    REQUIRE(path_util::lookup_path("src/Main.cpp") != path_util::lookup_path("src/main.cpp"));
+#endif
+}
+
+TEST_CASE("Absolute lookup scopes map only inside the requested root", "[path][lookup-api]") {
+    auto root = std::filesystem::current_path();
+    REQUIRE(path_util::lookup_path_in_root(root.string(), root.string()) == ".");
+    REQUIRE(path_util::lookup_path_in_root((root / "src" / "main.cpp").string(), root.string()) == "src/main.cpp");
+    REQUIRE(path_util::lookup_path_in_root((root / "*").string(), root.string()) == "*");
+    REQUIRE(path_util::lookup_path_in_root((root / "**").generic_string(), root.string()) == "**");
+    REQUIRE(path_util::lookup_path_in_root("src/main.cpp", root.string()).empty());
+    REQUIRE(path_util::lookup_path_in_root(root.string() + "-other/main.cpp", root.string()).empty());
+    REQUIRE(path_util::lookup_path_in_root((root / ".." / "main.cpp").string(), root.string()).empty());
+#ifdef _WIN32
+    REQUIRE(path_util::lookup_path_in_root(R"(C:\repo\*)", "C:/repo") == "*");
+    REQUIRE(path_util::lookup_path_in_root("C:/repo/**", R"(C:\repo)") == "**");
+    REQUIRE(path_util::lookup_path_in_root(R"(C:\repo\src\main.cpp)", "C:/repo") == "src/main.cpp");
+#endif
+}

@@ -154,9 +154,8 @@ int run_index(const Config& config) {
         ? "PRAGMA wal_checkpoint(PASSIVE)"
         : "PRAGMA wal_checkpoint(TRUNCATE)";
 
-    // Acquire lock (T014/FR-036). Supervised children are spawned by a --watch
-    // MCP server that already holds this lock for its lifetime and serializes
-    // reindexes internally, so they must NOT re-acquire it (would self-deadlock).
+    // Acquire lock for direct runs. Supervised children share their supervisor's
+    // operation-scoped lock and must not re-acquire it.
     auto lock_path = db_path;
     lock_path += ".lock";
     FileLock lock(lock_path);
@@ -193,7 +192,8 @@ int run_index(const Config& config) {
     }
     schema::ensure_nodes_fingerprint_schema(conn);
     schema::set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
-    // FTS triggers created later — after bulk inserts for performance
+    // Symbol search must track the same committed batches as structural reads.
+    fts::create_sync_triggers(conn);
 
     // Ensure quarantine table exists (additive migration)
     schema::ensure_quarantine_table(conn);
@@ -211,7 +211,6 @@ int run_index(const Config& config) {
     Persister persister(conn);
     std::vector<ScannedFile> work_list;
     bool force_cleared_index = false;
-    bool force_dropped_fts_triggers = false;
     bool targeted_mode = !config.only_files.empty() || !config.changed_file_lists.empty();
 
     bool resumed = false;
@@ -321,10 +320,6 @@ int run_index(const Config& config) {
         // first attempt already cleared the DB before writing progress.
         if (config.force_reindex && !targeted_mode) {
             std::cerr << "Force reindex: clearing existing index rows...\n";
-            if (!config.safe_mode) {
-                fts::drop_sync_triggers(conn);
-                force_dropped_fts_triggers = true;
-            }
             int64_t cleared = persister.clear_main_project_index_for_force();
             force_cleared_index = true;
             std::cerr << "Force reindex: cleared " << cleared << " existing files\n";
@@ -335,12 +330,6 @@ int run_index(const Config& config) {
         std::cerr << "Nothing to index. Database is up to date.\n";
 
         // No files changed → no new refs to resolve. Skip the expensive resolver.
-
-        // If --force cleared rows but there is nothing to reinsert, rebuild
-        // symbol FTS so it reflects the now-empty (or workspace-only) nodes.
-        if (force_cleared_index) {
-            fts::rebuild(conn);
-        }
 
         // Ensure FTS triggers are active for future incremental updates
         fts::create_sync_triggers(conn);
@@ -457,19 +446,15 @@ int run_index(const Config& config) {
     auto progress_path = db_path;
     progress_path += ".progress";
 
-    // --- Bulk load optimization: drop indexes and FTS triggers ---
-    // Building indexes on a populated table is 10-50x faster than maintaining
-    // them per-insert. FTS rebuild is similarly much faster in one pass.
-    // Uses IF EXISTS / IF NOT EXISTS — safe to call on resume after crash.
+    // CLI, watch and workspace children can all share their DB with MCP readers.
+    // Keep secondary indexes across every batch commit: readers require both
+    // their names (INDEXED BY) and their bounded query plans. A writer lock is
+    // not exclusive access to readers, so it cannot authorize dropping indexes.
+    // Keep symbol FTS triggers too: deferring them leaves committed batches
+    // unsearchable and a small crash-resume worklist cannot safely repair them.
     bool bulk_mode = (force_cleared_index || total > 1000) && !config.safe_mode;
     if (bulk_mode) {
-        std::cerr << "Bulk mode: dropping indexes for fast insert...\n";
-        schema::drop_bulk_indexes(conn);
-        if (!force_dropped_fts_triggers) {
-            fts::drop_sync_triggers(conn);
-        }
-    } else {
-        fts::create_sync_triggers(conn);
+        std::cerr << "Bulk mode: retaining query indexes and symbol FTS triggers...\n";
     }
 
     // No fixed thread pool — use detached threads per task.
@@ -822,6 +807,7 @@ int run_index(const Config& config) {
     std::thread persist_thread([&persist_queue, &persist_state, &persister, &profiler, 
                                  &config, &work_list, effective_batch_size, &progress_path,
                                  &conn, kWalCheckpoint]() {
+        try {
         persister.begin_batch();
         int local_count = 0;
 
@@ -879,27 +865,23 @@ int run_index(const Config& config) {
         // Runs in its own transaction after structural persist is fully committed.
         if (!fts_pending.empty()) {
             std::cerr << "Building content search index...\n";
-            sqlite3_stmt* cfts_ins = nullptr;
-            sqlite3_prepare_v2(conn.raw(),
-                "INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)",
-                -1, &cfts_ins, nullptr);
-            sqlite3_stmt* cfts_trk = nullptr;
-            sqlite3_prepare_v2(conn.raw(),
-                "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)",
-                -1, &cfts_trk, nullptr);
+            auto cfts_ins = content_fts::prepare(conn.raw(),
+                "INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)");
+            auto cfts_trk = content_fts::prepare(conn.raw(),
+                "INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?, ?, ?)");
 
             const int fts_batch = 10000;
-            conn.exec("BEGIN TRANSACTION");
+            conn.exec("BEGIN IMMEDIATE");
             int fts_count = 0;
             auto fts_start = std::chrono::steady_clock::now();
             for (auto& [fid, content] : fts_pending) {
-                content_fts::insert_lines(cfts_ins, cfts_trk, fid, content);
+                content_fts::insert_lines(cfts_ins.get(), cfts_trk.get(), fid, content);
                 content.clear();           // free memory incrementally
                 ++fts_count;
                 if (fts_count % fts_batch == 0) {
                     conn.exec("COMMIT");
                     conn.exec(kWalCheckpoint);
-                    conn.exec("BEGIN TRANSACTION");
+                    conn.exec("BEGIN IMMEDIATE");
                     auto now = std::chrono::steady_clock::now();
                     auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - fts_start).count();
                     double rate = secs > 0 ? static_cast<double>(fts_count) / secs : 0;
@@ -910,13 +892,24 @@ int run_index(const Config& config) {
             conn.exec("COMMIT");
             conn.exec(kWalCheckpoint);
 
-            sqlite3_finalize(cfts_ins);
-            sqlite3_finalize(cfts_trk);
             auto fts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - fts_start).count();
             std::cerr << "\r\033[KContent search index: " << fts_count << " files in "
                       << fts_elapsed << "s\n";
             fts_pending.clear();
+        }
+        } catch (const std::exception& e) {
+            persist_state.error_message = e.what();
+            persist_state.fatal_error.store(true, std::memory_order_release);
+            std::cerr << "ERROR: Persistence thread failed: " << e.what() << "\n";
+            if (!sqlite3_get_autocommit(conn.raw())) {
+                char* error = nullptr;
+                const int rc = sqlite3_exec(conn.raw(), "ROLLBACK", nullptr, nullptr, &error);
+                if (rc != SQLITE_OK)
+                    std::cerr << "ERROR: Persistence rollback failed: " << (error ? error : sqlite3_errmsg(conn.raw())) << "\n";
+                sqlite3_free(error);
+            }
+            persist_queue.close();
         }
     });
 
@@ -1000,6 +993,8 @@ int run_index(const Config& config) {
     watchdog_stop.store(true, std::memory_order_relaxed);
     if (watchdog.joinable()) watchdog.join();
 
+    if (persist_state.fatal_error.load(std::memory_order_acquire)) return 1;
+
     auto elapsed = std::chrono::steady_clock::now() - start_time;
     auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
     double rate = elapsed_s > 0 ? static_cast<double>(total) / elapsed_s : 0;
@@ -1038,50 +1033,8 @@ int run_index(const Config& config) {
                   << edges_created << " edges in " << resolve_elapsed << "s\n";
     }
 
-    // Checkpoint WAL after resolve_refs before building indexes
+    // Checkpoint WAL after reference resolution.
     conn.exec(kWalCheckpoint);
-
-    // --- Rebuild ALL secondary indexes in one pass (files, nodes, refs, edges) ---
-    if (bulk_mode) {
-        std::cerr << "Rebuilding indexes...\n";
-        ScopedPhase _ir(profiler.idx_read);
-        auto idx_start = std::chrono::steady_clock::now();
-        conn.exec("BEGIN TRANSACTION");
-        // files
-        std::cerr << "  files...\n";
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
-        // nodes
-        std::cerr << "  nodes...\n";
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_type_kind_name ON nodes(node_type, kind, name)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
-        // refs
-        std::cerr << "  refs...\n";
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_containing ON refs(containing_node_id)");
-        // edges
-        std::cerr << "  edges...\n";
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
-        conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
-        conn.exec("COMMIT");
-        auto idx_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - idx_start).count();
-        std::cerr << "Indexes rebuilt in " << idx_elapsed << "s\n";
-    }
-
-    // Rebuild FTS5 symbol index in one pass (much faster than per-row triggers)
-    if (bulk_mode || force_cleared_index) {
-        std::cerr << "Rebuilding symbol FTS index...\n";
-        ScopedPhase _fts(profiler.fts_rebuild);
-        auto fts_start = std::chrono::steady_clock::now();
-        fts::rebuild(conn);
-        auto fts_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - fts_start).count();
-        std::cerr << "Symbol FTS rebuilt in " << fts_elapsed << "s\n";
-    }
 
     // Content FTS: backfill only for incremental/upgrade scenarios where files
     // were already in the DB but not yet in content_fts_tracker.  The bulk case

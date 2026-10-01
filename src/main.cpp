@@ -114,12 +114,12 @@ int main(int argc, char** argv) {
     std::string mcp_root = ".";
     std::string mcp_db;
     int mcp_tool_timeout = 10;
-    int mcp_idle_timeout = 1800;
+    int mcp_idle_timeout = 0;
 
     sub_mcp->add_option("--root", mcp_root, "Repository root directory")->default_val(".");
     sub_mcp->add_option("--db", mcp_db, "Database path (default: <root>/.codetopo/index.sqlite)");
     sub_mcp->add_option("--tool-timeout", mcp_tool_timeout, "Tool timeout in seconds")->default_val(10);
-    sub_mcp->add_option("--idle-timeout", mcp_idle_timeout, "Idle timeout in seconds (0=disable)")->default_val(1800);
+    sub_mcp->add_option("--idle-timeout", mcp_idle_timeout, "Idle timeout in seconds (0=disable, default for editor stdio)")->default_val(0);
 
     // R9: Freshness policy and debounce tuning
     std::string mcp_freshness = "normal";

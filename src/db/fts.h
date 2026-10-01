@@ -66,6 +66,25 @@ inline void rebuild(Connection& conn) {
 // so MATCH returns exact line numbers without needing to re-read and scan files.
 namespace content_fts {
 
+using StatementPtr = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
+
+inline StatementPtr prepare(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    const int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+    StatementPtr result(stmt, sqlite3_finalize);
+    if (rc != SQLITE_OK) throw SqliteError(rc, "Content FTS prepare failed: " + std::string(sqlite3_errmsg(db)));
+    return result;
+}
+
+inline void step_write(sqlite3_stmt* stmt) {
+    const int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        const std::string message = sqlite3_errmsg(sqlite3_db_handle(stmt));
+        sqlite3_reset(stmt);
+        throw SqliteError(rc, "Content FTS write failed: " + message);
+    }
+}
+
 // Insert all lines of a file's content into content_fts using pre-prepared statements.
 // ins: INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)
 // trk: INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?,?,?)  (may be nullptr)
@@ -107,7 +126,7 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
                 sqlite3_bind_text(ins, 1, content.data() + pos, bind_len, SQLITE_STATIC);
                 sqlite3_bind_int64(ins, 2, file_id);
                 sqlite3_bind_int(ins, 3, line_no);
-                sqlite3_step(ins);
+                step_write(ins);
                 int64_t rid = sqlite3_last_insert_rowid(db);
                 if (!any_inserted) min_rowid = rid;
                 max_rowid = rid;
@@ -124,7 +143,7 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
         sqlite3_bind_int64(trk, 1, file_id);
         sqlite3_bind_int64(trk, 2, min_rowid);
         sqlite3_bind_int64(trk, 3, max_rowid);
-        sqlite3_step(trk);
+        step_write(trk);
     }
 }
 
@@ -138,46 +157,38 @@ inline void delete_file(Connection& conn, int64_t file_id) {
     int64_t min_rowid = 0, max_rowid = 0;
     bool have_range = false;
     {
-        sqlite3_stmt* q = nullptr;
-        if (sqlite3_prepare_v2(conn.raw(),
-                "SELECT min_rowid, max_rowid FROM content_fts_tracker WHERE file_id = ?",
-                -1, &q, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(q, 1, file_id);
-            if (sqlite3_step(q) == SQLITE_ROW &&
-                sqlite3_column_type(q, 0) != SQLITE_NULL &&
-                sqlite3_column_type(q, 1) != SQLITE_NULL) {
-                min_rowid = sqlite3_column_int64(q, 0);
-                max_rowid = sqlite3_column_int64(q, 1);
-                have_range = true;
-            }
+        auto q = prepare(conn.raw(),
+            "SELECT min_rowid, max_rowid FROM content_fts_tracker WHERE file_id = ?");
+        sqlite3_bind_int64(q.get(), 1, file_id);
+        const int rc = sqlite3_step(q.get());
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE)
+            throw SqliteError(rc, "Content FTS tracker read failed: " + std::string(sqlite3_errmsg(conn.raw())));
+        if (rc == SQLITE_ROW && sqlite3_column_type(q.get(), 0) != SQLITE_NULL &&
+            sqlite3_column_type(q.get(), 1) != SQLITE_NULL) {
+            min_rowid = sqlite3_column_int64(q.get(), 0);
+            max_rowid = sqlite3_column_int64(q.get(), 1);
+            have_range = true;
         }
-        sqlite3_finalize(q);
     }
 
-    sqlite3_stmt* stmt = nullptr;
+    StatementPtr stmt(nullptr, sqlite3_finalize);
     if (have_range) {
-        sqlite3_prepare_v2(conn.raw(),
-            "DELETE FROM content_fts WHERE rowid >= ? AND rowid <= ?", -1, &stmt, nullptr);
-        sqlite3_bind_int64(stmt, 1, min_rowid);
-        sqlite3_bind_int64(stmt, 2, max_rowid);
+        stmt = prepare(conn.raw(), "DELETE FROM content_fts WHERE rowid >= ? AND rowid <= ?");
+        sqlite3_bind_int64(stmt.get(), 1, min_rowid);
+        sqlite3_bind_int64(stmt.get(), 2, max_rowid);
     } else {
         // Legacy fallback: rows indexed before rowid ranges were tracked (NULL range).
         // This scans the FTS index once; the subsequent re-insert records a range so
         // future deletes of this file are fast. A --force reindex populates all ranges.
-        sqlite3_prepare_v2(conn.raw(),
-            "DELETE FROM content_fts WHERE file_id = ?", -1, &stmt, nullptr);
-        sqlite3_bind_int64(stmt, 1, file_id);
+        stmt = prepare(conn.raw(), "DELETE FROM content_fts WHERE file_id = ?");
+        sqlite3_bind_int64(stmt.get(), 1, file_id);
     }
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    step_write(stmt.get());
 
     // Remove from tracker
-    sqlite3_stmt* trk = nullptr;
-    sqlite3_prepare_v2(conn.raw(),
-        "DELETE FROM content_fts_tracker WHERE file_id = ?", -1, &trk, nullptr);
-    sqlite3_bind_int64(trk, 1, file_id);
-    sqlite3_step(trk);
-    sqlite3_finalize(trk);
+    auto trk = prepare(conn.raw(), "DELETE FROM content_fts_tracker WHERE file_id = ?");
+    sqlite3_bind_int64(trk.get(), 1, file_id);
+    step_write(trk.get());
 }
 
 // Insert file content line-by-line into the trigram index.

@@ -7,6 +7,8 @@
 #include "db/schema.h"
 #include "db/queries.h"
 #include "util/log.h"
+#include "mcp/workspace_jobs.h"
+#include "mcp/stdio_input.h"
 #include <string>
 #include <string_view>
 #include <functional>
@@ -37,10 +39,15 @@ struct StalenessState {
 class McpServer {
 public:
     McpServer(Connection& conn, const std::string& repo_root,
-              int tool_timeout_s = 10, int idle_timeout_s = 1800)
+              int tool_timeout_s = 10, int idle_timeout_s = 0,
+              std::mutex* writer_gate = nullptr)
         : conn_(conn), repo_root_(repo_root)
         , tool_timeout_s_(tool_timeout_s), idle_timeout_s_(idle_timeout_s)
-        , cache_(conn), start_time_(std::chrono::steady_clock::now()) {}
+        , cache_(conn), start_time_(std::chrono::steady_clock::now())
+        , writer_gate_(writer_gate ? *writer_gate : owned_gate_), jobs_(writer_gate_) {}
+
+    void shutdown_jobs() { jobs_.shutdown(); }
+    void set_indexing_flag(const std::atomic<bool>* flag) { indexing_ = flag; }
 
     // Optional trajectory log: when set, each tool call + result is appended as JSONL.
     void set_trajectory_log(const std::string& path) {
@@ -49,8 +56,7 @@ public:
         if (!traj_file_) mcp_log("warn: could not open trajectory log: " + path);
     }
 
-    // P2: Thread-safe flag — set from watcher's reindex-complete callback,
-    // consumed on the main stdio thread before each tool dispatch.
+    // Only the stdio owner ever touches conn_ or cache_. Workers signal atomically.
     void request_refresh() {
         needs_refresh_.store(true);
     }
@@ -65,28 +71,26 @@ public:
 
     // T057: Main stdio loop — read NDJSON, dispatch, write response.
     int run() {
-        auto last_activity = std::chrono::steady_clock::now();
+        StdioInput input;
 
         while (true) {
-            // Check idle timeout
-            if (idle_timeout_s_ > 0) {
-                auto idle = std::chrono::steady_clock::now() - last_activity;
-                if (std::chrono::duration_cast<std::chrono::seconds>(idle).count() > idle_timeout_s_) {
-                    mcp_log("shutdown: idle timeout (" + std::to_string(idle_timeout_s_) + "s)");
-                    return 0;
-                }
+            std::string line;
+            StdioInput::Result input_result;
+            try {
+                input_result = input.next(line, idle_timeout_s_);
+            } catch (const std::exception& e) {
+                mcp_log("shutdown: transport_error " + std::string(e.what()));
+                return 1;
             }
-
-            std::string line = json_read_line();
-            if (line.empty()) {
-                if (std::cin.eof()) {
-                    mcp_log("shutdown: stdin closed");
-                    return 0;
-                }
-                continue;
+            if (input_result == StdioInput::Result::idle) {
+                mcp_log("shutdown: idle timeout (" + std::to_string(idle_timeout_s_) + "s)");
+                return 0;
             }
-
-            last_activity = std::chrono::steady_clock::now();
+            if (input_result == StdioInput::Result::eof) {
+                mcp_log("shutdown: stdin EOF");
+                return 0;
+            }
+            if (line.empty()) continue;
 
             auto doc = json_parse(line);
             if (!doc) {
@@ -118,7 +122,14 @@ public:
             if (method_str == "notifications/initialized") {
                 // No response needed for notifications
                 initialized_ = true;
-                mcp_notify_active().store(true, std::memory_order_relaxed);
+                continue;
+            }
+            if (method_str == "ping") {
+                write_result(id, "{}");
+                continue;
+            }
+            if (method_str == "notifications/cancelled") {
+                // A request timeout is not cancellation of an accepted workspace job.
                 continue;
             }
 
@@ -143,15 +154,37 @@ public:
                     continue;
                 }
 
-                // P2: If watcher-triggered reindex completed, clear cached state
-                if (needs_refresh_.exchange(false)) {
-                    cache_.clear();
-                    staleness_.last_head_mtime = {};  // force re-read of git state
+                const std::string name(tool_name);
+                const bool job_control = name == "workspace_job_status" || name == "workspace_job_cancel";
+                const bool workspace_mutation = name == "workspace_add" ||
+                    name == "workspace_refresh" || name == "workspace_remove";
+                if (job_control || workspace_mutation || name == "server_health") {
+                    try {
+                        std::string result;
+                        if (job_control) {
+                            auto* job_id = tool_params ? json_get_str(tool_params, "job_id") : nullptr;
+                            result = jobs_.status(job_id ? job_id : "", name == "workspace_job_cancel");
+                        } else if (workspace_mutation) {
+                            // Admission-free requests must not touch the query cache.
+                            // Graph dispatch owns its independent committed read snapshot.
+                            auto* path = tool_params ? json_get_str(tool_params, "path") : nullptr;
+                            result = jobs_.start(name == "workspace_remove" ? "remove" :
+                                name == "workspace_refresh" ? "refresh" : "add",
+                                path ? path : "", conn_.db_path(), repo_root_);
+                        } else {
+                            std::unique_lock<std::mutex> gate(writer_gate_, std::try_to_lock);
+                            FileLock probe(conn_.db_path() + ".lock");
+                            result = jobs_.active() || (indexing_ && indexing_->load()) ||
+                                !gate.owns_lock() || !probe.acquire()
+                                ? R"({"status":"busy","retryable":true,"reason":"indexing_or_workspace_job"})"
+                                : R"({"status":"ready","health_check":"in_memory","counts_checked":false})";
+                        }
+                        write_result(id, result);
+                    } catch (const std::exception& e) {
+                        write_error(id, -32602, "invalid_input", e.what(), false);
+                    }
+                    continue;
                 }
-
-                // R2: Per-request staleness check (cheap stat)
-                check_staleness();
-
                 auto it = tools_.find(tool_name);
                 if (it == tools_.end()) {
                     write_error(id, -32601, "invalid_input", std::string("Unknown tool: ") + tool_name);
@@ -162,7 +195,28 @@ public:
                 mcp_log("tool: " + std::string(tool_name) + " " + json_for_log(tool_params));
 
                 try {
-                    std::string result = it->second(tool_params, conn_, cache_, repo_root_);
+                    // Trace ingestion opens a write connection. It alone needs writer
+                    // admission; ordinary reads never contend on this gate or FileLock.
+                    std::unique_lock<std::mutex> gate(writer_gate_, std::defer_lock);
+                    FileLock writer_probe(conn_.db_path() + ".lock");
+                    if (name == "ingest_traces" &&
+                        (!gate.try_lock() || !writer_probe.acquire())) {
+                        write_error(id, -32603, "busy", "Another index writer is active", true);
+                        continue;
+                    }
+                    refresh_read_cache();
+                    check_staleness();
+                    std::string result;
+                    {
+                        ReadSnapshot snapshot(conn_);
+                        try {
+                            result = it->second(tool_params, conn_, cache_, repo_root_);
+                        } catch (...) {
+                            cache_.reset_all();
+                            throw;
+                        }
+                        cache_.reset_all();
+                    } // Release the snapshot before stdout can block or a worker checkpoints.
                     auto elapsed = std::chrono::steady_clock::now() - started;
                     auto result_count = json_result_count(result);
 
@@ -205,8 +259,12 @@ public:
                     auto elapsed = std::chrono::steady_clock::now() - started;
                     mcp_log("error: " + std::string(tool_name) + " (" + format_duration_ms(elapsed) + "): "
                             + truncate_for_log(e.what()));
-                    write_error(id, -32603, "db_error", e.what(), false);
+                    auto* sqlite_error = dynamic_cast<const SqliteError*>(&e);
+                    auto rc = sqlite_error ? sqlite_error->code() : sqlite3_errcode(conn_.raw());
+                    bool busy = rc == SQLITE_BUSY || rc == SQLITE_LOCKED;
+                    write_error(id, -32603, busy ? "busy" : "db_error", e.what(), busy);
                 }
+                cache_.reset_all();
                 continue;
             }
 
@@ -243,6 +301,29 @@ private:
     bool initialized_ = false;
     StalenessState staleness_;
     std::atomic<bool> needs_refresh_{false};
+    std::mutex owned_gate_;
+    std::mutex& writer_gate_;
+    WorkspaceJobs jobs_;
+    const std::atomic<bool>* indexing_ = nullptr;
+    int64_t data_version_ = -1;
+
+    void refresh_read_cache() {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(conn_.raw(), "PRAGMA data_version", -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(conn_.raw()));
+        rc = sqlite3_step(stmt);
+        int64_t version = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : -1;
+        std::string error = rc == SQLITE_ROW ? "" : sqlite3_errmsg(conn_.raw());
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_ROW) throw SqliteError(rc, error);
+        // Detect workspace commits and independent CLI writers too. Preparing with
+        // v2 also reparses statements if a schema commit races this version check.
+        if (needs_refresh_.exchange(false) || version != data_version_) {
+            cache_.clear();
+            staleness_.last_head_mtime = {};
+        }
+        data_version_ = version;
+    }
 
     void handle_initialize(int64_t id) {
         JsonMutDoc doc;
