@@ -293,7 +293,10 @@ static void add_stable_key_if_present(JsonMutDoc& doc, yyjson_mut_val* item,
 
 // Resolve a node by stable_key, node_id, or by symbol+file name lookup.
 // Allows tools to be called with stable identifiers instead of volatile IDs.
-static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCache& cache,
+static std::string resolve_db_path(sqlite3* db, const std::string& path, const std::string& repo_root);
+
+static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache& cache,
+                                const std::string& repo_root,
                                 const char* id_param = "node_id",
                                 std::string* error = nullptr) {
     if (!params) return -1;
@@ -302,15 +305,25 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCa
     // that is reassigned on a full reindex, so callers caching handles across turns
     // should prefer stable_key. Resolving here benefits every node-consuming tool.
     auto* sk_val = yyjson_obj_get(params, "stable_key");
+    if (sk_val && (!yyjson_is_str(sk_val) || yyjson_get_len(sk_val) == 0 ||
+                   std::strlen(yyjson_get_str(sk_val)) != yyjson_get_len(sk_val))) {
+        if (error) *error = McpError::invalid_input("'stable_key' must be a non-empty string").to_json_rpc(0);
+        return -1;
+    }
     if (sk_val && yyjson_is_str(sk_val) && std::strlen(yyjson_get_str(sk_val)) > 0) {
         auto* sk_stmt = cache.get("resolve_node_by_stable_key",
             "SELECT id FROM nodes WHERE stable_key = ? LIMIT 1");
         sqlite3_bind_text(sk_stmt, 1, yyjson_get_str(sk_val), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(sk_stmt) == SQLITE_ROW) return sqlite3_column_int64(sk_stmt, 0);
-        if (error) *error = std::string("stable_key not found: ") + yyjson_get_str(sk_val);
+        if (error) *error = McpError::invalid_input(std::string("stable_key not found: ") + yyjson_get_str(sk_val)).to_json_rpc(0);
         return -1;
     }
 
+    auto* id_val = yyjson_obj_get(params, id_param);
+    if (id_val && (!yyjson_is_int(id_val) || yyjson_get_sint(id_val) < 0)) {
+        if (error) *error = McpError::invalid_input(std::string("'") + id_param + "' must be a non-negative integer").to_json_rpc(0);
+        return -1;
+    }
     int64_t id = json_get_int(params, id_param, -1);
     if (id >= 0) {
         auto* expected_val = yyjson_obj_get(params, "expected_stable_key");
@@ -320,15 +333,15 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCa
                 "SELECT stable_key FROM nodes WHERE id = ? LIMIT 1");
             sqlite3_bind_int64(check_stmt, 1, id);
             if (sqlite3_step(check_stmt) != SQLITE_ROW) {
-                if (error) *error = "node_id " + std::to_string(id) + " not found while checking expected_stable_key";
+                if (error) *error = McpError::invalid_input("node_id " + std::to_string(id) + " not found while checking expected_stable_key").to_json_rpc(0);
                 return -1;
             }
             const char* found = sqlite_text_or_null(check_stmt, 0);
             if (!found || std::strcmp(found, expected) != 0) {
                 if (error) {
-                    *error = "node_id " + std::to_string(id) + " is stale/reused: expected stable_key "
+                    *error = McpError::invalid_input("node_id " + std::to_string(id) + " is stale/reused: expected stable_key "
                         + expected + ", found " + (found ? found : "<null>")
-                        + " — reindex renumbered ids, re-resolve via symbol_search/context_for";
+                        + " — reindex renumbered ids, re-resolve via symbol_search/context_for").to_json_rpc(0);
                 }
                 return -1;
             }
@@ -338,16 +351,67 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& /*conn*/, QueryCa
 
     auto* sym_val = yyjson_obj_get(params, "symbol");
     auto* file_val = yyjson_obj_get(params, "file");
-    if (!sym_val || !file_val) return -1;
+    if (!sym_val && !file_val) {
+        if (error) *error = McpError::invalid_input("Provide 'stable_key', 'node_id', or both 'symbol' and 'file'").to_json_rpc(0);
+        return -1;
+    }
+    if (!yyjson_is_str(sym_val) || !yyjson_is_str(file_val) ||
+        yyjson_get_len(sym_val) == 0 || yyjson_get_len(file_val) == 0 ||
+        std::strlen(yyjson_get_str(sym_val)) != yyjson_get_len(sym_val) ||
+        std::strlen(yyjson_get_str(file_val)) != yyjson_get_len(file_val)) {
+        if (error) *error = McpError::invalid_input("'symbol' and 'file' must be non-empty strings").to_json_rpc(0);
+        return -1;
+    }
+    const std::string input_file(yyjson_get_str(file_val), yyjson_get_len(file_val));
+    if (path_util::lookup_path(input_file).empty()) {
+        if (error) *error = McpError::invalid_input("Invalid 'file' path").to_json_rpc(0);
+        return -1;
+    }
+    auto file = resolve_db_path(conn.raw(), input_file, repo_root);
+    if (file.empty()) {
+        if (error) *error = McpError::not_found("File not found: " + input_file).to_json_rpc(0);
+        return -1;
+    }
 
     auto* stmt = cache.get("resolve_node_by_name_file",
-        "SELECT id FROM nodes WHERE name = ? "
-        "AND file_id = (SELECT id FROM files WHERE path = ?) "
-        "AND node_type = 'symbol' "
-        "ORDER BY is_definition DESC, id ASC LIMIT 1");
-    sqlite3_bind_text(stmt, 1, yyjson_get_str(sym_val), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, yyjson_get_str(file_val), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt) == SQLITE_ROW) return sqlite3_column_int64(stmt, 0);
+        "SELECT n.id, n.name, n.qualname, n.kind, f.path, n.stable_key, n.start_line, n.is_definition "
+        "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id "
+        "WHERE f.path = ? AND n.node_type = 'symbol' AND (n.name = ? OR n.qualname = ?) "
+        "ORDER BY n.is_definition DESC, n.id ASC LIMIT 26");
+    sqlite3_bind_text(stmt, 1, file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, yyjson_get_str(sym_val), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, yyjson_get_str(sym_val), -1, SQLITE_TRANSIENT);
+    JsonMutDoc doc;
+    auto* root = doc.new_obj();
+    doc.set_root(root);
+    auto* candidates = doc.new_arr();
+    int64_t selected = -1;
+    int definition = -1;
+    int count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (definition < 0) definition = sqlite3_column_int(stmt, 7);
+        if (sqlite3_column_int(stmt, 7) != definition) break;
+        selected = sqlite3_column_int64(stmt, 0);
+        if (++count > 25) break;
+        auto* item = doc.new_obj();
+        yyjson_mut_obj_add_int(doc.doc, item, "node_id", selected);
+        const char* keys[] = {"name", "qualname", "kind", "file_path", "stable_key"};
+        for (int col = 1; col <= 5; ++col) {
+            auto* text = sqlite_text_or_null(stmt, col);
+            if (text && *text) yyjson_mut_obj_add_strcpy(doc.doc, item, keys[col - 1], text);
+        }
+        yyjson_mut_obj_add_int(doc.doc, item, "start_line", sqlite3_column_int(stmt, 6));
+        yyjson_mut_arr_append(candidates, item);
+    }
+    if (count == 1) return selected;
+    if (count > 1) {
+        yyjson_mut_obj_add_bool(doc.doc, root, "ambiguous", true);
+        yyjson_mut_obj_add_val(doc.doc, root, "candidates", candidates);
+        if (count > 25) yyjson_mut_obj_add_bool(doc.doc, root, "has_more", true);
+        if (error) *error = doc.to_string();
+    } else if (error) {
+        *error = McpError::not_found(std::string("Symbol not found: ") + yyjson_get_str(sym_val) + " in " + file).to_json_rpc(0);
+    }
     return -1;
 }
 
@@ -1589,52 +1653,64 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
     }
 }
 
-// Resolves a user-supplied path to the canonical absolute path as stored in the DB.
-// - If already absolute: verifies it exists in files, returns it as-is.
-// - If relative: tries exact match of (repo_root + "/" + path), then suffix LIKE '%/' || path.
-// Returns empty string if not found.
+// Preserve stored identity: primary files are relative; merged files use the
+// registered root's native spelling plus a forward-slash relative suffix.
+// Only root-bounded equality candidates are probed, never arbitrary suffixes.
+static std::vector<std::string> db_path_candidates(sqlite3* db, const std::string& path,
+                                                  const std::string& repo_root) {
+    std::vector<std::string> result;
+    auto input = path_util::lookup_path(path);
+    if (input.empty()) return result;
+    auto add = [&](const std::string& candidate) {
+        if (!candidate.empty() && std::find(result.begin(), result.end(), candidate) == result.end())
+            result.push_back(candidate);
+    };
+    add(path);
+    add(input);
+    const bool absolute = std::filesystem::path(input).is_absolute();
+    auto primary = path_util::lookup_path(repo_root);
+    std::string full = absolute ? input : primary + "/" + input;
+    auto under_root = [&](const std::string& raw_root, bool main_root) {
+        auto suffix = path_util::lookup_path_in_root(full, raw_root);
+        if (suffix.empty()) return;
+        if (suffix == ".") {
+            add(raw_root);
+            if (main_root) add(".");
+            return;
+        }
+        if (main_root) add(suffix);
+        std::string stored = raw_root;
+        if (!stored.empty() && stored.back() != '/') stored += '/';
+        add(stored + suffix);
+        add(path_util::lookup_path(stored + suffix));
+    };
+    under_root(repo_root, true);
+    if (absolute) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT path FROM roots", -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const char* root = sqlite_text_or_null(stmt, 0);
+                if (root) under_root(root, false);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    return result;
+}
+
 static std::string resolve_db_path(sqlite3* db, const std::string& path, const std::string& repo_root) {
-    if (std::filesystem::path(path).is_absolute()) {
-        sqlite3_stmt* stmt = nullptr;
-        sqlite3_prepare_v2(db, "SELECT 1 FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr);
-        sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
-        sqlite3_finalize(stmt);
-        return found ? path : std::string();
-    }
-
-    // Try exact match as provided (single-root indexes store repo-relative paths)
-    {
-        sqlite3_stmt* stmt = nullptr;
-        sqlite3_prepare_v2(db, "SELECT 1 FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr);
-        sqlite3_bind_text(stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
-        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
-        sqlite3_finalize(stmt);
-        if (found) return path;
-    }
-
-    // Try exact match: repo_root/path
-    std::string abs = repo_root;
-    if (!abs.empty() && abs.back() != '/') abs += '/';
-    abs += path;
-    {
-        sqlite3_stmt* stmt = nullptr;
-        sqlite3_prepare_v2(db, "SELECT 1 FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr);
-        sqlite3_bind_text(stmt, 1, abs.c_str(), -1, SQLITE_TRANSIENT);
-        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
-        sqlite3_finalize(stmt);
-        if (found) return abs;
-    }
-
-    // Suffix match: any stored path ending with '/' + path
-    std::string like_pat = "%/" + path;
+    auto candidates = db_path_candidates(db, path, repo_root);
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db, "SELECT path FROM files WHERE path LIKE ? LIMIT 1", -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, like_pat.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_prepare_v2(db, "SELECT path FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr) != SQLITE_OK)
+        return {};
     std::string result;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const auto* txt = sqlite3_column_text(stmt, 0);
-        if (txt) result = reinterpret_cast<const char*>(txt);
+    for (const auto& candidate : candidates) {
+        sqlite3_reset(stmt);
+        sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            result = sqlite_text_or_null(stmt, 0);
+            break;
+        }
     }
     sqlite3_finalize(stmt);
     return result;
@@ -1773,19 +1849,21 @@ static bool collect_git_changed_files(const std::string& repo_root,
 // - If relative: resolves against repo_root.
 // Returns empty string if not found.
 static std::string resolve_db_dir_path(sqlite3* db, const std::string& path, const std::string& repo_root) {
-    std::string input = path;
+    std::string input = path_util::lookup_path(path);
     if (input.empty() || input == "." || input == "./") return std::string();
 
     auto exists_as_prefix = [&](const std::string& candidate) -> bool {
         sqlite3_stmt* stmt = nullptr;
         sqlite3_prepare_v2(db,
-            "SELECT 1 FROM files WHERE path = ? OR path GLOB ? LIMIT 1",
+            "SELECT 1 FROM files WHERE path = ? OR (path >= ? AND path < ?) LIMIT 1",
             -1, &stmt, nullptr);
-        std::string glob = candidate;
-        if (!glob.empty() && glob.back() != '/') glob += '/';
-        glob += '*';
+        std::string prefix = candidate;
+        if (!prefix.empty() && prefix.back() != '/') prefix += '/';
+        auto upper = prefix;
+        upper.back() = '0';
         sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, glob.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, prefix.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, upper.c_str(), -1, SQLITE_TRANSIENT);
         bool found = (sqlite3_step(stmt) == SQLITE_ROW);
         sqlite3_finalize(stmt);
         if (found) return true;
@@ -1798,44 +1876,55 @@ static std::string resolve_db_dir_path(sqlite3* db, const std::string& path, con
         return found;
     };
 
-    if (std::filesystem::path(input).is_absolute()) {
-        if (exists_as_prefix(input)) return input;
-        std::error_code ec;
-        auto rel = std::filesystem::relative(std::filesystem::path(input), std::filesystem::path(repo_root), ec);
-        if (!ec) {
-            std::string rel_str = rel.generic_string();
-            if (exists_as_prefix(rel_str)) return rel_str;
-        }
-        return std::string();
+    for (const auto& candidate : db_path_candidates(db, path, repo_root)) {
+        if (exists_as_prefix(candidate)) return candidate;
     }
-
-    if (input.find("..") != std::string::npos) return std::string();
-
-    std::error_code ec;
-    auto canonical = std::filesystem::canonical(std::filesystem::path(repo_root) / input, ec);
-    if (ec) return std::string();
-    auto canonical_root = std::filesystem::canonical(std::filesystem::path(repo_root), ec);
-    if (ec) return std::string();
-    auto rel = std::filesystem::relative(canonical, canonical_root, ec);
-    if (ec) return std::string();
-    std::string validated = rel.generic_string();
-    if (validated.starts_with("..")) return std::string();
-
-    if (exists_as_prefix(validated)) return validated;
-
-    std::string abs = repo_root;
-    if (!abs.empty() && abs.back() != '/') abs += '/';
-    abs += validated;
-    return exists_as_prefix(abs) ? abs : std::string();
+    return {};
 }
 
-static bool canonical_paths_equal(const std::string& lhs, const std::string& rhs) {
-    std::error_code ec;
-    auto lhs_canon = std::filesystem::weakly_canonical(std::filesystem::path(lhs), ec);
-    if (ec) return false;
-    auto rhs_canon = std::filesystem::weakly_canonical(std::filesystem::path(rhs), ec);
-    if (ec) return false;
-    return lhs_canon == rhs_canon;
+static constexpr const char* kPrimaryFileScopeSql = " AND (f.root_id IS NULL OR f.root_id = 0)";
+
+static std::string resolve_db_pattern(sqlite3* db, const std::string& pattern,
+                                      const std::string& repo_root, bool& primary_only) {
+    auto input = path_util::lookup_path(pattern);
+    auto relative = path_util::lookup_path_in_root(input, repo_root);
+    primary_only = false;
+    if (input.empty()) return {};
+    auto wildcard = input.find_first_of("*?[");
+    if (wildcard == std::string::npos) {
+        auto file = resolve_db_path(db, pattern, repo_root);
+        primary_only = !relative.empty() && (file.empty() || !std::filesystem::path(file).is_absolute());
+        return file.empty() ? (primary_only ? relative : input) : file;
+    }
+    auto slash = input.rfind('/', wildcard);
+    if (slash != std::string::npos) {
+        auto prefix = input.substr(0, slash);
+        // Nested extra files can make the primary root look like an absolute DB prefix.
+        if (path_util::lookup_path_in_root(prefix, repo_root) == ".") {
+            primary_only = true;
+            return relative;
+        }
+        auto dir = resolve_db_dir_path(db, prefix, repo_root);
+        if (!dir.empty()) {
+            primary_only = !relative.empty() && !std::filesystem::path(dir).is_absolute();
+            return dir + input.substr(slash);
+        }
+    }
+    if (!relative.empty()) {
+        primary_only = true;
+        return relative;
+    }
+    return input;
+}
+
+static std::string path_parameter_error(yyjson_val* params, const char* key) {
+    auto* value = params ? yyjson_obj_get(params, key) : nullptr;
+    if (!value) return {};
+    if (!yyjson_is_str(value) || yyjson_get_len(value) == 0 ||
+        std::strlen(yyjson_get_str(value)) != yyjson_get_len(value) ||
+        path_util::lookup_path(std::string(yyjson_get_str(value), yyjson_get_len(value))).empty())
+        return McpError::invalid_input(std::string("Invalid '") + key + "': expected a non-empty path string without traversal").to_json_rpc(0);
+    return {};
 }
 
 static bool path_has_db_children(sqlite3* db, const std::string& path) {
@@ -2044,8 +2133,12 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
     auto* root = doc.new_obj();
     doc.set_root(root);
     yyjson_mut_obj_add_int(doc.doc, root, "file_count", count_query("files"));
-    yyjson_mut_obj_add_int(doc.doc, root, "symbol_count", count_query("nodes"));
-    yyjson_mut_obj_add_int(doc.doc, root, "edge_count", count_query("edges"));
+    // No persisted exact graph totals exist. Do not scan millions of nodes/edges
+    // just to report metadata, or substitute MAX(id) for an honest count.
+    yyjson_mut_obj_add_null(doc.doc, root, "symbol_count");
+    yyjson_mut_obj_add_null(doc.doc, root, "edge_count");
+    yyjson_mut_obj_add_bool(doc.doc, root, "graph_counts_checked", false);
+    yyjson_mut_obj_add_str(doc.doc, root, "graph_counts_status", "not_computed");
     yyjson_mut_obj_add_strcpy(doc.doc, root, "last_index_time", last_index.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "indexer_version", idx_version.c_str());
 
@@ -2056,17 +2149,12 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
         const char* sql =
             "SELECT r.id, r.path, "
             "  (SELECT COUNT(*) FROM files f WHERE f.root_id = r.id) AS file_count, "
-            "  (SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = r.id) AS symbol_count, "
-            "  (SELECT COUNT(*) FROM edges e "
-            "     JOIN nodes ns ON e.src_id = ns.id "
-            "     JOIN files f ON ns.file_id = f.id "
-            "     WHERE f.root_id = r.id) AS edge_count "
+            "  NULL AS symbol_count, NULL AS edge_count "
             "FROM roots r "
             "UNION ALL "
             "SELECT 0, '(main)', "
             "  (SELECT COUNT(*) FROM files WHERE root_id = 0), "
-            "  (SELECT COUNT(*) FROM nodes n JOIN files f ON n.file_id = f.id WHERE f.root_id = 0), "
-            "  (SELECT COUNT(*) FROM edges e JOIN nodes ns ON e.src_id = ns.id JOIN files f ON ns.file_id = f.id WHERE f.root_id = 0) "
+            "  NULL, NULL "
             "WHERE EXISTS (SELECT 1 FROM files WHERE root_id = 0) "
             "ORDER BY 1";
         if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) == SQLITE_OK) {
@@ -2075,14 +2163,12 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
                 int64_t rid = sqlite3_column_int64(stmt, 0);
                 auto* p = sqlite3_column_text(stmt, 1);
                 int64_t fc = sqlite3_column_int64(stmt, 2);
-                int64_t sc = sqlite3_column_int64(stmt, 3);
-                int64_t ec = sqlite3_column_int64(stmt, 4);
                 yyjson_mut_obj_add_int(doc.doc, entry, "root_id", rid);
                 yyjson_mut_obj_add_strcpy(doc.doc, entry, "path",
                     p ? reinterpret_cast<const char*>(p) : "");
                 yyjson_mut_obj_add_int(doc.doc, entry, "files", fc);
-                yyjson_mut_obj_add_int(doc.doc, entry, "symbols", sc);
-                yyjson_mut_obj_add_int(doc.doc, entry, "edges", ec);
+                yyjson_mut_obj_add_null(doc.doc, entry, "symbols");
+                yyjson_mut_obj_add_null(doc.doc, entry, "edges");
                 yyjson_mut_arr_append(roots_arr, entry);
             }
             sqlite3_finalize(stmt);
@@ -2218,6 +2304,11 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
         arch_conn = std::make_unique<Connection>(std::filesystem::path(arch_db_file), true);
     }
     Connection& conn = arch_conn ? *arch_conn : mcp_conn;
+    // The production architecture connection is private and must pin its own
+    // snapshot. In-memory calls may already be inside the dispatcher's snapshot.
+    std::unique_ptr<ReadSnapshot> snapshot;
+    if (sqlite3_get_autocommit(conn.raw()))
+        snapshot = std::make_unique<ReadSnapshot>(conn);
 
     int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
     if (limit > 100) limit = 100;
@@ -2720,10 +2811,14 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
 }
 
 // T080: file_search — search file paths by GLOB pattern
-std::string file_search(yyjson_val* params, Connection& /*conn*/,
-                                QueryCache& cache, const std::string& /*repo_root*/) {
+std::string file_search(yyjson_val* params, Connection& conn,
+                                QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "pattern"); !error.empty()) return error;
     const char* pattern = params ? json_get_str(params, "pattern") : nullptr;
     if (!pattern) return McpError::invalid_input("Missing 'pattern' parameter").to_json_rpc(0);
+    bool primary_only = false;
+    auto normalized_pattern = resolve_db_pattern(conn.raw(), pattern, repo_root, primary_only);
+    pattern = normalized_pattern.c_str();
 
     const char* language = params ? json_get_str(params, "language") : nullptr;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -2733,7 +2828,7 @@ std::string file_search(yyjson_val* params, Connection& /*conn*/,
     // Pattern analysis: absolute paths use as-is; patterns with no '/' also match basename
     bool is_absolute_pat = pattern[0] == '/';
     bool has_slash = strchr(pattern, '/') != nullptr;
-    bool add_basename_or = !has_slash && !is_absolute_pat;
+    bool add_basename_or = !primary_only && !has_slash && !is_absolute_pat;
 
     std::string where_sql;
     if (add_basename_or) {
@@ -2743,14 +2838,18 @@ std::string file_search(yyjson_val* params, Connection& /*conn*/,
     }
     std::string cache_key = "file_search";
     if (add_basename_or) cache_key += "_bn";
+    if (primary_only) {
+        where_sql += kPrimaryFileScopeSql;
+        cache_key += "_primary";
+    }
     if (language && strlen(language) > 0) {
         where_sql += " AND language = ?";
         cache_key += "_lang";
     }
 
     std::string sql =
-        "SELECT id, path, language, size_bytes FROM files" + where_sql + " ORDER BY path LIMIT ? OFFSET ?";
-    std::string count_sql = "SELECT COUNT(*) FROM files" + where_sql;
+        "SELECT id, path, language, size_bytes FROM files f" + where_sql + " ORDER BY path LIMIT ? OFFSET ?";
+    std::string count_sql = "SELECT COUNT(*) FROM files f" + where_sql;
 
     auto* stmt = cache.get(cache_key, sql);
     auto* count_stmt = cache.get(cache_key + "_count", count_sql);
@@ -2799,8 +2898,12 @@ std::string file_search(yyjson_val* params, Connection& /*conn*/,
 
 // T081: dir_list — list files in a directory (one level)
 std::string dir_list(yyjson_val* params, Connection& conn,
-                             QueryCache& cache, const std::string& /*repo_root*/) {
+                             QueryCache& cache, const std::string& repo_root) {
     const char* dir_path = params ? json_get_str(params, "path") : nullptr;
+    auto* dir_value = params ? yyjson_obj_get(params, "path") : nullptr;
+    if (!yyjson_is_str(dir_value) || yyjson_get_len(dir_value) != 0) {
+        if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
+    }
     if (!dir_path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
@@ -2811,8 +2914,13 @@ std::string dir_list(yyjson_val* params, Connection& conn,
     // paths are stored without a leading "./", so map "." / "./" to an empty prefix
     // (glob "*") which matches them. In workspace mode (absolute paths) this still
     // yields nothing and the roots-table fallback below handles it.
-    std::string dir = dir_path;
-    if (dir == "." || dir == "./") dir.clear();
+    bool primary_only = path_util::lookup_path_in_root(dir_path, repo_root) == ".";
+    std::string dir = path_util::lookup_path(dir_path);
+    if (dir.empty() || dir == "." || primary_only) dir.clear();
+    else {
+        dir = resolve_db_dir_path(conn.raw(), dir_path, repo_root);
+        if (dir.empty()) return McpError::not_found(std::string("Directory not found: ") + dir_path).to_json_rpc(0);
+    }
     if (!dir.empty() && dir.back() != '/') dir += '/';
 
     // Match files directly under this directory (not in subdirectories)
@@ -2835,14 +2943,17 @@ std::string dir_list(yyjson_val* params, Connection& conn,
         "SELECT 'directory' AS entry_type, "
         "substr(path, 1, instr(substr(path, length(?) + 1), '/') + length(?)) AS entry_path, "
         "'' AS language, 0 AS size_bytes "
-        "FROM files WHERE path GLOB ? AND path GLOB ? "
+        "FROM files f WHERE path GLOB ? AND path GLOB ? "
+        + std::string(primary_only ? kPrimaryFileScopeSql : "") +
         "GROUP BY entry_path "
         "UNION ALL "
         "SELECT 'file' AS entry_type, path AS entry_path, language, size_bytes "
-        "FROM files WHERE path GLOB ? AND path NOT GLOB ?"
+        "FROM files f WHERE path GLOB ? AND path NOT GLOB ?"
+        + std::string(primary_only ? kPrimaryFileScopeSql : "") +
         ")";
 
-    auto* count_stmt = cache.get("dir_list_count",
+    std::string cache_key = primary_only ? "dir_list_primary" : "dir_list";
+    auto* count_stmt = cache.get(cache_key + "_count",
         entry_cte + " SELECT COUNT(*) FROM entries");
     sqlite3_bind_text(count_stmt, 1, dir.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(count_stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
@@ -2852,7 +2963,7 @@ std::string dir_list(yyjson_val* params, Connection& conn,
     sqlite3_bind_text(count_stmt, 6, glob_deep.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
-    auto* stmt = cache.get("dir_list",
+    auto* stmt = cache.get(cache_key,
         entry_cte + " SELECT entry_type, entry_path, language, size_bytes "
         "FROM entries ORDER BY entry_path LIMIT ? OFFSET ?");
     sqlite3_bind_text(stmt, 1, dir.c_str(), -1, SQLITE_TRANSIENT);
@@ -2936,6 +3047,7 @@ std::string dir_list(yyjson_val* params, Connection& conn,
 // T081b: dir_tree — return a directory subtree up to a given depth
 std::string dir_tree(yyjson_val* params, Connection& conn,
                      QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     const char* requested_path = params ? json_get_str(params, "path") : nullptr;
     if (!requested_path) requested_path = ".";
 
@@ -2949,14 +3061,11 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     }
     int64_t max_depth = (depth == 0) ? 20 : std::min<int64_t>(depth, 20);
 
-    bool all_paths = (strcmp(requested_path, ".") == 0 || strcmp(requested_path, "./") == 0);
-    if (!all_paths && std::filesystem::path(requested_path).is_absolute() &&
-        canonical_paths_equal(requested_path, repo_root)) {
-        all_paths = true;
-    }
+    bool all_paths = path_util::lookup_path(requested_path) == ".";
+    bool primary_only = path_util::lookup_path_in_root(requested_path, repo_root) == ".";
 
     std::string resolved_dir;
-    if (!all_paths) {
+    if (!all_paths && !primary_only) {
         resolved_dir = resolve_db_dir_path(conn.raw(), requested_path, repo_root);
         if (resolved_dir.empty()) {
             if (!std::filesystem::path(requested_path).is_absolute()) {
@@ -2972,10 +3081,13 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
         }
     }
 
-    std::string count_sql = "SELECT COUNT(*) FROM files";
-    std::string select_sql = "SELECT path, language, size_bytes FROM files";
+    std::string count_sql = "SELECT COUNT(*) FROM files f";
+    std::string select_sql = "SELECT path, language, size_bytes FROM files f";
     std::string path_glob;
-    if (!all_paths) {
+    if (primary_only) {
+        count_sql += " WHERE (f.root_id IS NULL OR f.root_id = 0)";
+        select_sql += " WHERE (f.root_id IS NULL OR f.root_id = 0)";
+    } else if (!all_paths) {
         std::string prefix = resolved_dir;
         if (!prefix.empty() && prefix.back() != '/') prefix += '/';
         path_glob = prefix + "*";
@@ -2984,10 +3096,10 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     }
     select_sql += " ORDER BY path";
 
-    std::string cache_key = all_paths ? "dir_tree_all" : "dir_tree_dir";
+    std::string cache_key = primary_only ? "dir_tree_primary" : all_paths ? "dir_tree_all" : "dir_tree_dir";
     auto* count_stmt = cache.get(cache_key + "_count", count_sql);
     auto* stmt = cache.get(cache_key, select_sql);
-    if (!all_paths) {
+    if (!all_paths && !primary_only) {
         sqlite3_bind_text(count_stmt, 1, path_glob.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 1, path_glob.c_str(), -1, SQLITE_TRANSIENT);
     }
@@ -2996,11 +3108,8 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
     std::string root_name;
-    if (all_paths) {
-        root_name = (std::filesystem::path(requested_path).is_absolute() &&
-                     canonical_paths_equal(requested_path, repo_root))
-            ? path_basename_or_default(repo_root, ".")
-            : ".";
+    if (all_paths || primary_only) {
+        root_name = primary_only ? path_basename_or_default(repo_root, ".") : ".";
     } else {
         root_name = path_basename_or_default(resolved_dir, resolved_dir);
     }
@@ -3026,7 +3135,7 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     }
 
     std::string relative_prefix;
-    if (!all_paths) {
+    if (!all_paths && !primary_only) {
         relative_prefix = resolved_dir;
         if (!relative_prefix.empty() && relative_prefix.back() != '/') relative_prefix += '/';
     }
@@ -3119,13 +3228,17 @@ std::string dir_tree(yyjson_val* params, Connection& conn,
     "OR instr(lower(COALESCE(" COL ",'')),'test_')>0 THEN 1 ELSE 0 END"
 
 // T062: symbol_search
-std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
-                                   QueryCache& cache, const std::string& /*repo_root*/) {
+std::string symbol_search(yyjson_val* params, Connection& conn,
+                                   QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "file_pattern"); !error.empty()) return error;
     const char* query = params ? json_get_str(params, "query") : nullptr;
     if (!query) return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
 
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    bool primary_only = false;
+    auto normalized_pattern = file_pattern ? resolve_db_pattern(conn.raw(), file_pattern, repo_root, primary_only) : std::string();
+    if (file_pattern) file_pattern = normalized_pattern.c_str();
     const char* match_param = params ? json_get_str(params, "match") : nullptr;
     bool match_all = match_param && std::strcmp(match_param, "all") == 0;
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -3154,15 +3267,19 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
     if (!wildcard) cache_key += match_all ? "_all_terms" : "_any_terms";
     if (!wildcard) cache_key += "_t" + std::to_string(terms.empty() ? 1 : terms.size());
     if (has_file_pattern) cache_key += "_fp";
+    if (primary_only) cache_key += "_primary";
 
     std::string from_sql = wildcard
-        ? "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
+        ? (has_file_pattern
+            ? "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id "
+            : "FROM nodes n LEFT JOIN files f ON n.file_id = f.id ")
         : "FROM nodes_fts fts JOIN nodes n ON fts.rowid = n.id LEFT JOIN files f ON n.file_id = f.id ";
     std::string where_sql = wildcard ? "WHERE 1=1 " : "WHERE nodes_fts MATCH ? ";
     if (has_kind) {
         where_sql += fn_kind ? "AND n.kind IN ('function', 'method') " : "AND n.kind = ? ";
     }
     if (has_file_pattern) where_sql += "AND f.path GLOB ? ";
+    if (primary_only) where_sql += kPrimaryFileScopeSql;
 
     std::string select_sql =
         "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.stable_key "
@@ -3254,10 +3371,14 @@ std::string symbol_search(yyjson_val* params, Connection& /*conn*/,
 #undef CODETOPO_TEST_RANK
 
 // T062b: symbol_list — list/filter symbols without FTS, supports kind, file, and name-glob filters
-std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
-                                QueryCache& cache, const std::string& /*repo_root*/) {
+std::string symbol_list(yyjson_val* params, Connection& conn,
+                                QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "file_path"); !error.empty()) return error;
     const char* kind = params ? json_get_str(params, "kind") : nullptr;
     const char* file_path = params ? json_get_str(params, "file_path") : nullptr;
+    auto resolved_path = file_path ? resolve_db_path(conn.raw(), file_path, repo_root) : std::string();
+    if (file_path) file_path = resolved_path.c_str();
+    bool has_file = params && yyjson_obj_get(params, "file_path");
     const char* name_glob = params ? json_get_str(params, "name_glob") : nullptr;
     bool compact = params ? json_get_bool(params, "compact", false) : false;
     bool include_handles = params ? json_get_bool(params, "include_handles", false) : false;
@@ -3280,7 +3401,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     if (max_bytes > 100000) max_bytes = 100000;
 
     std::string base_where_sql = " WHERE 1=1";
-    if (file_path && strlen(file_path) > 0) base_where_sql += " AND f.path = ?";
+    if (has_file) base_where_sql += " AND f.path = ?";
     if (name_glob && strlen(name_glob) > 0) base_where_sql += " AND n.name GLOB ?";
 
     std::string semantic_sql = "1=1";
@@ -3301,26 +3422,29 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
     std::string where_sql = base_where_sql;
     if (semantic_filters) where_sql += " AND " + semantic_sql;
 
+    std::string from_sql = has_file
+        ? "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id"
+        : "FROM nodes n LEFT JOIN files f ON n.file_id = f.id";
     std::string sql =
         "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature, n.stable_key "
-        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
+        + from_sql + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
+        "SELECT COUNT(*) " + from_sql + where_sql;
     std::string candidate_count_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql;
+        "SELECT COUNT(*) " + from_sql + base_where_sql;
     std::string hidden_public_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql
+        "SELECT COUNT(*) " + from_sql + base_where_sql
         + " AND " + kPublicSymbolSql + " AND NOT (" + semantic_sql + ")";
 
     std::string cache_key = "symbol_list";
     if (kind && strlen(kind) > 0) cache_key += "_k";
-    if (file_path && strlen(file_path) > 0) cache_key += "_f";
+    if (has_file) cache_key += "_f";
     if (name_glob && strlen(name_glob) > 0) cache_key += "_g";
     if (min_span_lines > 0) cache_key += "_s";
 
     auto bind_base = [&](sqlite3_stmt* s, int idx) {
-        if (file_path && strlen(file_path) > 0)
+        if (has_file)
             sqlite3_bind_text(s, idx++, file_path, -1, SQLITE_TRANSIENT);
         if (name_glob && strlen(name_glob) > 0)
             sqlite3_bind_text(s, idx++, name_glob, -1, SQLITE_TRANSIENT);
@@ -3421,6 +3545,7 @@ std::string symbol_list(yyjson_val* params, Connection& /*conn*/,
 // T062c: symbols_in_path — list symbols under a directory subtree
 std::string symbols_in_path(yyjson_val* params, Connection& conn,
                             QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     const char* path = params ? json_get_str(params, "path") : nullptr;
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
@@ -3459,10 +3584,12 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         }
     }
 
-    bool all_paths = (strcmp(path, ".") == 0 || strcmp(path, "./") == 0);
-    std::string resolved_file = all_paths ? std::string() : resolve_db_path(conn.raw(), path, repo_root);
-    std::string resolved_dir = all_paths ? std::string() : resolve_db_dir_path(conn.raw(), path, repo_root);
-    if (!all_paths && resolved_file.empty() && resolved_dir.empty()) {
+    auto normalized_path = path_util::lookup_path(path);
+    bool all_paths = normalized_path == ".";
+    bool primary_only = path_util::lookup_path_in_root(path, repo_root) == ".";
+    std::string resolved_file = all_paths || primary_only ? std::string() : resolve_db_path(conn.raw(), path, repo_root);
+    std::string resolved_dir = all_paths || primary_only ? std::string() : resolve_db_dir_path(conn.raw(), path, repo_root);
+    if (!all_paths && !primary_only && resolved_file.empty() && resolved_dir.empty()) {
         if (!std::filesystem::path(path).is_absolute()) {
             auto validated = path_util::validate_mcp_path(path, repo_root);
             if (validated.empty())
@@ -3473,7 +3600,10 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
 
     std::string base_where_sql = " WHERE 1=1";
     std::vector<std::string> path_binds;
-    if (!resolved_file.empty()) {
+    if (primary_only) {
+        base_where_sql += kPrimaryFileScopeSql;
+        if (!recursive) base_where_sql += " AND f.path NOT GLOB '*/*'";
+    } else if (!resolved_file.empty()) {
         base_where_sql += " AND f.path = ?";
         path_binds.push_back(resolved_file);
     } else if (!all_paths) {
@@ -3512,20 +3642,24 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     std::string where_sql = base_where_sql;
     if (semantic_filters) where_sql += " AND " + semantic_sql;
 
+    std::string from_sql = all_paths
+        ? "FROM nodes n LEFT JOIN files f ON n.file_id = f.id"
+        : "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id";
     std::string sql =
         "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.signature, n.stable_key "
-        "FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql
+        + from_sql + where_sql
         + " ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     std::string count_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + where_sql;
+        "SELECT COUNT(*) " + from_sql + where_sql;
     std::string candidate_count_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql;
+        "SELECT COUNT(*) " + from_sql + base_where_sql;
     std::string hidden_public_sql =
-        "SELECT COUNT(*) FROM nodes n LEFT JOIN files f ON n.file_id = f.id" + base_where_sql
+        "SELECT COUNT(*) " + from_sql + base_where_sql
         + " AND " + kPublicSymbolSql + " AND NOT (" + semantic_sql + ")";
 
     std::string cache_key = "symbols_in_path";
-    if (all_paths) cache_key += "_all";
+    if (primary_only) cache_key += recursive ? "_primary_r" : "_primary_n";
+    else if (all_paths) cache_key += "_all";
     else if (!resolved_file.empty()) cache_key += "_file";
     else cache_key += recursive ? "_dir_r" : "_dir_n";
     if (!kinds.empty()) cache_key += "_k" + std::to_string(kinds.size());
@@ -3679,8 +3813,8 @@ static std::string truncate_source_lines(const std::string& source, int64_t max_
 std::string symbol_get(yyjson_val* params, Connection& conn,
                                QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     bool include_source = params ? json_get_bool(params, "include_source", true) : true;
@@ -3826,8 +3960,8 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
 std::string callers_approx(yyjson_val* params, Connection& conn,
                                     QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -4050,10 +4184,10 @@ std::string callers_approx(yyjson_val* params, Connection& conn,
 
 // T067: callees_approx
 std::string callees_approx(yyjson_val* params, Connection& conn,
-                                    QueryCache& cache, const std::string& /*repo_root*/) {
+                                    QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -4176,10 +4310,10 @@ std::string callees_approx(yyjson_val* params, Connection& conn,
 
 // T065: references
 std::string references(yyjson_val* params, Connection& conn,
-                               QueryCache& cache, const std::string& /*repo_root*/) {
+                               QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
@@ -4225,6 +4359,8 @@ std::string references(yyjson_val* params, Connection& conn,
 // T069: file_summary
 std::string file_summary(yyjson_val* params, Connection& conn,
                                  QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
+    if (auto error = path_parameter_error(params, "file_path"); !error.empty()) return error;
     const char* path = params ? json_get_str(params, "path") : nullptr;
     if (!path && params) path = json_get_str(params, "file_path");
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
@@ -4338,6 +4474,7 @@ std::string file_summary(yyjson_val* params, Connection& conn,
 // T069b: file_overview
 std::string file_overview(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     const char* path = params ? json_get_str(params, "path") : nullptr;
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
@@ -4501,8 +4638,8 @@ std::string file_overview(yyjson_val* params, Connection& conn,
 std::string context_for(yyjson_val* params, Connection& conn,
                                 QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     bool include_source = params ? json_get_bool(params, "include_source", true) : true;
@@ -4755,20 +4892,25 @@ std::string context_for(yyjson_val* params, Connection& conn,
 // T068b: context_by_name — resolve by symbol name, then return context
 std::string context_by_name(yyjson_val* params, Connection& conn,
                             QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "file_pattern"); !error.empty()) return error;
     const char* name = params ? json_get_str(params, "name") : nullptr;
     if (!name || std::strlen(name) == 0)
         return McpError::invalid_input("Missing 'name' parameter").to_json_rpc(0);
 
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    bool primary_only = false;
+    auto normalized_pattern = file_pattern ? resolve_db_pattern(conn.raw(), file_pattern, repo_root, primary_only) : std::string();
+    if (file_pattern) file_pattern = normalized_pattern.c_str();
 
     auto run_match_query = [&](bool prefix) -> std::vector<std::tuple<int64_t, std::string, std::string, std::string, std::string, std::string, int>> {
         std::string sql =
             "SELECT n.id, n.name, n.qualname, n.kind, f.path, n.stable_key, n.start_line "
-            "FROM nodes n "
+            "FROM nodes n INDEXED BY idx_nodes_name_type "
             "LEFT JOIN files f ON n.file_id = f.id "
             "WHERE n.node_type = 'symbol' AND ";
         sql += prefix ? "n.name GLOB ?" : "n.name = ?";
         if (file_pattern && std::strlen(file_pattern) > 0) sql += " AND f.path GLOB ?";
+        if (primary_only) sql += kPrimaryFileScopeSql;
         sql += " ORDER BY length(n.name), length(COALESCE(n.qualname, n.name)), f.path, n.start_line LIMIT 25";
 
         sqlite3_stmt* stmt = nullptr;
@@ -4845,15 +4987,18 @@ std::string context_by_name(yyjson_val* params, Connection& conn,
 // ===== US3: Graph Exploration Tools =====
 
 // T084: entrypoints — find natural starting points
-std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
-                                QueryCache& cache, const std::string& /*repo_root*/) {
+std::string entrypoints(yyjson_val* params, Connection& conn,
+                                QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "scope"); !error.empty()) return error;
     int64_t limit = params ? json_get_int(params, "limit", 20) : 20;
     const char* scope = params ? json_get_str(params, "scope") : nullptr;
 
     // Build scope GLOB pattern if provided
     std::string scope_glob;
+    bool primary_only = false;
     if (scope && strlen(scope) > 0) {
-        scope_glob = scope;
+        scope_glob = resolve_db_pattern(conn.raw(), scope, repo_root, primary_only);
+        if (primary_only && scope_glob == ".") scope_glob = "*";
         // If scope doesn't contain a wildcard, treat it as a prefix
         if (scope_glob.find('*') == std::string::npos && scope_glob.find('?') == std::string::npos) {
             if (scope_glob.back() != '/') scope_glob += '/';
@@ -4875,8 +5020,17 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
             "AND (n.name = 'main' OR n.name = 'Main' OR n.name = 'wmain') ";
         std::string cache_key = "entrypoints_main";
         if (!scope_glob.empty()) {
+            sql =
+                "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key "
+                "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id "
+                "WHERE n.node_type = 'symbol' AND n.kind = 'function' "
+                "AND (n.name = 'main' OR n.name = 'Main' OR n.name = 'wmain') ";
             sql += "AND f.path GLOB ? ";
             cache_key += "_scoped";
+        }
+        if (primary_only) {
+            sql += kPrimaryFileScopeSql;
+            cache_key += "_primary";
         }
         sql += "LIMIT ?";
 
@@ -4911,12 +5065,17 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
         std::string cache_key;
         if (!scope_glob.empty()) {
             sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
-                  "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
-                  "JOIN nodes n ON n.id = top.dst_id "
+                  "FROM (SELECT e.dst_id, COUNT(*) as cnt "
+                  "FROM files f CROSS JOIN nodes sn INDEXED BY idx_nodes_file_id ON sn.file_id = f.id "
+                  "CROSS JOIN edges e INDEXED BY idx_edges_dst ON e.dst_id = sn.id "
+                  "WHERE f.path GLOB ? "
+                  + std::string(primary_only ? kPrimaryFileScopeSql : "") +
+                  "GROUP BY e.dst_id ORDER BY cnt DESC LIMIT ?) top "
+                  "CROSS JOIN nodes n ON n.id = top.dst_id "
                   "LEFT JOIN files f ON n.file_id = f.id "
-                  "WHERE n.node_type = 'symbol' AND f.path GLOB ? "
+                  "WHERE n.node_type = 'symbol' "
                   "ORDER BY top.cnt DESC";
-            cache_key = "entrypoints_indegree_scoped";
+            cache_key = primary_only ? "entrypoints_indegree_scoped_primary" : "entrypoints_indegree_scoped";
         } else {
             sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
                   "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
@@ -4929,9 +5088,9 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
 
         auto* stmt = cache.get(cache_key, sql);
         int bind_idx = 1;
-        sqlite3_bind_int64(stmt, bind_idx++, limit);
         if (!scope_glob.empty())
             sqlite3_bind_text(stmt, bind_idx++, scope_glob.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, bind_idx++, limit);
 
         while (sqlite3_step(stmt) == SQLITE_ROW) {
             auto* item = doc.new_obj();
@@ -4960,8 +5119,8 @@ std::string entrypoints(yyjson_val* params, Connection& /*conn*/,
 std::string impact_of(yyjson_val* params, Connection& conn,
                               QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     int64_t depth = params ? json_get_int(params, "depth", 2) : 2;
@@ -5348,6 +5507,7 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
 // T086: file_deps — include relationships for a file
 std::string file_deps(yyjson_val* params, Connection& conn,
                               QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     const char* path = params ? json_get_str(params, "path") : nullptr;
     if (!path) return McpError::invalid_input("Missing 'path'").to_json_rpc(0);
 
@@ -5776,10 +5936,10 @@ std::string find_implementations(yyjson_val* params, Connection& /*conn*/,
 
 // T089b: find_similar — near-duplicate functions via MinHash fingerprints
 std::string find_similar(yyjson_val* params, Connection& conn,
-                         QueryCache& cache, const std::string& /*repo_root*/) {
+                         QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     double threshold = params ? json_get_double(params, "threshold", 0.8) : 0.8;
@@ -5890,10 +6050,10 @@ std::string find_similar(yyjson_val* params, Connection& conn,
 
 // T090: method_fields — field accesses and calls made by a method
 std::string method_fields(yyjson_val* params, Connection& conn,
-                                  QueryCache& cache, const std::string& /*repo_root*/) {
+                                  QueryCache& cache, const std::string& repo_root) {
     std::string resolve_error;
-    int64_t node_id = resolve_node_id(params, conn, cache, "node_id", &resolve_error);
-    if (!resolve_error.empty()) return McpError::invalid_input(resolve_error).to_json_rpc(0);
+    int64_t node_id = resolve_node_id(params, conn, cache, repo_root, "node_id", &resolve_error);
+    if (!resolve_error.empty()) return resolve_error;
     if (node_id < 0) return McpError::invalid_input("Missing 'node_id'").to_json_rpc(0);
 
     JsonMutDoc doc;
@@ -6022,8 +6182,9 @@ std::string method_fields(yyjson_val* params, Connection& conn,
 }
 
 // T091: dependency_cluster — group methods by shared field access with read/write weighting
-std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
-                               QueryCache& cache, const std::string& /*repo_root*/) {
+std::string dependency_cluster(yyjson_val* params, Connection& conn,
+                               QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     // Accept either file path or class node_id
     auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
     int64_t class_id = params ? json_get_int(params, "class_id", -1) : -1;
@@ -6034,7 +6195,8 @@ std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
     // Resolve file_id
     int64_t file_id = -1;
     if (path_val) {
-        std::string path(yyjson_get_str(path_val));
+        auto path = resolve_db_path(conn.raw(), yyjson_get_str(path_val), repo_root);
+        if (path.empty()) return McpError::not_found("File not found").to_json_rpc(0);
         auto* f_stmt = cache.get("dc_file", "SELECT id FROM files WHERE path = ?");
         sqlite3_bind_text(f_stmt, 1, path.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(f_stmt) == SQLITE_ROW) file_id = sqlite3_column_int64(f_stmt, 0);
@@ -6274,6 +6436,7 @@ std::string dependency_cluster(yyjson_val* params, Connection& /*conn*/,
 // T092: source_at — read raw source lines from a file
 std::string source_at(yyjson_val* params, Connection& conn,
                       QueryCache& /*cache*/, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "path"); !error.empty()) return error;
     const char* path = params ? json_get_str(params, "path") : nullptr;
     if (!path) return McpError::invalid_input("Missing 'path' parameter").to_json_rpc(0);
 
@@ -6321,6 +6484,7 @@ std::string source_at(yyjson_val* params, Connection& conn,
 // MATCH returns exact line numbers directly — no full-file scanning needed.
 std::string code_search(yyjson_val* params, Connection& conn,
                         QueryCache& /*cache*/, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "file_pattern"); !error.empty()) return error;
     const char* query = params ? json_get_str(params, "query") : nullptr;
     if (!query || std::strlen(query) == 0) {
         return McpError::invalid_input("Missing 'query' parameter").to_json_rpc(0);
@@ -6346,6 +6510,9 @@ std::string code_search(yyjson_val* params, Connection& conn,
     bool case_sensitive = params ? json_get_bool(params, "case_sensitive", false) : false;
 
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    bool primary_only = false;
+    auto normalized_pattern = file_pattern ? resolve_db_pattern(conn.raw(), file_pattern, repo_root, primary_only) : std::string();
+    if (file_pattern) file_pattern = normalized_pattern.c_str();
 
     // Query content_fts — each row is a single source line with file_id + line_no.
     std::string sql;
@@ -6353,15 +6520,15 @@ std::string code_search(yyjson_val* params, Connection& conn,
         sql = "SELECT cf.file_id, cf.line_no, f.path "
               "FROM content_fts cf "
               "JOIN files f ON f.id = cf.file_id "
-              "WHERE cf.content MATCH ? AND f.path GLOB ? "
-              "ORDER BY cf.file_id, cf.line_no";
+              "WHERE cf.content MATCH ? AND f.path GLOB ? ";
     } else {
         sql = "SELECT cf.file_id, cf.line_no, f.path "
               "FROM content_fts cf "
               "JOIN files f ON f.id = cf.file_id "
-              "WHERE cf.content MATCH ? "
-              "ORDER BY cf.file_id, cf.line_no";
+              "WHERE cf.content MATCH ? ";
     }
+    if (primary_only) sql += kPrimaryFileScopeSql;
+    sql += " ORDER BY cf.file_id, cf.line_no";
 
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr);
@@ -6887,7 +7054,8 @@ std::string get_traces(yyjson_val* params, Connection& conn,
 }
 
 std::string list_http_calls(yyjson_val* params, Connection& conn,
-                            QueryCache& cache, const std::string& /*repo_root*/) {
+                            QueryCache& cache, const std::string& repo_root) {
+    if (auto error = path_parameter_error(params, "file_pattern"); !error.empty()) return error;
     int limit = params ? static_cast<int>(json_get_int(params, "limit", 100)) : 100;
     if (limit > 500) limit = 500;
     if (limit < 1) limit = 1;
@@ -6896,6 +7064,9 @@ std::string list_http_calls(yyjson_val* params, Connection& conn,
     if (offset < 0) offset = 0;
 
     const char* file_pattern = params ? json_get_str(params, "file_pattern") : nullptr;
+    bool primary_only = false;
+    auto normalized_pattern = file_pattern ? resolve_db_pattern(conn.raw(), file_pattern, repo_root, primary_only) : std::string();
+    if (file_pattern) file_pattern = normalized_pattern.c_str();
 
     std::string count_sql =
         "SELECT COUNT(*) "
@@ -6913,22 +7084,23 @@ std::string list_http_calls(yyjson_val* params, Connection& conn,
         count_sql += " AND f.path GLOB ?";
         list_sql += " AND f.path GLOB ?";
     }
+    if (primary_only) {
+        count_sql += kPrimaryFileScopeSql;
+        list_sql += kPrimaryFileScopeSql;
+    }
     list_sql += " ORDER BY f.path, r.start_line, r.start_col LIMIT ? OFFSET ?";
 
-    auto* count_stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
-                                     ? "list_http_calls_count_glob"
-                                     : "list_http_calls_count",
-                                 count_sql);
+    std::string cache_key = "list_http_calls";
+    if (file_pattern && std::strlen(file_pattern) > 0) cache_key += "_glob";
+    if (primary_only) cache_key += "_primary";
+    auto* count_stmt = cache.get(cache_key + "_count", count_sql);
     if (file_pattern && std::strlen(file_pattern) > 0) {
         sqlite3_bind_text(count_stmt, 1, file_pattern, -1, SQLITE_TRANSIENT);
     }
     int64_t total = 0;
     if (sqlite3_step(count_stmt) == SQLITE_ROW) total = sqlite3_column_int64(count_stmt, 0);
 
-    auto* stmt = cache.get(file_pattern && std::strlen(file_pattern) > 0
-                               ? "list_http_calls_glob"
-                               : "list_http_calls",
-                           list_sql);
+    auto* stmt = cache.get(cache_key, list_sql);
     int bind_idx = 1;
     if (file_pattern && std::strlen(file_pattern) > 0) {
         sqlite3_bind_text(stmt, bind_idx++, file_pattern, -1, SQLITE_TRANSIENT);
@@ -6976,12 +7148,13 @@ std::string list_http_calls(yyjson_val* params, Connection& conn,
 
 // Workspace tool implementations — in a separate section to keep the main tools.cpp clean.
 #include "db/workspace.h"
+#include "util/lock.h"
 #include "util/repo.h"
 
 namespace codetopo {
 namespace tools {
 
-std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
+std::string workspace_add(yyjson_val* params, Connection& conn,
                           QueryCache& cache, const std::string& repo_root) {
     auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
     if (!path_val || !yyjson_get_str(path_val)) {
@@ -6994,7 +7167,7 @@ std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
     }
 
     try {
-        auto main_db = default_db(repo_root);
+        auto main_db = conn.db_path();
         ensure_codetopo_dir(repo_root);
 
         if (!std::filesystem::exists(main_db)) {
@@ -7009,6 +7182,8 @@ std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
         cfg.parse_timeout_s = 5;
         cfg.turbo = false;
 
+        FileLock writer(main_db + ".lock");
+        if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
         WorkspaceDB ws(main_db);
         auto result = ws.add_root(target_path, cfg);
 
@@ -7029,7 +7204,7 @@ std::string workspace_add(yyjson_val* params, Connection& /*conn*/,
     }
 }
 
-std::string workspace_remove(yyjson_val* params, Connection& /*conn*/,
+std::string workspace_remove(yyjson_val* params, Connection& conn,
                              QueryCache& cache, const std::string& repo_root) {
     auto* path_val = params ? yyjson_obj_get(params, "path") : nullptr;
     if (!path_val || !yyjson_get_str(path_val)) {
@@ -7038,11 +7213,13 @@ std::string workspace_remove(yyjson_val* params, Connection& /*conn*/,
     std::string target_path = yyjson_get_str(path_val);
 
     try {
-        auto main_db = default_db(repo_root);
+        auto main_db = conn.db_path();
         if (!std::filesystem::exists(main_db)) {
             return R"({"error":"index.sqlite not found"})";
         }
 
+        FileLock writer(main_db + ".lock");
+        if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
         WorkspaceDB ws(main_db);
         auto result = ws.remove_root(target_path);
 
@@ -7061,33 +7238,36 @@ std::string workspace_remove(yyjson_val* params, Connection& /*conn*/,
     }
 }
 
-std::string workspace_list(yyjson_val* /*params*/, Connection& /*conn*/,
-                           QueryCache& /*cache*/, const std::string& repo_root) {
+std::string workspace_list(yyjson_val* /*params*/, Connection& conn,
+                           QueryCache& /*cache*/, const std::string& /*repo_root*/) {
     try {
-        auto main_db = default_db(repo_root);
-
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
         auto* arr = doc.new_arr();
 
-        if (!std::filesystem::exists(main_db)) {
-            yyjson_mut_obj_add_val(doc.doc, root, "roots", arr);
-            return doc.to_string();
-        }
-
-        WorkspaceDB ws(main_db);
-        auto roots = ws.list_roots();
-
-        for (const auto& r : roots) {
+        sqlite3_stmt* stmt = nullptr;
+        const std::string sql =
+            "SELECT r.id, r.path, "
+            "(SELECT COUNT(*) FROM files WHERE root_id=r.id), "
+            "(SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id=f.id WHERE f.root_id=r.id), "
+            + workspace_edge_count_sql("r.id") + " "
+            "FROM roots r ORDER BY r.id";
+        if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+            throw std::runtime_error(sqlite3_errmsg(conn.raw()));
+        int rc = SQLITE_OK;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "root_id", r.id);
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "path", r.path.c_str());
-            yyjson_mut_obj_add_int(doc.doc, item, "file_count", r.files);
-            yyjson_mut_obj_add_int(doc.doc, item, "symbol_count", r.symbols);
-            yyjson_mut_obj_add_int(doc.doc, item, "edge_count", r.edges);
+            yyjson_mut_obj_add_int(doc.doc, item, "root_id", sqlite3_column_int64(stmt, 0));
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "path",
+                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+            yyjson_mut_obj_add_int(doc.doc, item, "file_count", sqlite3_column_int64(stmt, 2));
+            yyjson_mut_obj_add_int(doc.doc, item, "symbol_count", sqlite3_column_int64(stmt, 3));
+            yyjson_mut_obj_add_int(doc.doc, item, "edge_count", sqlite3_column_int64(stmt, 4));
             yyjson_mut_arr_append(arr, item);
         }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(conn.raw()));
 
         yyjson_mut_obj_add_val(doc.doc, root, "roots", arr);
         return doc.to_string();

@@ -8,6 +8,15 @@
 
 namespace codetopo {
 
+class SqliteError : public std::runtime_error {
+public:
+    SqliteError(int code, const std::string& message)
+        : std::runtime_error(message), code_(code & 0xff) {}
+    int code() const { return code_; }
+private:
+    int code_;
+};
+
 // T010: SQLite connection manager with WAL, FK pragmas, busy_timeout,
 // and SQLITE_CONFIG_HEAP/PAGECACHE pre-allocation.
 class Connection {
@@ -27,6 +36,11 @@ public:
                        4096, static_cast<int>(page_cache_size / 4096));
     }
 
+    std::string db_path() const {
+        const char* path = sqlite3_db_filename(db_, "main");
+        return path ? path : "";
+    }
+
     explicit Connection(const std::filesystem::path& db_path, bool readonly = false) {
         int flags = readonly
             ? (SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX)
@@ -36,21 +50,25 @@ public:
         if (rc != SQLITE_OK) {
             std::string msg = db_ ? sqlite3_errmsg(db_) : "failed to open database";
             if (db_) sqlite3_close(db_);
-            throw std::runtime_error("SQLite open failed: " + msg);
+            throw SqliteError(rc, "SQLite open failed: " + msg);
         }
 
-        // PRAGMA setup
-        exec("PRAGMA journal_mode=WAL");
-        exec("PRAGMA foreign_keys=ON");
-        // 30s (was 5s): on a large index a watch-mode/incremental reindex holds a write
-        // transaction and checkpoints the WAL; a heavy read (e.g. get_architecture) must
-        // wait out that burst rather than fail with "database is locked". WAL still lets
-        // readers and the single writer run concurrently -- this only affects the brief
-        // commit/checkpoint windows.
-        exec("PRAGMA busy_timeout=30000");
-        exec("PRAGMA synchronous=NORMAL");
-        exec("PRAGMA cache_size=-65536");    // 64 MB page cache
-        exec("PRAGMA mmap_size=4294967296");  // 4 GB memory-mapped I/O (R4: covers DB growth past 2GB at 100K+ files)
+        try {
+            exec(readonly ? "PRAGMA busy_timeout=250" : "PRAGMA busy_timeout=30000");
+            // Readers must not try to change journal mode while another connection writes.
+            if (!readonly) exec("PRAGMA journal_mode=WAL");
+            exec("PRAGMA foreign_keys=ON");
+            // Writers retain their 30s contention budget. Read-only connections have a
+            // bounded 250ms budget for genuine locks (e.g. a non-WAL legacy database);
+            // ordinary WAL writer transactions do not block committed reads.
+            exec("PRAGMA synchronous=NORMAL");
+            exec("PRAGMA cache_size=-65536");    // 64 MB page cache
+            exec("PRAGMA mmap_size=4294967296");  // 4 GB memory-mapped I/O (R4: covers DB growth past 2GB at 100K+ files)
+        } catch (...) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+            throw;
+        }
     }
 
     ~Connection() {
@@ -84,7 +102,7 @@ public:
         if (rc != SQLITE_OK) {
             std::string msg = err ? err : "unknown error";
             sqlite3_free(err);
-            throw std::runtime_error("SQLite exec failed: " + msg);
+            throw SqliteError(rc, "SQLite exec failed: " + msg);
         }
     }
 
@@ -133,6 +151,29 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
+};
+
+// A request may execute many statements. Pin one committed main snapshot for
+// all of them, then release it even on exceptions; TEMP writes remain allowed.
+// In-memory callers use their existing connection, never a second empty DB.
+class ReadSnapshot {
+public:
+    explicit ReadSnapshot(Connection& conn) : conn_(conn) {
+        conn_.exec("BEGIN");
+        try {
+            conn_.exec("SELECT name FROM main.sqlite_schema LIMIT 1");
+        } catch (...) {
+            conn_.exec("ROLLBACK");
+            throw;
+        }
+    }
+    ~ReadSnapshot() {
+        sqlite3_exec(conn_.raw(), "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    ReadSnapshot(const ReadSnapshot&) = delete;
+    ReadSnapshot& operator=(const ReadSnapshot&) = delete;
+private:
+    Connection& conn_;
 };
 
 } // namespace codetopo

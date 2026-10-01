@@ -58,6 +58,9 @@ TEST_CASE("repo_stats response has required fields", "[contract][us2]") {
         REQUIRE(yyjson_obj_get(r, "file_count") != nullptr);
         REQUIRE(yyjson_obj_get(r, "symbol_count") != nullptr);
         REQUIRE(yyjson_obj_get(r, "edge_count") != nullptr);
+        REQUIRE(yyjson_is_null(yyjson_obj_get(r, "symbol_count")));
+        REQUIRE(yyjson_is_null(yyjson_obj_get(r, "edge_count")));
+        REQUIRE_FALSE(yyjson_get_bool(yyjson_obj_get(r, "graph_counts_checked")));
         REQUIRE(yyjson_obj_get(r, "last_index_time") != nullptr);
         REQUIRE(yyjson_obj_get(r, "indexer_version") != nullptr);
     }

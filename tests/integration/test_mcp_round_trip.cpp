@@ -118,8 +118,8 @@ static fs::path create_test_db() {
     return db_path;
 }
 
-// T077: repo_stats returns correct counts
-TEST_CASE("MCP repo_stats returns correct counts", "[integration][us2]") {
+// T077: repo_stats reports metadata without scanning the graph
+TEST_CASE("MCP repo_stats reports exact file counts and honest unknown graph totals", "[integration][us2]") {
     auto db_path = create_test_db();
     {
         Connection conn(db_path, true);
@@ -132,9 +132,10 @@ TEST_CASE("MCP repo_stats returns correct counts", "[integration][us2]") {
 
         auto* root = doc.root();
         REQUIRE(json_get_int(root, "file_count") == 2);
-        // 2 file nodes + 2 symbol nodes = 4 nodes total
-        REQUIRE(json_get_int(root, "symbol_count") >= 2);
-        REQUIRE(json_get_int(root, "edge_count") >= 1);
+        REQUIRE(yyjson_is_null(yyjson_obj_get(root, "symbol_count")));
+        REQUIRE(yyjson_is_null(yyjson_obj_get(root, "edge_count")));
+        REQUIRE_FALSE(yyjson_get_bool(yyjson_obj_get(root, "graph_counts_checked")));
+        REQUIRE(std::string(json_get_str(root, "graph_counts_status")) == "not_computed");
 
         auto* idx_ver = json_get_str(root, "indexer_version");
         REQUIRE(idx_ver != nullptr);

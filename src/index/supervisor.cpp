@@ -2,6 +2,7 @@
 #include "db/connection.h"
 #include "db/schema.h"
 #include "util/process.h"
+#include "util/lock.h"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -55,6 +56,17 @@ int run_index_supervisor(const Config& config,
     std::string self = exe_path_override.empty() ? get_self_executable_path() : exe_path_override;
     if (self.empty()) {
         std::cerr << "ERROR: Could not determine own executable path\n";
+        return 1;
+    }
+    auto parent = config.db_path.parent_path();
+    if (!parent.empty()) std::filesystem::create_directories(parent);
+    FileLock writer(config.db_path.string() + ".lock");
+    if (!writer.acquire_blocking(std::chrono::seconds(30),
+            std::chrono::milliseconds(250), std::chrono::milliseconds(2000),
+            [](int64_t pid, std::chrono::milliseconds) {
+                std::cerr << "[index] waiting_for_writer pid=" << pid << "\n";
+            })) {
+        std::cerr << "[index] failed: writer lock busy pid=" << writer.holder_pid() << "\n";
         return 1;
     }
 

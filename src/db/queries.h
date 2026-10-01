@@ -31,6 +31,14 @@ public:
         cache_.clear();
     }
 
+    // Release read snapshots at request boundaries without losing prepared SQL.
+    void reset_all() noexcept {
+        for (auto& [key, stmt] : cache_) {
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+        }
+    }
+
     // Get or prepare a statement. Resets it if already prepared.
     sqlite3_stmt* get(const std::string& name, const std::string& sql) {
         auto it = cache_.find(name);
@@ -44,8 +52,8 @@ public:
         int rc = sqlite3_prepare_v2(conn_.raw(), sql.c_str(),
                                      static_cast<int>(sql.size()), &stmt, nullptr);
         if (rc != SQLITE_OK) {
-            throw std::runtime_error("Failed to prepare SQL '" + name + "': " +
-                                     sqlite3_errmsg(conn_.raw()));
+            throw SqliteError(rc, "Failed to prepare SQL '" + name + "': " +
+                                  sqlite3_errmsg(conn_.raw()));
         }
         cache_[name] = stmt;
         return stmt;

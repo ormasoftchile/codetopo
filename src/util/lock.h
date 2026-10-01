@@ -18,6 +18,7 @@
 #else
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 
 namespace codetopo {
@@ -35,24 +36,40 @@ public:
 
         if (std::filesystem::exists(path_)) {
             auto holder_pid = read_pid();
+            // An empty file can be a creator that has not written its PID yet.
+            if (holder_pid <= 0) return false;
             if (holder_pid > 0 && is_process_alive(holder_pid)) {
                 holder_pid_ = holder_pid;
                 return false;  // Live process holds lock
             }
             // Stale lock — break it
-            std::filesystem::remove(path_);
+            std::error_code ec;
+            if (!std::filesystem::remove(path_, ec) || ec) return false;
             stale_broken_ = true;
         }
 
-        // Write our PID
-        std::ofstream f(path_);
-        if (!f) return false;
+        // Exclusive creation closes the admission race between MCP and CLI writers.
 #ifdef _WIN32
-        f << GetCurrentProcessId();
+        auto handle = CreateFileW(path_.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            holder_pid_ = read_pid();
+            return false;
+        }
+        auto pid = std::to_string(GetCurrentProcessId());
+        DWORD written = 0;
+        bool ok = WriteFile(handle, pid.data(), static_cast<DWORD>(pid.size()), &written, nullptr)
+            && written == pid.size();
+        if (!ok) { CloseHandle(handle); std::filesystem::remove(path_); return false; }
+        lock_handle_ = handle;
 #else
-        f << getpid();
+        int fd = open(path_.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) { holder_pid_ = read_pid(); return false; }
+        auto pid = std::to_string(getpid());
+        bool ok = write(fd, pid.data(), pid.size()) == static_cast<ssize_t>(pid.size());
+        close(fd);
+        if (!ok) { std::filesystem::remove(path_); return false; }
 #endif
-        f.close();
         held_ = true;
         return true;
     }
@@ -90,7 +107,12 @@ public:
 
     void release() {
         if (held_) {
-            std::filesystem::remove(path_);
+#ifdef _WIN32
+            CloseHandle(lock_handle_);
+            lock_handle_ = INVALID_HANDLE_VALUE;
+#endif
+            std::error_code ec;
+            std::filesystem::remove(path_, ec);
             held_ = false;
         }
     }
@@ -108,6 +130,9 @@ private:
     bool held_ = false;
     bool stale_broken_ = false;
     int64_t holder_pid_ = 0;
+#ifdef _WIN32
+    HANDLE lock_handle_ = INVALID_HANDLE_VALUE;
+#endif
 
     int64_t read_pid() {
         std::ifstream f(path_);

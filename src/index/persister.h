@@ -54,7 +54,7 @@ public:
     // --- Batch transaction management for bulk loading ---
     void begin_batch() {
         if (!in_batch_) {
-            conn_.exec("BEGIN TRANSACTION");
+            conn_.exec("BEGIN IMMEDIATE");
             in_batch_ = true;
             batch_count_ = 0;
         }
@@ -73,7 +73,7 @@ public:
     bool flush_if_needed(int batch_size) {
         if (in_batch_ && ++batch_count_ >= batch_size) {
             conn_.exec("COMMIT");
-            conn_.exec("BEGIN TRANSACTION");
+            conn_.exec("BEGIN IMMEDIATE");
             batch_count_ = 0;
             return true;
         }
@@ -170,9 +170,10 @@ public:
                     "WHERE file_id IN (SELECT id FROM __codetopo_force_file_ids)");
                 conn_.exec(
                     "INSERT OR IGNORE INTO __codetopo_force_node_ids(id) "
-                    "SELECT n.id FROM nodes n "
-                    "JOIN files f ON n.node_type = 'file' AND n.name = f.path "
-                    "WHERE f.id IN (SELECT id FROM __codetopo_force_file_ids)");
+                    "SELECT n.id FROM __codetopo_force_file_ids t "
+                    "CROSS JOIN files f ON f.id=t.id "
+                    "CROSS JOIN nodes n INDEXED BY idx_nodes_stable_key ON n.stable_key=f.path||'::file' "
+                    "WHERE n.node_type='file'");
 
                 conn_.exec(
                     "DELETE FROM content_fts "
@@ -226,7 +227,7 @@ public:
         ensure_stmts_cached();
 
         bool own_txn = !in_batch_;
-        if (own_txn) conn_.exec("BEGIN TRANSACTION");
+        if (own_txn) conn_.exec("BEGIN IMMEDIATE");
 
         try {
             // Delete existing file record (cascades to nodes → edges, refs)
@@ -237,19 +238,22 @@ public:
                     "SELECT id FROM files WHERE path = ? AND root_id IS NULL",
                     -1, &find_file_stmt, nullptr);
                 sqlite3_bind_text(find_file_stmt, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
-                while (sqlite3_step(find_file_stmt) == SQLITE_ROW) {
-                    content_fts::delete_file(conn_, sqlite3_column_int64(find_file_stmt, 0));
-                }
+                const int find_rc = sqlite3_step(find_file_stmt);
+                const int64_t existing_file_id = find_rc == SQLITE_ROW
+                    ? sqlite3_column_int64(find_file_stmt, 0) : 0;
                 sqlite3_finalize(find_file_stmt);
+                if (find_rc != SQLITE_ROW && find_rc != SQLITE_DONE)
+                    throw SqliteError(find_rc, "Find existing file failed: " + std::string(sqlite3_errmsg(conn_.raw())));
+                if (existing_file_id > 0) content_fts::delete_file(conn_, existing_file_id);
 
                 auto file_key = make_file_stable_key(file.relative_path);
                 sqlite3_reset(stmt_delete_file_node_);
                 sqlite3_bind_text(stmt_delete_file_node_, 1, file_key.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(stmt_delete_file_node_);
+                step_write(stmt_delete_file_node_);
 
                 sqlite3_reset(stmt_delete_file_);
                 sqlite3_bind_text(stmt_delete_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
-                sqlite3_step(stmt_delete_file_);
+                step_write(stmt_delete_file_);
             }
 
             // Insert file record
@@ -267,7 +271,7 @@ public:
                 } else {
                     sqlite3_bind_text(stmt_insert_file_, 7, parse_error.c_str(), -1, SQLITE_STATIC);
                 }
-                sqlite3_step(stmt_insert_file_);
+                step_write(stmt_insert_file_);
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
                 last_file_id_ = file_id;
             }
@@ -279,7 +283,7 @@ public:
                 sqlite3_reset(stmt_insert_file_node_);
                 sqlite3_bind_text(stmt_insert_file_node_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt_insert_file_node_, 2, file_key.c_str(), -1, SQLITE_STATIC);
-                sqlite3_step(stmt_insert_file_node_);
+                step_write(stmt_insert_file_node_);
                 file_node_id = sqlite3_last_insert_rowid(conn_.raw());
             }
 
@@ -322,7 +326,7 @@ public:
                             else sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 12, sym.doc.c_str(), -1, SQLITE_STATIC);
                             sqlite3_bind_text(stmt_batch_insert_symbol_, base_param + 13, sym.stable_key.c_str(), -1, SQLITE_STATIC);
                         }
-                        sqlite3_step(stmt_batch_insert_symbol_);
+                        step_write(stmt_batch_insert_symbol_);
                         // Compute IDs arithmetically: last_insert_rowid is the LAST row's ID
                         int64_t last_id = sqlite3_last_insert_rowid(conn_.raw());
                         int64_t first_id = last_id - (SYMBOL_BATCH_SIZE - 1);
@@ -357,7 +361,7 @@ public:
                     else sqlite3_bind_text(stmt_insert_symbol_, 13, sym.doc.c_str(), -1, SQLITE_STATIC);
                     sqlite3_bind_text(stmt_insert_symbol_, 14, sym.stable_key.c_str(), -1, SQLITE_STATIC);
 
-                    sqlite3_step(stmt_insert_symbol_);
+                    step_write(stmt_insert_symbol_);
                     symbol_ids.push_back(sqlite3_last_insert_rowid(conn_.raw()));
                 }
             }
@@ -409,7 +413,7 @@ public:
                             else
                                 sqlite3_bind_text(stmt_batch_insert_ref_, base_param + 11, ref.receiver_type_hint.c_str(), -1, SQLITE_STATIC);
                         }
-                        sqlite3_step(stmt_batch_insert_ref_);
+                        step_write(stmt_batch_insert_ref_);
                     }
                 }
                 
@@ -439,7 +443,7 @@ public:
                     else sqlite3_bind_text(stmt_insert_ref_, 11, ref.arg_pattern.c_str(), -1, SQLITE_STATIC);
                     if (ref.receiver_type_hint.empty()) sqlite3_bind_null(stmt_insert_ref_, 12);
                     else sqlite3_bind_text(stmt_insert_ref_, 12, ref.receiver_type_hint.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_step(stmt_insert_ref_);
+                    step_write(stmt_insert_ref_);
                 }
             }
 
@@ -484,7 +488,7 @@ public:
                             else 
                                 sqlite3_bind_text(stmt_batch_insert_edge_, base_param + 4, edge_ptr->evidence.c_str(), -1, SQLITE_STATIC);
                         }
-                        sqlite3_step(stmt_batch_insert_edge_);
+                        step_write(stmt_batch_insert_edge_);
                     }
                 }
                 
@@ -500,7 +504,7 @@ public:
                     sqlite3_bind_double(stmt_insert_edge_, 4, edge_ptr->confidence);
                     if (edge_ptr->evidence.empty()) sqlite3_bind_null(stmt_insert_edge_, 5);
                     else sqlite3_bind_text(stmt_insert_edge_, 5, edge_ptr->evidence.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_step(stmt_insert_edge_);
+                    step_write(stmt_insert_edge_);
                 }
             }
 
@@ -509,11 +513,12 @@ public:
 
         } catch (...) {
             if (own_txn || in_batch_) {
-                conn_.exec("ROLLBACK");
+                if (!sqlite3_get_autocommit(conn_.raw())) conn_.exec("ROLLBACK");
                 in_batch_ = false;
                 batch_count_ = 0;
             }
-            return false;
+            last_file_id_ = -1;
+            throw;
         }
     }
 
@@ -1222,6 +1227,21 @@ private:
     bool in_batch_ = false;
     int batch_count_ = 0;
 
+    void step_write(sqlite3_stmt* stmt) {
+        const int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            const std::string message = sqlite3_errmsg(conn_.raw());
+            sqlite3_reset(stmt);
+            throw SqliteError(rc, "Persist statement failed: " + message);
+        }
+    }
+
+    void prepare_cached(const char* sql, sqlite3_stmt** stmt) {
+        const int rc = sqlite3_prepare_v2(conn_.raw(), sql, -1, stmt, nullptr);
+        if (rc != SQLITE_OK)
+            throw SqliteError(rc, "Persist prepare failed: " + std::string(sqlite3_errmsg(conn_.raw())));
+    }
+
     // Cached prepared statements for persist_file() — prepared once, reused via reset/clear_bindings
     sqlite3_stmt* stmt_delete_file_ = nullptr;
     sqlite3_stmt* stmt_delete_file_node_ = nullptr;
@@ -1244,34 +1264,34 @@ private:
     void ensure_stmts_cached() {
         if (stmts_cached_) return;
 
-        sqlite3_prepare_v2(conn_.raw(),
-            "DELETE FROM files WHERE path = ? AND root_id IS NULL", -1, &stmt_delete_file_, nullptr);
+        prepare_cached(
+            "DELETE FROM files WHERE path = ? AND root_id IS NULL", &stmt_delete_file_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "DELETE FROM nodes WHERE node_type = 'file' AND stable_key = ?",
-            -1, &stmt_delete_file_node_, nullptr);
+            &stmt_delete_file_node_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO files(path, language, size_bytes, mtime_ns, content_hash, parse_status, parse_error) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_file_, nullptr);
+            "VALUES(?, ?, ?, ?, ?, ?, ?)", &stmt_insert_file_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
-            "VALUES('file', NULL, 'file', ?, ?)", -1, &stmt_insert_file_node_, nullptr);
+            "VALUES('file', NULL, 'file', ?, ?)", &stmt_insert_file_node_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, fingerprint, "
             "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
-            "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_symbol_, nullptr);
+            "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", &stmt_insert_symbol_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id, "
             "arg_count, arg_pattern, receiver_type_hint) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt_insert_ref_, nullptr);
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", &stmt_insert_ref_);
 
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-            "VALUES(?, ?, ?, ?, ?)", -1, &stmt_insert_edge_, nullptr);
+            "VALUES(?, ?, ?, ?, ?)", &stmt_insert_edge_);
 
         stmts_cached_ = true;
     }
@@ -1286,7 +1306,7 @@ private:
             if (i > 0) sql += ",";
             sql += "(?,?,?,?,?,?,?,?,?,?,?,?)";
         }
-        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_ref_, nullptr);
+        prepare_cached(sql.c_str(), &stmt_batch_insert_ref_);
     }
 
     void ensure_batch_edge_stmt() {
@@ -1298,7 +1318,7 @@ private:
             if (i > 0) sql += ",";
             sql += "(?,?,?,?,?)";
         }
-        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_edge_, nullptr);
+        prepare_cached(sql.c_str(), &stmt_batch_insert_edge_);
     }
 
     // DEC-039 OPT-1: Lazy-prepare 20-row batch symbol INSERT
@@ -1313,7 +1333,7 @@ private:
             if (i > 0) sql += ",";
             sql += "('symbol',?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         }
-        sqlite3_prepare_v2(conn_.raw(), sql.c_str(), -1, &stmt_batch_insert_symbol_, nullptr);
+        prepare_cached(sql.c_str(), &stmt_batch_insert_symbol_);
     }
 
     void finalize_cached_stmts() {

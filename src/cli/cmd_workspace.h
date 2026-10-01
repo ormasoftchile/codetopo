@@ -132,6 +132,8 @@ inline int run_workspace_list(const std::string& root_str) {
     }
 
     try {
+        FileLock writer(db_path + ".lock");
+        if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
         WorkspaceDB ws(db_path);
         auto roots = ws.list_roots();
 

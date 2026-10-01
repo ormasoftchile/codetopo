@@ -161,6 +161,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_lock.cpp
     tests/unit/test_mcp_correctness.cpp
     tests/unit/test_path_normalize.cpp
+    tests/unit/test_lookup_api.cpp
     tests/unit/test_placeholder.cpp
     tests/unit/test_process.cpp
     tests/unit/test_resource_limits.cpp
@@ -178,6 +179,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_approx_callgraph.cpp
     tests/unit/test_detect_changes.cpp
     tests/unit/test_workspace_merge.cpp
+    tests/unit/test_workspace_jobs.cpp
     tests/unit/test_trace_tools.cpp
     tests/unit/test_targeted_reindex.cpp
 )
