@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <spawn.h>
 #include <signal.h>
+#include <fcntl.h>
 extern char** environ;
 #endif
 
@@ -137,7 +138,7 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
     int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
                          const_cast<char* const*>(argv.data()), environ);
@@ -179,7 +180,7 @@ int spawn_and_wait_with_stall_timeout(
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addclose(&actions, STDIN_FILENO);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
     int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
                          const_cast<char* const*>(argv.data()), environ);

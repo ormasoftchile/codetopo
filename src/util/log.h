@@ -81,6 +81,26 @@ inline std::string format_with_commas(int64_t value) {
     return formatted;
 }
 
+inline std::atomic<bool>& mcp_notify_active() {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+
+inline std::atomic<int>& mcp_log_level() {
+    static std::atomic<int> level{1};
+    return level;
+}
+
+inline std::optional<int> mcp_log_level_value(std::string_view level) {
+    constexpr std::string_view levels[] = {
+        "debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"
+    };
+    for (int i = 0; i < 8; ++i) {
+        if (level == levels[i]) return i;
+    }
+    return std::nullopt;
+}
+
 inline void mcp_log(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
@@ -97,6 +117,19 @@ inline void mcp_log(const std::string& msg) {
     // Always write to stderr (visible in terminal / VS Code output channel).
     std::cerr << line << "\n" << std::flush;
 
+    if (mcp_notify_active().load(std::memory_order_relaxed) &&
+        mcp_log_level().load(std::memory_order_relaxed) <= 1) {
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        doc.set_root(root);
+        yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
+        yyjson_mut_obj_add_str(doc.doc, root, "method", "notifications/message");
+        auto* params = doc.new_obj();
+        yyjson_mut_obj_add_str(doc.doc, params, "level", "info");
+        yyjson_mut_obj_add_strcpy(doc.doc, params, "data", line.c_str());
+        yyjson_mut_obj_add_val(doc.doc, root, "params", params);
+        json_write_line(doc.to_string());
+    }
 }
 
 inline std::string truncate_for_log(std::string text, size_t max_len = 120) {

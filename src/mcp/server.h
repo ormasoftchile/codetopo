@@ -71,6 +71,13 @@ public:
 
     // T057: Main stdio loop — read NDJSON, dispatch, write response.
     int run() {
+        struct LogSession {
+            LogSession() {
+                mcp_notify_active().store(false, std::memory_order_relaxed);
+                mcp_log_level().store(1, std::memory_order_relaxed);
+            }
+            ~LogSession() { mcp_notify_active().store(false, std::memory_order_relaxed); }
+        } log_session;
         StdioInput input;
 
         while (true) {
@@ -122,6 +129,26 @@ public:
             if (method_str == "notifications/initialized") {
                 // No response needed for notifications
                 initialized_ = true;
+                mcp_notify_active().store(true, std::memory_order_relaxed);
+                mcp_log("logging: client initialized, live logs enabled");
+                continue;
+            }
+            if (method_str == "logging/setLevel") {
+                auto* level_val = params_val ? yyjson_obj_get(params_val, "level") : nullptr;
+                const char* level = level_val ? yyjson_get_str(level_val) : nullptr;
+                auto parsed = mcp_log_level_value(level ? level : "");
+                if (!parsed) {
+                    write_error(id, -32602, "invalid_input", "Invalid or missing logging level");
+                    continue;
+                }
+                mcp_log_level().store(*parsed, std::memory_order_relaxed);
+                JsonMutDoc response;
+                auto* root = response.new_obj();
+                response.set_root(root);
+                yyjson_mut_obj_add_str(response.doc, root, "jsonrpc", "2.0");
+                yyjson_mut_obj_add_int(response.doc, root, "id", id);
+                yyjson_mut_obj_add_val(response.doc, root, "result", response.new_obj());
+                json_write_line(response.to_string());
                 continue;
             }
             if (method_str == "ping") {
@@ -340,6 +367,7 @@ private:
         auto* tools_cap = doc.new_obj();
         yyjson_mut_obj_add_bool(doc.doc, tools_cap, "listChanged", false);
         yyjson_mut_obj_add_val(doc.doc, caps, "tools", tools_cap);
+        yyjson_mut_obj_add_val(doc.doc, caps, "logging", doc.new_obj());
         yyjson_mut_obj_add_val(doc.doc, result, "capabilities", caps);
 
         auto* server_info = doc.new_obj();
