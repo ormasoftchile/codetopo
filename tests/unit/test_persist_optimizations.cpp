@@ -14,6 +14,7 @@
 #include "index/persister.h"
 #include "index/extractor.h"
 #include "index/scanner.h"
+#include "index/persist_queue.h"
 #include <sqlite3.h>
 #include <filesystem>
 #include <string>
@@ -562,63 +563,147 @@ TEST_CASE("OPT-2: Empty extraction (0 symbols, 0 refs) causes no crash", "[persi
 // Note: These tests verify queue mechanics. Full threading tests may require
 // a separate integration test or mock queue structure.
 
-TEST_CASE("OPT-3: Queue accepts multiple results and persists in order", "[persist_opt][persist_thread][!mayfail]") {
-    // This test requires the ResultQueue + persist_thread_fn infrastructure.
-    // If not yet implemented, mark as [!mayfail] or SKIP.
-    
+TEST_CASE("OPT-3: Queue accepts multiple results and persists in order", "[persist_opt][persist_thread]") {
     auto tmp = make_test_dir("test_persist_queue");
     auto db_path = tmp / "queue.sqlite";
 
     {
         Connection conn(db_path);
         schema::ensure_schema(conn);
+        Persister persister(conn);
 
-        // Mock test: If ResultQueue exists, push 3 results and verify all persisted
-        // For now, this is a placeholder — implementation will wire up actual queue
-        
-        // Expected: 3 files pushed → 3 files in DB after drain
-        WARN("OPT-3 test placeholder — requires ResultQueue implementation");
-        
-        // Temporary assertion to ensure test is recognized but skipped
-        REQUIRE(true);
+        PersistQueue queue(10);
+        for (int i = 0; i < 3; ++i) {
+            PersistItem item;
+            item.parsed.file = make_scanned_file("src/q_file_" + std::to_string(i) + ".cpp");
+            item.parsed.extraction = make_extraction_with_symbols(5, "q_sym_" + std::to_string(i));
+            item.parsed.content_hash = "hash_q_" + std::to_string(i);
+            item.parsed.parse_status = "ok";
+            item.work_list_index = i;
+            queue.push(std::move(item));
+        }
+
+        CHECK(queue.size() == 3);
+
+        persister.begin_batch();
+        for (int i = 0; i < 3; ++i) {
+            auto popped = queue.pop();
+            REQUIRE(popped.has_value());
+            CHECK(popped->work_list_index == i);
+            bool ok = persister.persist_file(popped->parsed.file,
+                                             popped->parsed.extraction,
+                                             popped->parsed.content_hash,
+                                             popped->parsed.parse_status);
+            CHECK(ok == true);
+        }
+        persister.commit_batch();
+
+        CHECK(queue.empty());
+        REQUIRE(count_rows(conn, "files") == 3);
+        // 3 files + 3 * 5 symbols = 18 nodes
+        REQUIRE(count_rows(conn, "nodes") == 18);
     }
     cleanup(tmp);
 }
 
-TEST_CASE("OPT-3: Persist thread drains queue before shutdown", "[persist_opt][persist_thread][!mayfail]") {
+TEST_CASE("OPT-3: Persist thread drains queue before shutdown", "[persist_opt][persist_thread]") {
     auto tmp = make_test_dir("test_persist_drain");
     auto db_path = tmp / "drain.sqlite";
 
     {
         Connection conn(db_path);
         schema::ensure_schema(conn);
+        Persister persister(conn);
 
-        // Expected behavior:
-        // 1. Push N results to queue
-        // 2. Signal shutdown
-        // 3. Verify queue is empty and all N results persisted
-        
-        WARN("OPT-3 drain test placeholder — requires shutdown signal + drain logic");
-        REQUIRE(true);
+        const int kItemCount = 10;
+        PersistQueue queue(4); // Smaller bounded capacity to exercise concurrency
+
+        std::thread producer([&queue, kItemCount]() {
+            for (int i = 0; i < kItemCount; ++i) {
+                PersistItem item;
+                item.parsed.file = make_scanned_file("src/drain_" + std::to_string(i) + ".cpp");
+                item.parsed.extraction = make_extraction_with_symbols(2, "drain_sym_" + std::to_string(i));
+                item.parsed.content_hash = "drain_hash_" + std::to_string(i);
+                item.parsed.parse_status = "ok";
+                item.work_list_index = i;
+                queue.push(std::move(item));
+            }
+            queue.close();
+        });
+
+        int received = 0;
+        persister.begin_batch();
+        while (auto item = queue.pop()) {
+            CHECK(item->work_list_index == received);
+            bool ok = persister.persist_file(item->parsed.file,
+                                             item->parsed.extraction,
+                                             item->parsed.content_hash,
+                                             item->parsed.parse_status);
+            CHECK(ok == true);
+            received++;
+        }
+        persister.commit_batch();
+
+        producer.join();
+
+        CHECK(received == kItemCount);
+        REQUIRE(count_rows(conn, "files") == kItemCount);
     }
     cleanup(tmp);
 }
 
-TEST_CASE("OPT-3: Error in persist does not crash pipeline", "[persist_opt][persist_thread][!mayfail]") {
+TEST_CASE("OPT-3: Error in persist does not crash pipeline", "[persist_opt][persist_thread]") {
     auto tmp = make_test_dir("test_persist_error_resilience");
     auto db_path = tmp / "error.sqlite";
 
     {
         Connection conn(db_path);
         schema::ensure_schema(conn);
+        Persister persister(conn);
 
-        // Expected behavior:
-        // 1. Push a result that will cause persist error (e.g., malformed data)
-        // 2. Verify error is caught and logged/counted
-        // 3. Verify pipeline continues (subsequent results still persist)
-        
-        WARN("OPT-3 error resilience placeholder — requires error injection");
-        REQUIRE(true);
+        PersistQueue queue(10);
+        PersistThreadState state;
+
+        // Push 1 valid, 1 error item, 1 valid item
+        for (int i = 0; i < 3; ++i) {
+            PersistItem item;
+            item.parsed.file = make_scanned_file("src/err_file_" + std::to_string(i) + ".cpp");
+            if (i == 1) {
+                item.parsed.parse_status = "failed";
+                item.parsed.parse_error = "Syntax error at line 42";
+                item.parsed.has_error = true;
+            } else {
+                item.parsed.extraction = make_extraction_with_symbols(2, "ok_sym_" + std::to_string(i));
+                item.parsed.content_hash = "ok_hash_" + std::to_string(i);
+                item.parsed.parse_status = "ok";
+            }
+            item.work_list_index = i;
+            queue.push(std::move(item));
+        }
+        queue.close();
+
+        persister.begin_batch();
+        while (auto item = queue.pop()) {
+            if (item->parsed.has_error || item->parsed.parse_status == "failed") {
+                state.persist_errors++;
+            } else {
+                bool ok = persister.persist_file(item->parsed.file,
+                                                 item->parsed.extraction,
+                                                 item->parsed.content_hash,
+                                                 item->parsed.parse_status);
+                if (ok) {
+                    state.persisted_count++;
+                } else {
+                    state.persist_errors++;
+                }
+            }
+        }
+        persister.commit_batch();
+
+        CHECK(state.persisted_count == 2);
+        CHECK(state.persist_errors == 1);
+        CHECK(state.fatal_error == false);
+        REQUIRE(count_rows(conn, "files") == 2);
     }
     cleanup(tmp);
 }

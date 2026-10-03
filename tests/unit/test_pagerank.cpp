@@ -163,4 +163,61 @@ TEST_CASE("symbol_search ranks higher-centrality symbols first", "[unit][pageran
     auto* ep_rank = yyjson_obj_get(ep_first, "rank");
     REQUIRE(ep_rank);
     CHECK(yyjson_get_real(ep_rank) > 0.0);
+
+    // Verify symbol_get returns rank
+    int64_t parse_core_id = yyjson_get_sint(yyjson_obj_get(first, "node_id"));
+    auto get_params = json_parse("{\"node_id\":" + std::to_string(parse_core_id) + "}");
+    std::string get_resp = tools::symbol_get(get_params.root(), conn, cache, temp.dir.string());
+    auto get_doc = json_parse(get_resp);
+    REQUIRE(get_doc);
+    auto* get_rank = yyjson_obj_get(get_doc.root(), "rank");
+    REQUIRE(get_rank);
+    CHECK(yyjson_get_real(get_rank) > 0.0);
+
+    // Verify symbol_get_batch returns rank
+    auto batch_params = json_parse("{\"node_ids\":[" + std::to_string(parse_core_id) + "]}");
+    std::string batch_resp = tools::symbol_get_batch(batch_params.root(), conn, cache, temp.dir.string());
+    auto batch_doc = json_parse(batch_resp);
+    REQUIRE(batch_doc);
+    auto* batch_results = yyjson_obj_get(batch_doc.root(), "results");
+    REQUIRE(batch_results);
+    REQUIRE(yyjson_arr_size(batch_results) == 1);
+    auto* batch_first = yyjson_arr_get(batch_results, 0);
+    auto* batch_rank = yyjson_obj_get(batch_first, "rank");
+    REQUIRE(batch_rank);
+    CHECK(yyjson_get_real(batch_rank) > 0.0);
+
+    // Verify context_for returns rank on symbol
+    auto ctx_params = json_parse("{\"node_id\":" + std::to_string(parse_core_id) + "}");
+    std::string ctx_resp = tools::context_for(ctx_params.root(), conn, cache, temp.dir.string());
+    auto ctx_doc = json_parse(ctx_resp);
+    REQUIRE(ctx_doc);
+    auto* ctx_symbol = yyjson_obj_get(ctx_doc.root(), "symbol");
+    REQUIRE(ctx_symbol);
+    auto* ctx_rank = yyjson_obj_get(ctx_symbol, "rank");
+    REQUIRE(ctx_rank);
+    CHECK(yyjson_get_real(ctx_rank) > 0.0);
+
+    // Verify get_architecture hotspots expose rank
+    std::string arch_resp = tools::get_architecture(nullptr, conn, cache, temp.dir.string());
+    auto arch_doc = json_parse(arch_resp);
+    REQUIRE(arch_doc);
+    auto* arch_hotspots = yyjson_obj_get(arch_doc.root(), "hotspots");
+    REQUIRE(arch_hotspots);
+    if (yyjson_arr_size(arch_hotspots) > 0) {
+        auto* arch_first = yyjson_arr_get(arch_hotspots, 0);
+        auto* arch_rank = yyjson_obj_get(arch_first, "rank");
+        REQUIRE(arch_rank);
+        CHECK(yyjson_get_real(arch_rank) > 0.0);
+    }
+
+    // Verify impact_of returns rank on symbol
+    std::string impact_resp = tools::impact_of(ctx_params.root(), conn, cache, temp.dir.string());
+    auto impact_doc = json_parse(impact_resp);
+    REQUIRE(impact_doc);
+    auto* impact_symbol = yyjson_obj_get(impact_doc.root(), "symbol");
+    REQUIRE(impact_symbol);
+    auto* impact_rank = yyjson_obj_get(impact_symbol, "rank");
+    REQUIRE(impact_rank);
+    CHECK(yyjson_get_real(impact_rank) > 0.0);
 }
