@@ -35,8 +35,8 @@ struct ScopedPhase {
             phase.add(elapsed);
         }
     }
-    ScopedPhase(const ScopedPhase&) = delete;
-    ScopedPhase& operator=(const ScopedPhase&) = delete;
+    ScopedPhase(const ScopedPhase&) = delete("ScopedPhase times a specific lexical scope and cannot be copied");
+    ScopedPhase& operator=(const ScopedPhase&) = delete("ScopedPhase times a specific lexical scope and cannot be copied");
 };
 
 // Per-index-run profiler with named phase accumulators.

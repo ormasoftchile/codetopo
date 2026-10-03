@@ -20,8 +20,8 @@ public:
         }
     }
 
-    QueryCache(const QueryCache&) = delete;
-    QueryCache& operator=(const QueryCache&) = delete;
+    QueryCache(const QueryCache&) = delete("QueryCache manages raw sqlite3_stmt pointers and cannot be copied");
+    QueryCache& operator=(const QueryCache&) = delete("QueryCache manages raw sqlite3_stmt pointers and cannot be copied");
 
     // Invalidate all cached prepared statements (e.g. after re-index).
     void clear() {

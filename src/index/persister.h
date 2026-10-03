@@ -8,6 +8,7 @@
 #include "util/log.h"
 #include "db/schema.h"
 #include "db/fts.h"
+#include "db/bind.h"
 #include <sqlite3.h>
 #include <algorithm>
 #include <cctype>
@@ -48,8 +49,8 @@ public:
     }
 
     // Non-copyable, non-movable (owns raw sqlite3_stmt pointers)
-    Persister(const Persister&) = delete;
-    Persister& operator=(const Persister&) = delete;
+    Persister(const Persister&) = delete("Persister owns raw sqlite3_stmt pointers bound to a connection and cannot be copied");
+    Persister& operator=(const Persister&) = delete("Persister owns raw sqlite3_stmt pointers bound to a connection and cannot be copied");
 
     // --- Batch transaction management for bulk loading ---
     void begin_batch() {
@@ -247,30 +248,24 @@ public:
                 if (existing_file_id > 0) content_fts::delete_file(conn_, existing_file_id);
 
                 auto file_key = make_file_stable_key(file.relative_path);
-                sqlite3_reset(stmt_delete_file_node_);
-                sqlite3_bind_text(stmt_delete_file_node_, 1, file_key.c_str(), -1, SQLITE_TRANSIENT);
+                db::bind(stmt_delete_file_node_, file_key);
                 step_write(stmt_delete_file_node_);
 
-                sqlite3_reset(stmt_delete_file_);
-                sqlite3_bind_text(stmt_delete_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
+                db::bind(stmt_delete_file_, file.relative_path);
                 step_write(stmt_delete_file_);
             }
 
             // Insert file record
             int64_t file_id;
             {
-                sqlite3_reset(stmt_insert_file_);
-                sqlite3_bind_text(stmt_insert_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt_insert_file_, 2, file.language.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_int64(stmt_insert_file_, 3, file.size_bytes);
-                sqlite3_bind_int64(stmt_insert_file_, 4, file.mtime_ns);
-                sqlite3_bind_text(stmt_insert_file_, 5, content_hash.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt_insert_file_, 6, parse_status.c_str(), -1, SQLITE_STATIC);
-                if (parse_error.empty()) {
-                    sqlite3_bind_null(stmt_insert_file_, 7);
-                } else {
-                    sqlite3_bind_text(stmt_insert_file_, 7, parse_error.c_str(), -1, SQLITE_STATIC);
-                }
+                db::bind(stmt_insert_file_,
+                         file.relative_path,
+                         file.language,
+                         file.size_bytes,
+                         file.mtime_ns,
+                         content_hash,
+                         parse_status,
+                         parse_error.empty() ? nullptr : parse_error.c_str());
                 step_write(stmt_insert_file_);
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
                 last_file_id_ = file_id;
@@ -280,9 +275,7 @@ public:
             int64_t file_node_id;
             {
                 auto file_key = make_file_stable_key(file.relative_path);
-                sqlite3_reset(stmt_insert_file_node_);
-                sqlite3_bind_text(stmt_insert_file_node_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt_insert_file_node_, 2, file_key.c_str(), -1, SQLITE_STATIC);
+                db::bind(stmt_insert_file_node_, file.relative_path, file_key);
                 step_write(stmt_insert_file_node_);
                 file_node_id = sqlite3_last_insert_rowid(conn_.raw());
             }
@@ -341,25 +334,21 @@ public:
                     int idx = full_chunks * SYMBOL_BATCH_SIZE + r;
                     const auto& sym = extraction.symbols[idx];
 
-                    sqlite3_reset(stmt_insert_symbol_);
-                    sqlite3_bind_int64(stmt_insert_symbol_, 1, file_id);
-                    sqlite3_bind_text(stmt_insert_symbol_, 2, sym.kind.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_text(stmt_insert_symbol_, 3, sym.name.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_text(stmt_insert_symbol_, 4, sym.qualname.c_str(), -1, SQLITE_STATIC);
-                    if (sym.signature.empty()) sqlite3_bind_null(stmt_insert_symbol_, 5);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 5, sym.signature.c_str(), -1, SQLITE_STATIC);
-                    if (sym.fingerprint.empty()) sqlite3_bind_null(stmt_insert_symbol_, 6);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 6, sym.fingerprint.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_int(stmt_insert_symbol_, 7, sym.start_line);
-                    sqlite3_bind_int(stmt_insert_symbol_, 8, sym.start_col);
-                    sqlite3_bind_int(stmt_insert_symbol_, 9, sym.end_line);
-                    sqlite3_bind_int(stmt_insert_symbol_, 10, sym.end_col);
-                    sqlite3_bind_int(stmt_insert_symbol_, 11, sym.is_definition ? 1 : 0);
-                    if (sym.visibility.empty()) sqlite3_bind_null(stmt_insert_symbol_, 12);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 12, sym.visibility.c_str(), -1, SQLITE_STATIC);
-                    if (sym.doc.empty()) sqlite3_bind_null(stmt_insert_symbol_, 13);
-                    else sqlite3_bind_text(stmt_insert_symbol_, 13, sym.doc.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_text(stmt_insert_symbol_, 14, sym.stable_key.c_str(), -1, SQLITE_STATIC);
+                    db::bind(stmt_insert_symbol_,
+                             file_id,
+                             sym.kind,
+                             sym.name,
+                             sym.qualname,
+                             sym.signature.empty() ? nullptr : sym.signature.c_str(),
+                             sym.fingerprint.empty() ? nullptr : sym.fingerprint.c_str(),
+                             sym.start_line,
+                             sym.start_col,
+                             sym.end_line,
+                             sym.end_col,
+                             sym.is_definition,
+                             sym.visibility.empty() ? nullptr : sym.visibility.c_str(),
+                             sym.doc.empty() ? nullptr : sym.doc.c_str(),
+                             sym.stable_key);
 
                     step_write(stmt_insert_symbol_);
                     symbol_ids.push_back(sqlite3_last_insert_rowid(conn_.raw()));
@@ -422,27 +411,22 @@ public:
                     int idx = full_chunks * REF_BATCH_SIZE + r;
                     const auto& ref = extraction.refs[idx];
                     
-                    sqlite3_reset(stmt_insert_ref_);
-                    sqlite3_bind_int64(stmt_insert_ref_, 1, file_id);
-                    sqlite3_bind_text(stmt_insert_ref_, 2, ref.kind.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_text(stmt_insert_ref_, 3, ref.name.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_int(stmt_insert_ref_, 4, ref.start_line);
-                    sqlite3_bind_int(stmt_insert_ref_, 5, ref.start_col);
-                    sqlite3_bind_int(stmt_insert_ref_, 6, ref.end_line);
-                    sqlite3_bind_int(stmt_insert_ref_, 7, ref.end_col);
-                    if (ref.evidence.empty()) sqlite3_bind_null(stmt_insert_ref_, 8);
-                    else sqlite3_bind_text(stmt_insert_ref_, 8, ref.evidence.c_str(), -1, SQLITE_STATIC);
-                    if (ref.containing_symbol_index >= 0 &&
-                        ref.containing_symbol_index < static_cast<int>(symbol_ids.size()))
-                        sqlite3_bind_int64(stmt_insert_ref_, 9, symbol_ids[ref.containing_symbol_index]);
-                    else
-                        sqlite3_bind_null(stmt_insert_ref_, 9);
-                    if (ref.arg_count >= 0) sqlite3_bind_int(stmt_insert_ref_, 10, ref.arg_count);
-                    else sqlite3_bind_null(stmt_insert_ref_, 10);
-                    if (ref.arg_pattern.empty()) sqlite3_bind_null(stmt_insert_ref_, 11);
-                    else sqlite3_bind_text(stmt_insert_ref_, 11, ref.arg_pattern.c_str(), -1, SQLITE_STATIC);
-                    if (ref.receiver_type_hint.empty()) sqlite3_bind_null(stmt_insert_ref_, 12);
-                    else sqlite3_bind_text(stmt_insert_ref_, 12, ref.receiver_type_hint.c_str(), -1, SQLITE_STATIC);
+                    db::bind(stmt_insert_ref_,
+                             file_id,
+                             ref.kind,
+                             ref.name,
+                             ref.start_line,
+                             ref.start_col,
+                             ref.end_line,
+                             ref.end_col,
+                             ref.evidence.empty() ? nullptr : ref.evidence.c_str(),
+                             (ref.containing_symbol_index >= 0 &&
+                              ref.containing_symbol_index < static_cast<int>(symbol_ids.size()))
+                                 ? std::optional<int64_t>(symbol_ids[ref.containing_symbol_index])
+                                 : std::nullopt,
+                             ref.arg_count >= 0 ? std::optional<int>(ref.arg_count) : std::nullopt,
+                             ref.arg_pattern.empty() ? nullptr : ref.arg_pattern.c_str(),
+                             ref.receiver_type_hint.empty() ? nullptr : ref.receiver_type_hint.c_str());
                     step_write(stmt_insert_ref_);
                 }
             }
@@ -497,13 +481,12 @@ public:
                     int idx = full_chunks * EDGE_BATCH_SIZE + e;
                     auto [src_id, dst_id, edge_ptr] = valid_edges[idx];
                     
-                    sqlite3_reset(stmt_insert_edge_);
-                    sqlite3_bind_int64(stmt_insert_edge_, 1, src_id);
-                    sqlite3_bind_int64(stmt_insert_edge_, 2, dst_id);
-                    sqlite3_bind_text(stmt_insert_edge_, 3, edge_ptr->kind.c_str(), -1, SQLITE_STATIC);
-                    sqlite3_bind_double(stmt_insert_edge_, 4, edge_ptr->confidence);
-                    if (edge_ptr->evidence.empty()) sqlite3_bind_null(stmt_insert_edge_, 5);
-                    else sqlite3_bind_text(stmt_insert_edge_, 5, edge_ptr->evidence.c_str(), -1, SQLITE_STATIC);
+                    db::bind(stmt_insert_edge_,
+                             src_id,
+                             dst_id,
+                             edge_ptr->kind,
+                             edge_ptr->confidence,
+                             edge_ptr->evidence.empty() ? nullptr : edge_ptr->evidence.c_str());
                     step_write(stmt_insert_edge_);
                 }
             }
@@ -1035,9 +1018,7 @@ public:
                     resolved = true;
                     edge_kind = "calls";
                     ++call_resolved;
-                    sqlite3_reset(update_stmt);
-                    sqlite3_bind_int64(update_stmt, 1, resolved_id);
-                    sqlite3_bind_int64(update_stmt, 2, ref_id);
+                    db::bind(update_stmt, resolved_id, ref_id);
                     sqlite3_step(update_stmt);
                     ++total_resolved;
 
@@ -1095,9 +1076,7 @@ public:
             }
 
             if (resolved) {
-                sqlite3_reset(update_stmt);
-                sqlite3_bind_int64(update_stmt, 1, resolved_id);
-                sqlite3_bind_int64(update_stmt, 2, ref_id);
+                db::bind(update_stmt, resolved_id, ref_id);
                 sqlite3_step(update_stmt);
                 ++total_resolved;
 
@@ -1195,11 +1174,7 @@ public:
 
         for (int e = 0; e < remainder; ++e) {
             const auto& t = edge_tuples[full_chunks * RESOLVE_EDGE_BATCH + e];
-            sqlite3_reset(single_edge_stmt);
-            sqlite3_bind_int64(single_edge_stmt, 1, t.src_id);
-            sqlite3_bind_int64(single_edge_stmt, 2, t.dst_id);
-            sqlite3_bind_text(single_edge_stmt, 3, t.kind, -1, SQLITE_STATIC);
-            sqlite3_bind_double(single_edge_stmt, 4, t.confidence);
+            db::bind(single_edge_stmt, t.src_id, t.dst_id, t.kind, t.confidence);
             sqlite3_step(single_edge_stmt);
             ++edges_created;
         }

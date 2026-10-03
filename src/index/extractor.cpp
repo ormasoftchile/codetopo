@@ -1705,7 +1705,7 @@ void Extractor::extract_typescript(TSNode node, const std::string& type, const s
     }
 }
 
-void Extractor::extract_go(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
+void Extractor::extract_go(TSNode node, const std::string& type, const std::string& _) {
     if (type == "function_declaration") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);
@@ -1906,7 +1906,7 @@ void Extractor::extract_java(TSNode node, const std::string& type, const std::st
     }
 }
 
-void Extractor::extract_bash(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
+void Extractor::extract_bash(TSNode node, const std::string& type, const std::string& _) {
     if (type == "function_definition") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);
@@ -2023,7 +2023,7 @@ void Extractor::extract_batch(TSNode node, const std::string& type, const std::s
     }
 }
 
-void Extractor::extract_sql(TSNode node, const std::string& type, const std::string& /*parent_qn*/) {
+void Extractor::extract_sql(TSNode node, const std::string& type, const std::string& _) {
     if (type == "create_function_statement") {
         auto name = get_name_from_child(node, "name");
         if (!name.empty()) add_symbol("function", name, node);
