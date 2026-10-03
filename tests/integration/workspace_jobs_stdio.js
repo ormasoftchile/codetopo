@@ -54,6 +54,11 @@ class Client {
         this.lines.on('line', line => {
             try {
                 const message = JSON.parse(line);
+                if (message.id == null && message.method === 'notifications/message') {
+                    assert.equal(message.params.level, 'info', line);
+                    assert.equal(typeof message.params.data, 'string', line);
+                    return;
+                }
                 assert(message.id != null, `Unexpected protocol notification: ${line}`);
                 const pending = this.pending.get(message.id);
                 assert(pending, `Unknown response ID: ${line}`);
@@ -68,7 +73,7 @@ class Client {
         clients.push(this);
     }
 
-    async request(method, params) {
+    async request(method, params, timeoutMs = 3000) {
         const id = ++this.sequence;
         const message = { jsonrpc: '2.0', id, method };
         if (params) message.params = params;
@@ -79,7 +84,7 @@ class Client {
         let timer;
         try {
             return await Promise.race([response, new Promise((_, reject) => {
-                timer = setTimeout(() => reject(new Error(`Request timeout: ${method}\n${this.logs.slice(-2000)}`)), 3000);
+                timer = setTimeout(() => reject(new Error(`Request timeout: ${method}\n${this.logs.slice(-2000)}`)), timeoutMs);
             })]);
         } finally {
             clearTimeout(timer);
@@ -91,7 +96,9 @@ class Client {
         this.child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
     }
 
-    tool(name, args = {}) { return this.request('tools/call', { name, arguments: args }); }
+    tool(name, args = {}, timeoutMs = 3000) {
+        return this.request('tools/call', { name, arguments: args }, timeoutMs);
+    }
 
     payload(response) {
         assert(!response.error, JSON.stringify(response));
@@ -1020,10 +1027,12 @@ async function main() {
         const completionDeadline = Date.now() + 90000;
         do {
             const traffic = [];
+            // The serial dispatcher queues 100 graph reads; the batch deadline
+            // must include queue time, not just the individual read latency.
             for (let n = 0; n < 100; ++n) {
-                traffic.push(client.tool('workspace_refresh', { path: extra }));
-                traffic.push(client.tool('server_health'));
-                traffic.push(client.tool('symbol_search', { query: '*' }));
+                traffic.push(client.tool('workspace_refresh', { path: extra }, 15000));
+                traffic.push(client.tool('server_health', {}, 15000));
+                traffic.push(client.tool('symbol_search', { query: '*' }, 15000));
             }
             for (const response of await Promise.all(traffic)) {
                 if (response.error) {

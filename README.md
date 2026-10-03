@@ -115,6 +115,11 @@ codetopo mcp --root /path/to/repo
 
 The server communicates over stdio using JSON‑RPC. Connect it to any MCP‑compatible client.
 
+After client initialization, server diagnostics are sent both to stderr and as
+MCP `notifications/message` events. This includes tool calls, watcher changes,
+and reindex completion or failure. Clients can filter protocol logs with
+`logging/setLevel`; stderr diagnostics remain available regardless of that level.
+
 ```bash
 # With file watching for auto‑reindex
 codetopo mcp --root /path/to/repo --watch --freshness eager

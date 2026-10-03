@@ -15,6 +15,7 @@ let child, exited, created = false;
 let sequence = 0;
 const pending = new Map();
 let logs = '';
+const notifications = [];
 
 async function run(args) {
     const process = spawn(exe, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -106,6 +107,13 @@ async function main() {
     readline.createInterface({ input: child.stdout }).on('line', line => {
         try {
             const message = JSON.parse(line);
+            if (message.id == null) {
+                assert.equal(message.method, 'notifications/message', line);
+                assert.equal(message.params.level, 'info', line);
+                assert.equal(typeof message.params.data, 'string', line);
+                notifications.push(message);
+                return;
+            }
             const waiter = pending.get(message.id);
             assert(waiter, line);
             pending.delete(message.id);
@@ -115,9 +123,24 @@ async function main() {
             pending.clear();
         }
     });
-    assert((await request('initialize', {})).result);
+    const initialized = await request('initialize', {});
+    assert(initialized.result.capabilities.logging);
+    assert.equal(notifications.length, 0, 'No logs before client initialization');
     child.stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
     assert.equal((await tool('server_health', {})).status, 'ready');
+    await tool('repo_stats', {});
+    assert(notifications.some(message => message.params.data.includes('live logs enabled')));
+    assert(notifications.some(message => message.params.data.includes('tool: repo_stats')));
+    assert(notifications.some(message => message.params.data.includes('done: repo_stats')));
+    assert.deepEqual((await request('logging/setLevel', { level: 'warning' })).result, {});
+    const beforeFilteredCall = notifications.length;
+    await tool('repo_stats', {});
+    assert.equal(notifications.length, beforeFilteredCall, 'Info logs must respect setLevel');
+    assert.deepEqual((await request('logging/setLevel', { level: 'info' })).result, {});
+    const invalidLevel = await request('logging/setLevel', { level: 'invalid' });
+    assert.equal(invalidLevel.error.code, -32602);
+    await tool('repo_stats', {});
+    assert(notifications.length > beforeFilteredCall, 'Info logging resumes after setLevel');
     const schemas = (await request('tools/list', {})).result.tools;
     const nodeTools = ['context_for', 'symbol_get', 'references', 'method_fields',
         'find_similar', 'callers_approx', 'callees_approx', 'impact_of'];
