@@ -15,9 +15,9 @@ adjacent layers through a narrow interface.
   >=stealth
 ]
 \node[layer] (mcp)     at (0,4.5) {MCP Server \quad (JSON-RPC 2.0 / stdio)};
-\node[layer] (query)   at (0,3.0) {Query Engine \quad (27 tools + QueryCache)};
+\node[layer] (query)   at (0,3.0) {Query Engine \quad (41 tools + QueryCache)};
 \node[layer] (storage) at (0,1.5) {Storage \quad (SQLite --- index.sqlite)};
-\node[layer] (indexer) at (0,0.0) {Indexer \quad (tree-sitter, C++20) + Watcher};
+\node[layer] (indexer) at (0,0.0) {Indexer \quad (tree-sitter, C++26) + Watcher};
 
 \draw[<->] (mcp)     -- (query)   node[ann,right,midway] {tool dispatch};
 \draw[<->] (query)   -- (storage) node[ann,right,midway] {SQL (prepared)};
@@ -57,7 +57,7 @@ reads while the Indexer is writing.
 
 \subsection{Query Engine}
 
-The Query Engine exposes 27 MCP tools. Each tool translates a structured
+The Query Engine exposes 41 MCP tools. Each tool translates a structured
 request into one or more SQL queries, formats the result, and returns it as a
 JSON-RPC response. Frequently used statements are cached as \emph{prepared
 statements} in a \texttt{QueryCache} keyed by tool name; the cache is

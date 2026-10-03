@@ -147,6 +147,15 @@ Before inserting, existing rows for the file are deleted
 (\texttt{DELETE WHERE file\_id = ?}), so the operation is idempotent. The
 entire insert sequence for one file runs inside a single transaction.
 
+\paragraph{Statement binding and memory efficiency.} Statement parameter binding
+is implemented in C++26 using pack indexing (\texttt{src/db/bind.h}), allowing
+variadic tuples of heterogeneous SQLite values to be bound directly to 1-based
+statement indices (\texttt{args...[Is]}) without recursive template
+expansions or intermediate tuple allocations. Memory allocations during
+Tree-sitter AST traversals are serviced by a dedicated bump-pointer
+\texttt{Arena} pool (\texttt{src/core/arena.h}) that avoids general-purpose
+heap contention across parallel worker threads.
+
 \paragraph{Bulk mode.} When the initial index covers more than 1\,000 files,
 the pipeline enters \emph{bulk mode}: it drops secondary indexes and FTS
 triggers before the load and rebuilds them afterwards. This avoids repeated

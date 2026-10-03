@@ -13,7 +13,22 @@ The following capabilities are implemented and functional as of the document dat
         JavaScript, Python, Rust, Java, Go, Bash, SQL, YAML, Lua.
   \item Symbol extraction (definitions) and call-edge extraction for all
         supported languages.
-  \item All 27 MCP tools registered and functional (24 core + 3 workspace).
+  \item All 41 MCP tools registered and functional (31 code intelligence,
+        6 multi-root workspace management, and 4 server operations and diagnostics).
+  \item Migration to C++26 standard (\texttt{CMAKE\_CXX\_STANDARD 26}, CMake 3.25+)
+        featuring pack-indexed variadic SQLite statement binding (\texttt{db::bind}),
+        compile-time delete diagnostic reasons, memory arena pooling (\texttt{Arena}),
+        and wildcard parameter bindings.
+  \item PR blast-radius analysis (\texttt{detect\_changes}) integrating \texttt{git diff}
+        against base refs with reverse call-graph traversals.
+  \item Structural architecture summarization (\texttt{get\_architecture}) computing
+        directory clusters, high-centrality hotspots, boundaries, and coupling/cohesion metrics.
+  \item Runtime observability integration: distributed trace ingestion
+        (\texttt{ingest\_\allowbreak traces}, \texttt{get\_\allowbreak traces})
+        boosting static edge confidence, and protocol-aware HTTP call
+        extraction via \texttt{list\_\allowbreak http\_\allowbreak calls}.
+  \item Asynchronous workspace job engine with retained status polling
+        and safe phase-boundary cancellation.
   \item Incremental indexing via mtime + xxHash fingerprinting.
   \item Filesystem watcher (FSEvents / inotify / ReadDirectoryChangesW)
         for live re-indexing on file changes.
