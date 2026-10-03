@@ -62,8 +62,6 @@ The following capabilities are implemented and functional as of the document dat
         use codetopo directly as a language server.
   \item \textbf{No remote or team-shared index.} The index is per-developer
         local. There is no shared index server or sync protocol.
-  \item \textbf{No symbol-importance ranking.} FTS5 BM25 provides text
-        relevance; there is no PageRank-style scoring over the call graph.
 \end{itemize}
 
 \subsection{Future work}
@@ -77,9 +75,8 @@ The following capabilities are implemented and functional as of the document dat
         tree-sitter~\cite{brunsfeld2018treesitter} ecosystem.
   \item[LSP adapter.] Expose an LSP endpoint backed by the codetopo index
         to expand editor coverage beyond the VS Code / Cursor / Windsurf family.
-  \item[PageRank on the call graph.] Weight symbol search results by structural
-        importance (in-degree on the call graph) in addition to BM25 text
-        relevance.
+  \item[Incremental centrality updates.] Dynamically adjust PageRank scores during
+        fast targeted file-watch reindexing without full graph recomputation.
   \item[Remote/shared index.] Implement a sync protocol so that large teams can
         share a pre-built index rather than indexing individually.
 \end{description}

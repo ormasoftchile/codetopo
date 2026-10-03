@@ -128,8 +128,6 @@ target_link_libraries(codetopo PRIVATE
     unofficial::sqlite3::sqlite3
     CLI11::CLI11
     yyjson::yyjson
-    ftxui::screen
-    ftxui::dom
     ftxui::component
     unofficial::tree-sitter::tree-sitter
     ${TS_GRAMMAR_TARGETS}
@@ -211,8 +209,6 @@ target_link_libraries(codetopo_tests PRIVATE
     unofficial::sqlite3::sqlite3
     CLI11::CLI11
     yyjson::yyjson
-    ftxui::screen
-    ftxui::dom
     ftxui::component
     unofficial::tree-sitter::tree-sitter
     ${TS_GRAMMAR_TARGETS}

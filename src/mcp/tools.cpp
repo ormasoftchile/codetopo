@@ -2212,6 +2212,7 @@ struct ArchitectureHotspot {
     std::string kind;
     std::string file;
     int64_t fan_in = 0;
+    double rank = 0.0;
 };
 
 struct ArchitectureScopedEdge {
@@ -2720,7 +2721,7 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
             // CROSS JOIN to force that co-routine to drive rowid lookups into nodes/files
             // -- the CROSS JOIN also pins the join order so the planner cannot reorder.
             sql =
-                "SELECT n.file_id, n.name, n.kind, f.path, fi.fan_in "
+                "SELECT n.file_id, n.name, n.kind, f.path, fi.fan_in, n.rank "
                 "FROM (SELECT e.dst_id AS id, COUNT(DISTINCT e.src_id) AS fan_in "
                 "      FROM edges e "
                 "      WHERE e.kind = 'calls' AND e.confidence >= 0.5 "
@@ -2729,15 +2730,15 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
                 "CROSS JOIN nodes n ON n.id = fi.id "
                 "CROSS JOIN files f ON f.id = n.file_id "
                 "WHERE n.node_type = 'symbol' "
-                "ORDER BY fi.fan_in DESC, n.name ASC";
+                "ORDER BY fi.fan_in DESC, n.rank DESC, n.name ASC";
         } else {
             sql =
-                "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in "
+                "SELECT n.file_id, n.name, n.kind, f.path, COUNT(DISTINCT e.src_id) AS fan_in, n.rank "
                 "FROM edges e "
                 "JOIN nodes n ON e.dst_id = n.id "
                 "JOIN files f ON n.file_id = f.id "
                 "WHERE e.kind = 'calls' AND e.confidence >= 0.5 AND n.node_type = 'symbol' "
-                "GROUP BY n.id ORDER BY fan_in DESC, n.name ASC";
+                "GROUP BY n.id ORDER BY fan_in DESC, n.rank DESC, n.name ASC";
         }
         if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
             return McpError::db_error("Failed to compute architecture hotspots").to_json_rpc(0);
@@ -2751,6 +2752,7 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
             hotspot.file = architecture_display_path(
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3)), repo_root);
             hotspot.fan_in = sqlite3_column_int64(stmt, 4);
+            hotspot.rank = sqlite3_column_double(stmt, 5);
             hotspots.push_back(std::move(hotspot));
         }
         sqlite3_finalize(stmt);
@@ -2763,6 +2765,7 @@ std::string get_architecture(yyjson_val* params, Connection& mcp_conn,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", hotspot.kind.c_str());
             yyjson_mut_obj_add_strcpy(doc.doc, item, "file", hotspot.file.c_str());
             yyjson_mut_obj_add_int(doc.doc, item, "fan_in", hotspot.fan_in);
+            if (hotspot.rank > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", hotspot.rank);
             yyjson_mut_arr_append(hotspots_arr, item);
         }
         yyjson_mut_obj_add_val(doc.doc, root, "hotspots", hotspots_arr);
@@ -3819,7 +3822,7 @@ std::string symbol_get(yyjson_val* params, Connection& conn,
 
     auto* stmt = cache.get("symbol_get",
         "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-        "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key "
+        "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key, n.rank "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.id = ? AND n.node_type = 'symbol'");
 
@@ -3844,6 +3847,9 @@ std::string symbol_get(yyjson_val* params, Connection& conn,
     auto* sig = sqlite3_column_text(stmt, 4);
     if (sig) yyjson_mut_obj_add_strcpy(doc.doc, root, "signature", reinterpret_cast<const char*>(sig));
     add_stable_key_if_present(doc, root, sqlite_text_or_null(stmt, 12));
+
+    double rk = sqlite3_column_double(stmt, 13);
+    if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, root, "rank", rk);
 
     auto* fp = sqlite3_column_text(stmt, 5);
     std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
@@ -3913,7 +3919,7 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
 
         auto* stmt = cache.get("symbol_get",
             "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-            "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key "
+            "n.start_line, n.start_col, n.end_line, n.end_col, n.doc, f.mtime_ns, n.stable_key, n.rank "
             "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
             "WHERE n.id = ? AND n.node_type = 'symbol'");
         sqlite3_bind_int64(stmt, 1, nid);
@@ -3931,6 +3937,8 @@ std::string symbol_get_batch(yyjson_val* params, Connection& /*conn*/,
         auto* sig = sqlite3_column_text(stmt, 4);
         if (sig) yyjson_mut_obj_add_strcpy(doc.doc, item, "signature", reinterpret_cast<const char*>(sig));
         add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 12));
+        double rk = sqlite3_column_double(stmt, 13);
+        if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", rk);
         auto* fp = sqlite3_column_text(stmt, 5);
         std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
         if (!file_path.empty()) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", file_path.c_str());
@@ -4662,7 +4670,7 @@ std::string context_for(yyjson_val* params, Connection& conn,
     // Symbol info (inline from symbol_get query)
     auto* sym_stmt = cache.get("context_symbol",
         "SELECT n.id, n.kind, n.name, n.qualname, n.signature, f.path, "
-        "n.start_line, n.end_line, n.doc, n.stable_key "
+        "n.start_line, n.end_line, n.doc, n.stable_key, n.rank "
         "FROM nodes n LEFT JOIN files f ON n.file_id = f.id "
         "WHERE n.id = ? AND n.node_type = 'symbol'");
     sqlite3_bind_int64(sym_stmt, 1, node_id);
@@ -4686,6 +4694,8 @@ std::string context_for(yyjson_val* params, Connection& conn,
     // context_for on the same node_id returns a different stable_key, the id was reused.
     auto* skv = sqlite3_column_text(sym_stmt, 9);
     if (skv) yyjson_mut_obj_add_strcpy(doc.doc, symbol, "stable_key", reinterpret_cast<const char*>(skv));
+    double rk = sqlite3_column_double(sym_stmt, 10);
+    if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, symbol, "rank", rk);
     auto* fp = sqlite3_column_text(sym_stmt, 5);
     std::string file_path = fp ? reinterpret_cast<const char*>(fp) : "";
     if (!file_path.empty()) {
@@ -5189,7 +5199,7 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     auto* sym = doc.new_obj();
     {
         auto* stmt = cache.get("impact_symbol",
-            "SELECT name, f.path, n.stable_key FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
+            "SELECT n.name, f.path, n.stable_key, n.rank FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
         sqlite3_bind_int64(stmt, 1, node_id);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             yyjson_mut_obj_add_int(doc.doc, sym, "node_id", node_id);
@@ -5198,6 +5208,8 @@ std::string impact_of(yyjson_val* params, Connection& conn,
                 reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
             auto* fp = sqlite3_column_text(stmt, 1);
             if (fp) yyjson_mut_obj_add_strcpy(doc.doc, sym, "file_path", reinterpret_cast<const char*>(fp));
+            double rk = sqlite3_column_double(stmt, 3);
+            if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, sym, "rank", rk);
         }
     }
     yyjson_mut_obj_add_val(doc.doc, root, "symbol", sym);
@@ -5213,10 +5225,11 @@ std::string impact_of(yyjson_val* params, Connection& conn,
         for (int64_t nid : frontier) {
             // Find nodes that depend on nid (reverse edges: dst_id = nid)
             auto* stmt = cache.get("impact_reverse",
-                "SELECT e.src_id, n.name, f.path, e.kind, e.confidence, n.stable_key "
+                "SELECT e.src_id, n.name, f.path, e.kind, e.confidence, n.stable_key, n.rank "
                 "FROM edges e JOIN nodes n ON e.src_id = n.id "
                 "LEFT JOIN files f ON n.file_id = f.id "
-                "WHERE e.dst_id = ? AND e.kind != 'contains'");
+                "WHERE e.dst_id = ? AND e.kind != 'contains' "
+                "ORDER BY n.rank DESC");
             sqlite3_bind_int64(stmt, 1, nid);
 
             while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -5243,6 +5256,8 @@ std::string impact_of(yyjson_val* params, Connection& conn,
                 }
                 yyjson_mut_obj_add_strcpy(doc.doc, item, "relationship", relationship);
                 yyjson_mut_obj_add_int(doc.doc, item, "distance", d);
+                double rk = sqlite3_column_double(stmt, 6);
+                if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", rk);
                 yyjson_mut_arr_append(impacted, item);
 
                 next_frontier.push_back(src_id);
