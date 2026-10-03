@@ -182,6 +182,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_workspace_jobs.cpp
     tests/unit/test_trace_tools.cpp
     tests/unit/test_targeted_reindex.cpp
+    tests/unit/test_bind.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
