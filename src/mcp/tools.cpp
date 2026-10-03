@@ -5057,55 +5057,104 @@ std::string entrypoints(yyjson_val* params, Connection& conn,
         }
     }
 
-    // 2. High in-degree symbols (most referenced)
+    // 2. High centrality / in-degree symbols (most referenced)
     {
-        std::string sql;
-        std::string cache_key;
+        std::string rank_sql;
+        std::string rank_cache_key;
         if (!scope_glob.empty()) {
-            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
-                  "FROM (SELECT e.dst_id, COUNT(*) as cnt "
-                  "FROM files f CROSS JOIN nodes sn INDEXED BY idx_nodes_file_id ON sn.file_id = f.id "
-                  "CROSS JOIN edges e INDEXED BY idx_edges_dst ON e.dst_id = sn.id "
-                  "WHERE f.path GLOB ? "
-                  + std::string(primary_only ? kPrimaryFileScopeSql : "") +
-                  "GROUP BY e.dst_id ORDER BY cnt DESC LIMIT ?) top "
-                  "CROSS JOIN nodes n ON n.id = top.dst_id "
-                  "LEFT JOIN files f ON n.file_id = f.id "
-                  "WHERE n.node_type = 'symbol' "
-                  "ORDER BY top.cnt DESC";
-            cache_key = primary_only ? "entrypoints_indegree_scoped_primary" : "entrypoints_indegree_scoped";
+            rank_sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, n.rank "
+                       "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id = f.id "
+                       "WHERE f.path GLOB ? "
+                       + std::string(primary_only ? kPrimaryFileScopeSql : "") +
+                       "AND n.node_type = 'symbol' AND n.rank > 0 "
+                       "ORDER BY n.rank DESC LIMIT ?";
+            rank_cache_key = primary_only ? "entrypoints_rank_scoped_primary" : "entrypoints_rank_scoped";
         } else {
-            sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
-                  "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
-                  "JOIN nodes n ON n.id = top.dst_id "
-                  "LEFT JOIN files f ON n.file_id = f.id "
-                  "WHERE n.node_type = 'symbol' "
-                  "ORDER BY top.cnt DESC";
-            cache_key = "entrypoints_indegree";
+            rank_sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, n.rank "
+                       "FROM nodes n INDEXED BY idx_nodes_rank "
+                       "LEFT JOIN files f ON n.file_id = f.id "
+                       "WHERE n.node_type = 'symbol' AND n.rank > 0 "
+                       "ORDER BY n.rank DESC LIMIT ?";
+            rank_cache_key = "entrypoints_rank";
         }
 
-        auto* stmt = cache.get(cache_key, sql);
-        int bind_idx = 1;
+        auto* rank_stmt = cache.get(rank_cache_key, rank_sql);
+        int rank_bind_idx = 1;
         if (!scope_glob.empty())
-            sqlite3_bind_text(stmt, bind_idx++, scope_glob.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, bind_idx++, limit);
+            sqlite3_bind_text(rank_stmt, rank_bind_idx++, scope_glob.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(rank_stmt, rank_bind_idx++, limit);
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rank_count = 0;
+        while (sqlite3_step(rank_stmt) == SQLITE_ROW) {
+            rank_count++;
             auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
-            add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 6));
+            yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(rank_stmt, 0));
+            add_stable_key_if_present(doc, item, sqlite_text_or_null(rank_stmt, 6));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
-                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+                reinterpret_cast<const char*>(sqlite3_column_text(rank_stmt, 1)));
             yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
-                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
-            auto* fp = sqlite3_column_text(stmt, 3);
+                reinterpret_cast<const char*>(sqlite3_column_text(rank_stmt, 2)));
+            auto* fp = sqlite3_column_text(rank_stmt, 3);
             if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
             auto* span = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 4));
-            yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 5));
+            yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(rank_stmt, 4));
+            yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(rank_stmt, 5));
             yyjson_mut_obj_add_val(doc.doc, item, "span", span);
             yyjson_mut_obj_add_str(doc.doc, item, "reason", "high_in_degree");
+            double rk = sqlite3_column_double(rank_stmt, 7);
+            if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", rk);
             yyjson_mut_arr_append(results, item);
+        }
+
+        if (rank_count == 0) {
+            std::string sql;
+            std::string cache_key;
+            if (!scope_glob.empty()) {
+                sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
+                      "FROM (SELECT e.dst_id, COUNT(*) as cnt "
+                      "FROM files f CROSS JOIN nodes sn INDEXED BY idx_nodes_file_id ON sn.file_id = f.id "
+                      "CROSS JOIN edges e INDEXED BY idx_edges_dst ON e.dst_id = sn.id "
+                      "WHERE f.path GLOB ? "
+                      + std::string(primary_only ? kPrimaryFileScopeSql : "") +
+                      "GROUP BY e.dst_id ORDER BY cnt DESC LIMIT ?) top "
+                      "CROSS JOIN nodes n ON n.id = top.dst_id "
+                      "LEFT JOIN files f ON n.file_id = f.id "
+                      "WHERE n.node_type = 'symbol' "
+                      "ORDER BY top.cnt DESC";
+                cache_key = primary_only ? "entrypoints_indegree_scoped_primary" : "entrypoints_indegree_scoped";
+            } else {
+                sql = "SELECT n.id, n.kind, n.name, f.path, n.start_line, n.end_line, n.stable_key, top.cnt "
+                      "FROM (SELECT dst_id, COUNT(*) as cnt FROM edges GROUP BY dst_id ORDER BY cnt DESC LIMIT ?) top "
+                      "JOIN nodes n ON n.id = top.dst_id "
+                      "LEFT JOIN files f ON n.file_id = f.id "
+                      "WHERE n.node_type = 'symbol' "
+                      "ORDER BY top.cnt DESC";
+                cache_key = "entrypoints_indegree";
+            }
+
+            auto* stmt = cache.get(cache_key, sql);
+            int bind_idx = 1;
+            if (!scope_glob.empty())
+                sqlite3_bind_text(stmt, bind_idx++, scope_glob.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, bind_idx++, limit);
+
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                auto* item = doc.new_obj();
+                yyjson_mut_obj_add_int(doc.doc, item, "node_id", sqlite3_column_int64(stmt, 0));
+                add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 6));
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "kind",
+                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
+                yyjson_mut_obj_add_strcpy(doc.doc, item, "name",
+                    reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2)));
+                auto* fp = sqlite3_column_text(stmt, 3);
+                if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
+                auto* span = doc.new_obj();
+                yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 4));
+                yyjson_mut_obj_add_int(doc.doc, span, "end_line", sqlite3_column_int(stmt, 5));
+                yyjson_mut_obj_add_val(doc.doc, item, "span", span);
+                yyjson_mut_obj_add_str(doc.doc, item, "reason", "high_in_degree");
+                yyjson_mut_arr_append(results, item);
+            }
         }
     }
 

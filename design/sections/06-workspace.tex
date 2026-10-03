@@ -132,6 +132,10 @@ and \texttt{workspace\_refresh} execute asynchronously:
         between file batches or before beginning table merges) so that
         in-progress SQLite transactions commit cleanly and the database is
         never left in a partially merged state.
+  \item Upon finalizing table copy and cross-root reference resolution, the
+        job recalculates global graph centrality (\S\ref{sec:pagerank})
+        across all merged roots so cross-repository caller relationships
+        properly weight shared APIs in \texttt{symbol\_search}.
 \end{enumerate}
 
 \subsection{Indexer guard}

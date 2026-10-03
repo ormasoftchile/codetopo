@@ -18,7 +18,11 @@ The following capabilities are implemented and functional as of the document dat
   \item Migration to C++26 standard (\texttt{CMAKE\_CXX\_STANDARD 26}, CMake 3.25+)
         featuring pack-indexed variadic SQLite statement binding (\texttt{db::bind}),
         compile-time delete diagnostic reasons, memory arena pooling (\texttt{Arena}),
-        and wildcard parameter bindings.
+        zero-heap \texttt{std::inplace\_vector<T, N>} container polyfills on hot paths,
+        and saturation arithmetic safety checks.
+  \item Structural graph centrality (PageRank power iteration over directed edges)
+        persisted in \texttt{nodes.rank} (schema v14), weighting \texttt{symbol\_search}
+        alongside BM25 relevance and accelerating \texttt{entrypoints}.
   \item PR blast-radius analysis (\texttt{detect\_changes}) integrating \texttt{git diff}
         against base refs with reverse call-graph traversals.
   \item Structural architecture summarization (\texttt{get\_architecture}) computing

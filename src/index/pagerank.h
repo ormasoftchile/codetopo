@@ -124,7 +124,8 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
     // Bulk persist via temporary table
     conn.exec("CREATE TEMP TABLE IF NOT EXISTS temp_pagerank(id INTEGER PRIMARY KEY, rank REAL)");
     conn.exec("DELETE FROM temp_pagerank");
-    conn.exec("BEGIN TRANSACTION");
+    const bool manage_tx = (sqlite3_get_autocommit(conn.raw()) != 0);
+    if (manage_tx) conn.exec("BEGIN TRANSACTION");
 
     sqlite3_stmt* ins_stmt = nullptr;
     sqlite3_prepare_v2(conn.raw(),
@@ -140,7 +141,7 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
         sqlite3_step(ins_stmt);
     }
     sqlite3_finalize(ins_stmt);
-    conn.exec("COMMIT");
+    if (manage_tx) conn.exec("COMMIT");
 
     conn.exec(
         "UPDATE nodes SET rank = (SELECT rank FROM temp_pagerank WHERE temp_pagerank.id = nodes.id) "
