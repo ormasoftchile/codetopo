@@ -15,6 +15,7 @@
 #include "index/parser.h"
 #include "index/extractor.h"
 #include "index/persister.h"
+#include "index/pagerank.h"
 #include "util/hash.h"
 #include "util/git.h"
 #include "util/lock.h"
@@ -191,6 +192,7 @@ int run_index(const Config& config) {
         return 3;
     }
     schema::ensure_nodes_fingerprint_schema(conn);
+    schema::ensure_nodes_rank_schema(conn);
     schema::set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     // Symbol search must track the same committed batches as structural reads.
     fts::create_sync_triggers(conn);
@@ -1031,6 +1033,15 @@ int run_index(const Config& config) {
             std::chrono::steady_clock::now() - resolve_start).count();
         std::cerr << "Resolved " << refs_resolved << " refs, created "
                   << edges_created << " edges in " << resolve_elapsed << "s\n";
+    }
+
+    // Structural graph centrality (PageRank) ranking
+    {
+        auto pr_start = std::chrono::steady_clock::now();
+        int ranked = compute_and_persist_pagerank(conn);
+        auto pr_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - pr_start).count();
+        std::cerr << "Ranked " << ranked << " symbols by centrality in " << pr_elapsed << "ms\n";
     }
 
     // Checkpoint WAL after reference resolution.

@@ -1,4 +1,5 @@
 #include "util/process.h"
+#include "core/inplace_vector.h"
 #include <iostream>
 #include <filesystem>
 #include <thread>
@@ -131,17 +132,27 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
 #else
     // POSIX: fork + exec
     pid_t pid;
-    std::vector<const char*> argv;
-    argv.push_back(exe.c_str());
-    for (const auto& arg : args) argv.push_back(arg.c_str());
-    argv.push_back(nullptr);
+    inplace_vector<const char*, 64> argv_buf;
+    std::vector<const char*> argv_vec;
+    char* const* argv_data = nullptr;
+    if (args.size() + 2 <= argv_buf.capacity()) {
+        argv_buf.push_back(exe.c_str());
+        for (const auto& arg : args) argv_buf.push_back(arg.c_str());
+        argv_buf.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_buf.data());
+    } else {
+        argv_vec.reserve(args.size() + 2);
+        argv_vec.push_back(exe.c_str());
+        for (const auto& arg : args) argv_vec.push_back(arg.c_str());
+        argv_vec.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_vec.data());
+    }
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
-    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
-                         const_cast<char* const*>(argv.data()), environ);
+    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv_data, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         std::cerr << "ERROR: posix_spawn failed (rc=" << rc << ")\n";
@@ -173,17 +184,27 @@ int spawn_and_wait_with_stall_timeout(
     return spawn_and_wait(exe, args);
 #else
     pid_t pid;
-    std::vector<const char*> argv;
-    argv.push_back(exe.c_str());
-    for (const auto& arg : args) argv.push_back(arg.c_str());
-    argv.push_back(nullptr);
+    inplace_vector<const char*, 64> argv_buf;
+    std::vector<const char*> argv_vec;
+    char* const* argv_data = nullptr;
+    if (args.size() + 2 <= argv_buf.capacity()) {
+        argv_buf.push_back(exe.c_str());
+        for (const auto& arg : args) argv_buf.push_back(arg.c_str());
+        argv_buf.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_buf.data());
+    } else {
+        argv_vec.reserve(args.size() + 2);
+        argv_vec.push_back(exe.c_str());
+        for (const auto& arg : args) argv_vec.push_back(arg.c_str());
+        argv_vec.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_vec.data());
+    }
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
-    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
-                         const_cast<char* const*>(argv.data()), environ);
+    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv_data, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         std::cerr << "ERROR: posix_spawn failed (rc=" << rc << ")\n";
@@ -355,14 +376,24 @@ int spawn_and_read_stdout(const std::string& exe,
     posix_spawn_file_actions_addclose(&actions, pipefd[0]);
     posix_spawn_file_actions_addclose(&actions, pipefd[1]);
 
-    std::vector<const char*> argv;
-    argv.push_back(exe.c_str());
-    for (const auto& arg : args) argv.push_back(arg.c_str());
-    argv.push_back(nullptr);
+    inplace_vector<const char*, 64> argv_buf;
+    std::vector<const char*> argv_vec;
+    char* const* argv_data = nullptr;
+    if (args.size() + 2 <= argv_buf.capacity()) {
+        argv_buf.push_back(exe.c_str());
+        for (const auto& arg : args) argv_buf.push_back(arg.c_str());
+        argv_buf.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_buf.data());
+    } else {
+        argv_vec.reserve(args.size() + 2);
+        argv_vec.push_back(exe.c_str());
+        for (const auto& arg : args) argv_vec.push_back(arg.c_str());
+        argv_vec.push_back(nullptr);
+        argv_data = const_cast<char* const*>(argv_vec.data());
+    }
 
     pid_t pid;
-    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr,
-                         const_cast<char* const*>(argv.data()), environ);
+    int rc = posix_spawn(&pid, exe.c_str(), &actions, nullptr, argv_data, environ);
     posix_spawn_file_actions_destroy(&actions);
 
     if (rc != 0) {

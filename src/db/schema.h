@@ -21,7 +21,8 @@ namespace codetopo {
 // Schema version 11 = semantic symbol embeddings in node_vectors (removed in v12).
 // Schema version 12 = drop node_vectors (semantic embedding subsystem removed).
 // Schema version 13 = files.language CHECK allows 'powershell' and 'batch'.
-static constexpr int CURRENT_SCHEMA_VERSION = 13;
+// Schema version 14 = symbol structural centrality / PageRank (nodes.rank column).
+static constexpr int CURRENT_SCHEMA_VERSION = 14;
 static constexpr const char* INDEXER_VERSION = "1.7.0";
 
 namespace schema {
@@ -146,7 +147,8 @@ inline void create_tables(Connection& conn) {
             visibility TEXT CHECK(visibility IN ('public','protected','private') OR visibility IS NULL),
             doc TEXT,
             fingerprint TEXT,
-            stable_key TEXT NOT NULL
+            stable_key TEXT NOT NULL,
+            rank REAL DEFAULT 0.0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key);
         CREATE INDEX IF NOT EXISTS idx_nodes_file_id ON nodes(file_id);
@@ -154,6 +156,7 @@ inline void create_tables(Connection& conn) {
         CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname);
         CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type);
         CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_nodes_rank ON nodes(rank) WHERE rank > 0;
     )SQL");
 
     conn.exec(R"SQL(
@@ -435,6 +438,14 @@ inline void ensure_nodes_fingerprint_schema(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
 }
 
+inline void ensure_nodes_rank_schema(Connection& conn) {
+    if (!table_exists(conn, "nodes")) return;
+    if (!table_has_column(conn, "nodes", "rank")) {
+        conn.exec("ALTER TABLE nodes ADD COLUMN rank REAL DEFAULT 0.0");
+    }
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_rank ON nodes(rank) WHERE rank > 0");
+}
+
 // Restore secondary indexes without invalidating concurrent readers.
 inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
@@ -444,6 +455,7 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_qualname ON nodes(qualname)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_name_type ON nodes(name, node_type)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_fingerprint ON nodes(fingerprint) WHERE fingerprint IS NOT NULL");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_rank ON nodes(rank) WHERE rank > 0");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_kind_name ON refs(kind, name)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_refs_resolved ON refs(resolved_node_id)");
@@ -472,6 +484,7 @@ inline int ensure_schema(Connection& conn) {
 
     if (version == CURRENT_SCHEMA_VERSION) {
         ensure_nodes_fingerprint_schema(conn);
+        ensure_nodes_rank_schema(conn);
         ensure_content_fts_tracker_rowid_schema(conn);
         return 0;  // Compatible
     }
@@ -588,6 +601,12 @@ inline int ensure_schema(Connection& conn) {
         version = 13;
     }
 
+    // v13→v14: add nodes.rank column for PageRank centrality scoring.
+    if (version == 13) {
+        ensure_nodes_rank_schema(conn);
+        version = 14;
+    }
+
     if (version == CURRENT_SCHEMA_VERSION) {
         if (recreate_nodes_fts) {
             create_fts(conn);
@@ -598,6 +617,7 @@ inline int ensure_schema(Connection& conn) {
         }
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         ensure_content_fts_tracker_rowid_schema(conn);
+        ensure_nodes_rank_schema(conn);
         return 0;
     }
 

@@ -9,6 +9,7 @@
 #include "mcp/error.h"
 #include "db/schema.h"
 #include "db/bind.h"
+#include "core/inplace_vector.h"
 #include <sqlite3.h>
 #include <sstream>
 #include <fstream>
@@ -495,14 +496,14 @@ static std::string lower_copy(std::string s) {
     return s;
 }
 
-static std::vector<std::string> split_search_terms(const std::string& query) {
-    std::vector<std::string> terms;
+static inplace_vector<std::string, 8> split_search_terms(const std::string& query) {
+    inplace_vector<std::string, 8> terms;
     std::istringstream in(query);
     std::string term;
     while (in >> term) {
-        if (!term.empty()) terms.push_back(term);
+        if (!term.empty() && terms.size() < terms.capacity()) terms.push_back(term);
     }
-    if (terms.empty() && !query.empty()) terms.push_back(query);
+    if (terms.empty() && !query.empty() && terms.size() < terms.capacity()) terms.push_back(query);
     return terms;
 }
 
@@ -3255,7 +3256,7 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     bool has_kind = kind && strlen(kind) > 0;
     bool fn_kind = has_kind && std::string(kind) == "function";
     bool has_file_pattern = file_pattern && strlen(file_pattern) > 0;
-    auto terms = wildcard ? std::vector<std::string>{} : split_search_terms(query);
+    auto terms = wildcard ? inplace_vector<std::string, 8>{} : split_search_terms(query);
     std::string fts_query;
     for (size_t i = 0; i < terms.size(); ++i) {
         if (i) fts_query += match_all ? " AND " : " OR ";
@@ -3283,7 +3284,7 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
     if (primary_only) where_sql += kPrimaryFileScopeSql;
 
     std::string select_sql =
-        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.stable_key "
+        "SELECT n.id, n.kind, n.name, n.qualname, f.path, n.start_line, n.end_line, n.stable_key, n.rank "
         + from_sql + where_sql;
     std::string match_score_sql;
     if (!wildcard) {
@@ -3296,10 +3297,10 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
         if (match_score_sql.empty()) match_score_sql = "0";
     }
     if (wildcard) {
-        select_sql += "ORDER BY f.path, n.start_line, n.id LIMIT ? OFFSET ?";
+        select_sql += "ORDER BY n.rank DESC, f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     } else {
         select_sql += "ORDER BY (" + match_score_sql + ") DESC, " CODETOPO_TEST_RANK("f.path")
-            ", length(n.name), n.name, f.path, n.start_line, n.id LIMIT ? OFFSET ?";
+            ", n.rank DESC, (-bm25(nodes_fts)) DESC, length(n.name), n.name, f.path, n.start_line, n.id LIMIT ? OFFSET ?";
     }
     std::string count_sql = "SELECT COUNT(*) " + from_sql + where_sql;
 
@@ -3355,6 +3356,8 @@ std::string symbol_search(yyjson_val* params, Connection& conn,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", reinterpret_cast<const char*>(qn));
         if (fp) yyjson_mut_obj_add_strcpy(doc.doc, item, "file_path", reinterpret_cast<const char*>(fp));
         add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 7));
+        double rk = sqlite3_column_double(stmt, 8);
+        if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", rk);
 
         auto* span = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, span, "start_line", sqlite3_column_int(stmt, 5));
