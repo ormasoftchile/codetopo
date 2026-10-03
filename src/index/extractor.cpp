@@ -1,4 +1,5 @@
 #include "index/extractor.h"
+#include "core/inplace_vector.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -159,17 +160,17 @@ bool declaration_prefix_allows_receiver(std::string before) {
     char last = before.back();
     if (last == '(' || last == ',' || last == '[') return true;
 
-    std::vector<std::string> tokens;
+    inplace_vector<std::string, 16> tokens;
     std::string token;
     for (char c : before) {
         if (is_identifier_char(c)) {
             token.push_back(c);
         } else if (!token.empty()) {
-            tokens.push_back(token);
+            if (tokens.size() < tokens.capacity()) tokens.push_back(token);
             token.clear();
         }
     }
-    if (!token.empty()) tokens.push_back(token);
+    if (!token.empty() && tokens.size() < tokens.capacity()) tokens.push_back(token);
     if (tokens.empty()) return true;
 
     static const std::unordered_set<std::string> allowed = {
@@ -440,7 +441,8 @@ std::string classify_argument(TSNode arg, const std::string& source) {
     return "expr";
 }
 
-std::string join_patterns(const std::vector<std::string>& patterns) {
+template <typename Container>
+std::string join_patterns(const Container& patterns) {
     std::string out;
     for (const auto& p : patterns) {
         if (!out.empty()) out += ",";
@@ -1197,12 +1199,20 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
     TSNode args = find_argument_list_node(node);
     if (!ts_node_is_null(args)) {
         arg_count = static_cast<int>(ts_node_named_child_count(args));
-        std::vector<std::string> patterns;
-        patterns.reserve(static_cast<size_t>(std::max(arg_count, 0)));
-        for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
-            patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+        if (arg_count <= 16) {
+            inplace_vector<std::string, 16> patterns;
+            for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
+                patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+            }
+            arg_pattern = join_patterns(patterns);
+        } else {
+            std::vector<std::string> patterns;
+            patterns.reserve(static_cast<size_t>(arg_count));
+            for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
+                patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+            }
+            arg_pattern = join_patterns(patterns);
         }
-        arg_pattern = join_patterns(patterns);
     }
 
     std::string receiver_type_hint;
