@@ -71,8 +71,8 @@ public:
     // UB from detached threads accessing freed stack variables.
     bool had_stuck_threads() const { return had_stuck_threads_; }
 
-    ThreadPool(const ThreadPool&) = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
+    ThreadPool(const ThreadPool&) = delete("ThreadPool manages worker threads and cannot be copied");
+    ThreadPool& operator=(const ThreadPool&) = delete("ThreadPool manages worker threads and cannot be copied");
 
     // Submit a task and get a future for its result.
     template<typename F>

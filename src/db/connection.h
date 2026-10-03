@@ -75,8 +75,8 @@ public:
         if (db_) sqlite3_close(db_);
     }
 
-    Connection(const Connection&) = delete;
-    Connection& operator=(const Connection&) = delete;
+    Connection(const Connection&) = delete("Connection manages an exclusive sqlite3 handle and cannot be copied");
+    Connection& operator=(const Connection&) = delete("Connection manages an exclusive sqlite3 handle and cannot be copied");
 
     Connection(Connection&& other) noexcept : db_(other.db_) {
         other.db_ = nullptr;

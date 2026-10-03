@@ -31,8 +31,8 @@ public:
         delete[] buffer_;
     }
 
-    Arena(const Arena&) = delete;
-    Arena& operator=(const Arena&) = delete;
+    Arena(const Arena&) = delete("Arena is a thread-local bump allocator and cannot be copied");
+    Arena& operator=(const Arena&) = delete("Arena is a thread-local bump allocator and cannot be copied");
 
     // Bump-allocate `size` bytes, aligned to `alignment`.
     // Falls back to malloc on overflow and sets overflowed_ flag.
