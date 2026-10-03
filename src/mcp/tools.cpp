@@ -8,6 +8,7 @@
 #include "util/process.h"
 #include "mcp/error.h"
 #include "db/schema.h"
+#include "db/bind.h"
 #include <sqlite3.h>
 #include <sstream>
 #include <fstream>
@@ -6747,9 +6748,7 @@ static TraceNodeResolution resolve_trace_node(sqlite3_stmt* stmt, const std::str
     TraceNodeResolution resolved;
     if (symbol_name.empty()) return resolved;
 
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
-    sqlite3_bind_text(stmt, 1, symbol_name.c_str(), -1, SQLITE_TRANSIENT);
+    db::bind(stmt, symbol_name);
 
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         resolved.node_id = sqlite3_column_int64(stmt, 0);
@@ -6794,10 +6793,7 @@ static bool resolve_trace_edge(Connection& /*conn*/, QueryCache& cache,
         "SELECT confidence FROM edges "
         "WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls' "
         "ORDER BY confidence DESC, id ASC LIMIT 1");
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
-    sqlite3_bind_int64(stmt, 1, caller_node_id);
-    sqlite3_bind_int64(stmt, 2, callee_node_id);
+    db::bind(stmt, caller_node_id, callee_node_id);
     if (sqlite3_step(stmt) != SQLITE_ROW) return false;
     if (confidence_out) *confidence_out = sqlite3_column_double(stmt, 0);
     return true;
@@ -6884,16 +6880,8 @@ std::string ingest_traces(yyjson_val* params, Connection& conn,
             double p99_ms = json_get_double(trace, "p99_ms", 0.0);
             double error_rate = json_get_double(trace, "error_rate", 0.0);
 
-            sqlite3_reset(upsert_trace);
-            sqlite3_clear_bindings(upsert_trace);
-            sqlite3_bind_text(upsert_trace, 1, caller, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(upsert_trace, 2, callee, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(upsert_trace, 3, count);
-            sqlite3_bind_double(upsert_trace, 4, p50_ms);
-            sqlite3_bind_double(upsert_trace, 5, p99_ms);
-            sqlite3_bind_double(upsert_trace, 6, error_rate);
-            if (source) sqlite3_bind_text(upsert_trace, 7, source, -1, SQLITE_TRANSIENT);
-            else sqlite3_bind_null(upsert_trace, 7);
+            db::bind(upsert_trace, caller, callee, count, p50_ms, p99_ms, error_rate,
+                     source ? source : nullptr);
             if (sqlite3_step(upsert_trace) != SQLITE_DONE) {
                 throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
             }
@@ -6909,11 +6897,7 @@ std::string ingest_traces(yyjson_val* params, Connection& conn,
             double boost = 0.1 * std::log10(static_cast<double>(count));
             if (boost < 0.0) boost = 0.0;
 
-            sqlite3_reset(update_edge);
-            sqlite3_clear_bindings(update_edge);
-            sqlite3_bind_int64(update_edge, 1, caller_node.node_id);
-            sqlite3_bind_int64(update_edge, 2, callee_node.node_id);
-            sqlite3_bind_double(update_edge, 3, boost);
+            db::bind(update_edge, caller_node.node_id, callee_node.node_id, boost);
             if (sqlite3_step(update_edge) != SQLITE_DONE) {
                 throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
             }

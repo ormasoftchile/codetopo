@@ -142,8 +142,8 @@ public:
         if (parser_) ts_parser_delete(parser_);
     }
 
-    Parser(const Parser&) = delete;
-    Parser& operator=(const Parser&) = delete;
+    Parser(const Parser&) = delete("Parser manages a TSParser handle and cannot be copied");
+    Parser& operator=(const Parser&) = delete("Parser manages a TSParser handle and cannot be copied");
 
     Parser(Parser&& other) noexcept : parser_(other.parser_) {
         other.parser_ = nullptr;
@@ -218,8 +218,8 @@ struct TreeGuard {
     TSTree* tree;
     explicit TreeGuard(TSTree* t) : tree(t) {}
     ~TreeGuard() { if (tree) ts_tree_delete(tree); }
-    TreeGuard(const TreeGuard&) = delete;
-    TreeGuard& operator=(const TreeGuard&) = delete;
+    TreeGuard(const TreeGuard&) = delete("TreeGuard owns a TSTree pointer and cannot be copied");
+    TreeGuard& operator=(const TreeGuard&) = delete("TreeGuard owns a TSTree pointer and cannot be copied");
     TreeGuard(TreeGuard&& o) noexcept : tree(o.tree) { o.tree = nullptr; }
     TreeGuard& operator=(TreeGuard&& o) noexcept {
         if (this != &o) { if (tree) ts_tree_delete(tree); tree = o.tree; o.tree = nullptr; }

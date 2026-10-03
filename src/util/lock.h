@@ -119,8 +119,8 @@ public:
 
     ~FileLock() { release(); }
 
-    FileLock(const FileLock&) = delete;
-    FileLock& operator=(const FileLock&) = delete;
+    FileLock(const FileLock&) = delete("FileLock holds exclusive OS file descriptor locks and cannot be copied");
+    FileLock& operator=(const FileLock&) = delete("FileLock holds exclusive OS file descriptor locks and cannot be copied");
 
     bool was_stale_broken() const { return stale_broken_; }
     int64_t holder_pid() const { return holder_pid_; }

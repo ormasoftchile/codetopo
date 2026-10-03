@@ -16,8 +16,8 @@ struct JsonDoc {
 
     explicit JsonDoc(yyjson_doc* d) : doc(d) {}
     ~JsonDoc() { if (doc) yyjson_doc_free(doc); }
-    JsonDoc(const JsonDoc&) = delete;
-    JsonDoc& operator=(const JsonDoc&) = delete;
+    JsonDoc(const JsonDoc&) = delete("JsonDoc owns a raw yyjson_doc pointer and cannot be copied");
+    JsonDoc& operator=(const JsonDoc&) = delete("JsonDoc owns a raw yyjson_doc pointer and cannot be copied");
     JsonDoc(JsonDoc&& o) noexcept : doc(o.doc) { o.doc = nullptr; }
 
     yyjson_val* root() { return doc ? yyjson_doc_get_root(doc) : nullptr; }
@@ -30,8 +30,8 @@ struct JsonMutDoc {
 
     JsonMutDoc() : doc(yyjson_mut_doc_new(nullptr)) {}
     ~JsonMutDoc() { if (doc) yyjson_mut_doc_free(doc); }
-    JsonMutDoc(const JsonMutDoc&) = delete;
-    JsonMutDoc& operator=(const JsonMutDoc&) = delete;
+    JsonMutDoc(const JsonMutDoc&) = delete("JsonMutDoc owns a raw yyjson_mut_doc pointer and cannot be copied");
+    JsonMutDoc& operator=(const JsonMutDoc&) = delete("JsonMutDoc owns a raw yyjson_mut_doc pointer and cannot be copied");
 
     yyjson_mut_val* new_obj() { return yyjson_mut_obj(doc); }
     yyjson_mut_val* new_arr() { return yyjson_mut_arr(doc); }

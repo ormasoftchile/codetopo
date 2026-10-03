@@ -68,8 +68,8 @@ public:
         }
     }
 
-    ArenaLease(const ArenaLease&) = delete;
-    ArenaLease& operator=(const ArenaLease&) = delete;
+    ArenaLease(const ArenaLease&) = delete("ArenaLease holds a unique scoped lease from ArenaPool and cannot be copied");
+    ArenaLease& operator=(const ArenaLease&) = delete("ArenaLease holds a unique scoped lease from ArenaPool and cannot be copied");
 
     ArenaLease(ArenaLease&& other) noexcept
         : pool_(other.pool_), arena_(other.arena_) {
