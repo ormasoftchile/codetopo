@@ -64,7 +64,7 @@ representative entries.
 hashmap
   title schema kv
   buckets 5
-  bucket 0: schema_version->8
+  bucket 0: schema_version->14
   bucket 1: indexer_version->2026.06, last_index_time->2026-06-28T12:48
   bucket 2: repo_root->workspace, language_coverage->13langs
   bucket 3: git_head->abc1234, git_branch->main
@@ -103,9 +103,14 @@ CREATE TABLE nodes (
   is_definition INTEGER DEFAULT 1,
   visibility    TEXT,               -- public|private|protected|...
   doc           TEXT,               -- leading docstring
-  stable_key    TEXT                -- language-specific stable identifier
+  fingerprint   TEXT,               -- MinHash fingerprint (schema v10)
+  stable_key    TEXT,               -- language-specific stable identifier
+  rank          REAL DEFAULT 0.0    -- PageRank structural centrality (schema v14)
 );
 \end{lstlisting}
+
+A partial index \texttt{CREATE INDEX idx\_nodes\_rank ON nodes(rank) WHERE rank > 0}
+accelerates top-centrality and entrypoint lookups without indexing unranked leaf symbols.
 
 \subsubsection{Symbol kinds}
 

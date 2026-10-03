@@ -8,21 +8,41 @@ how developers investigate large codebases~\cite{robillard2004codenav}.
 
 \subsection{Symbol search}
 
-\texttt{symbol\_search} queries the \texttt{nodes\_fts} FTS5 virtual table
-(\S\ref{sec:data-model}) with a prefix \texttt{MATCH} on the \texttt{name}
-column:
+\texttt{symbol\_search} combines full-text indexing, structural graph
+centrality, and production-code heuristics into a multi-tier ranking:
 
 \begin{lstlisting}[language=sql]
-SELECT n.id, n.name, n.qualname, n.kind, f.path, n.span
-FROM   nodes n
-JOIN   files f ON f.id = n.file_id
-JOIN   nodes_fts nf ON nf.rowid = n.id
-WHERE  nf.name MATCH :query || '*'
-  AND  n.node_type = 'symbol'
-  AND  (:root_id IS NULL OR f.root_id = :root_id)
-ORDER  BY rank
-LIMIT  :limit;
+SELECT n.id, n.kind, n.name, n.qualname, f.path,
+       n.start_line, n.end_line, n.stable_key, n.rank
+FROM   nodes_fts fts
+JOIN   nodes n ON fts.rowid = n.id
+LEFT   JOIN files f ON n.file_id = f.id
+WHERE  nodes_fts MATCH :fts_query
+  AND  (:kind IS NULL OR n.kind = :kind)
+ORDER  BY (:match_score) DESC,
+          CODETOPO_TEST_RANK(f.path),
+          n.rank DESC,
+          (-bm25(nodes_fts)) DESC,
+          length(n.name), n.name, f.path
+LIMIT  :limit OFFSET :offset;
 \end{lstlisting}
+
+The ranking evaluates in five tiers:
+\begin{enumerate}
+  \item \textbf{Token coverage} (\texttt{match\_score}): symbols matching all
+        query terms directly in their name or qualified name rank highest.
+  \item \textbf{Production code priority} (\texttt{CODETOPO\_TEST\_RANK}):
+        test, mock, stub, and fake paths are partitioned below real
+        implementation files.
+  \item \textbf{Graph centrality} (\texttt{n.rank}): normalized PageRank
+        centrality (\S\ref{sec:pagerank}) boosts widely-used symbols,
+        ensuring core architectural APIs appear ahead of obscure leaf utilities.
+  \item \textbf{BM25 text relevance} (\texttt{-bm25(nodes\_fts)}): Okapi BM25
+        scores across symbol names, signatures, and docstrings break ties
+        within the same centrality tier.
+  \item \textbf{Length and stability}: shorter, direct symbol names precede
+        nested or verbose variants.
+\end{enumerate}
 
 A \texttt{kind='function'} filter expands to \texttt{kind IN ('function',
 'method')} to achieve polyglot parity: in Python a method has kind

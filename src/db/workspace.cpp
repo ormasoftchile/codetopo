@@ -6,6 +6,7 @@
 #include "db/workspace.h"
 #include "db/schema.h"
 #include "db/fts.h"
+#include "index/pagerank.h"
 #include "index/supervisor.h"
 #include "util/log.h"
 #include "util/repo.h"
@@ -419,6 +420,12 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     conn_.exec("DETACH DATABASE src");
     source_writer.release();
     conn_.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+
+    auto pagerank_phase = WorkspaceClock::now();
+    log_workspace_line("computing workspace graph centrality...", color_output);
+    int ranked = compute_and_persist_pagerank(conn_);
+    log_workspace_phase("centrality computed", pagerank_phase, color_output,
+                        "(" + format_with_commas(ranked) + " symbols)");
 
     // Content FTS is intentionally populated after the structural merge in
     // bounded transactions. This keeps node/file/ref/edge merge atomic while

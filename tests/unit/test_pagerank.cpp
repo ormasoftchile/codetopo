@@ -147,4 +147,20 @@ TEST_CASE("symbol_search ranks higher-centrality symbols first", "[unit][pageran
     auto* first_rank = yyjson_obj_get(first, "rank");
     REQUIRE(first_rank);
     CHECK(yyjson_get_real(first_rank) > 0.0);
+
+    // Also verify entrypoints tool returns parse_core with rank
+    std::string ep_response = tools::entrypoints(nullptr, conn, cache, temp.dir.string());
+    auto ep_doc = json_parse(ep_response);
+    REQUIRE(ep_doc);
+    auto* ep_results = yyjson_obj_get(ep_doc.root(), "results");
+    REQUIRE(ep_results);
+    REQUIRE(yyjson_arr_size(ep_results) >= 1);
+
+    auto* ep_first = yyjson_arr_get(ep_results, 0);
+    auto* ep_name = yyjson_obj_get(ep_first, "name");
+    REQUIRE(ep_name);
+    CHECK(std::string(yyjson_get_str(ep_name)) == "parse_core");
+    auto* ep_rank = yyjson_obj_get(ep_first, "rank");
+    REQUIRE(ep_rank);
+    CHECK(yyjson_get_real(ep_rank) > 0.0);
 }

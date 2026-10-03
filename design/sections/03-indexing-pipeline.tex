@@ -154,13 +154,37 @@ statement indices (\texttt{args...[Is]}) without recursive template
 expansions or intermediate tuple allocations. Memory allocations during
 Tree-sitter AST traversals are serviced by a dedicated bump-pointer
 \texttt{Arena} pool (\texttt{src/core/arena.h}) that avoids general-purpose
-heap contention across parallel worker threads.
+heap contention across parallel worker threads. Furthermore, bounded hot-path
+collections adopt C++26 \texttt{std::inplace\_vector<T, N>}
+(\texttt{src/core/inplace\_vector.h}) with zero-heap inline storage: child
+process execution argument lists (\texttt{N=64}), declaration modifier tokens
+(\texttt{N=16}), argument classification patterns (\texttt{N=16}), and search
+query term splitting (\texttt{N=8}).
 
 \paragraph{Bulk mode.} When the initial index covers more than 1\,000 files,
 the pipeline enters \emph{bulk mode}: it drops secondary indexes and FTS
 triggers before the load and rebuilds them afterwards. This avoids repeated
 B-tree rebalancing during the insert flood and significantly reduces total
 indexing time on large repositories.
+
+\subsection{Structural centrality and PageRank}
+\label{sec:pagerank}
+
+Following cross-file reference resolution, the pipeline performs a graph-wide
+centrality calculation (\texttt{src/index/pagerank.h}) to quantify architectural
+importance:
+
+\begin{equation}
+  PR^{(k+1)}(v) = \frac{1 - d}{N} + \frac{d \cdot S_{\text{dangle}}}{N} + d \sum_{u \in M(v)} \frac{PR^{(k)}(u) \cdot w(u, v)}{W_{\text{out}}(u)}
+\end{equation}
+
+where directed edges include \texttt{calls}, \texttt{inherits}, and
+\texttt{references} ($w(u,v) \ge 0.1$), $d = 0.85$, and $S_{\text{dangle}}$
+redistributes probability mass from sink nodes lacking outgoing edges. Power
+iteration terminates when $\Delta < 10^{-5}$ (typically 12--18 iterations,
+taking under 15\,ms for 100\,000 edges). Ranks are normalized against the
+maximum score ($PR(v) / \max PR \in (0.0, 1.0]$) and persisted into
+\texttt{nodes.rank} via a temporary staging table in a single atomic update.
 
 \subsection{FTS rebuild (phase 2)}
 
