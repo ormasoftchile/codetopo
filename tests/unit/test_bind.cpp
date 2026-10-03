@@ -62,3 +62,24 @@ TEST_CASE("C++26 pack-indexed statement binder", "[db][bind]") {
 
     sqlite3_finalize(query_stmt);
 }
+
+struct CustomUnbindableType { int a; };
+
+TEST_CASE("C++26 is_bindable_v trait and custom diagnostic assertions", "[db][bind]") {
+    STATIC_CHECK(db::is_bindable_v<int>);
+    STATIC_CHECK(db::is_bindable_v<unsigned int>);
+    STATIC_CHECK(db::is_bindable_v<int64_t>);
+    STATIC_CHECK(db::is_bindable_v<uint64_t>);
+    STATIC_CHECK(db::is_bindable_v<size_t>);
+    STATIC_CHECK(db::is_bindable_v<bool>);
+    STATIC_CHECK(db::is_bindable_v<double>);
+    STATIC_CHECK(db::is_bindable_v<float>);
+    STATIC_CHECK(db::is_bindable_v<std::string>);
+    STATIC_CHECK(db::is_bindable_v<std::string_view>);
+    STATIC_CHECK(db::is_bindable_v<const char*>);
+    STATIC_CHECK(db::is_bindable_v<char[8]>);
+    STATIC_CHECK(db::is_bindable_v<std::nullptr_t>);
+    STATIC_CHECK(db::is_bindable_v<std::optional<std::string>>);
+    STATIC_CHECK_FALSE(db::is_bindable_v<CustomUnbindableType>);
+    STATIC_CHECK_FALSE(db::is_bindable_v<std::vector<int>>);
+}

@@ -12,6 +12,7 @@
 #include "core/arena_pool.h"
 #include "index/parser.h"
 #include <string>
+#include <limits>
 
 using namespace codetopo;
 
@@ -345,4 +346,19 @@ TEST_CASE("Arena reset on release: memory reclaimed after lease ends",
         CHECK(lease2.get() == arena_ptr);
         CHECK(lease2->used() == 0); // Arena was reset on release
     }
+}
+
+TEST_CASE("Arena C++26 saturation arithmetic prevents integer overflow",
+          "[arena][saturation]") {
+    Arena arena(1024);
+
+    // allocate with size close to SIZE_MAX saturates and marks overflowed
+    void* p1 = arena.allocate(std::numeric_limits<size_t>::max() - 10);
+    CHECK(arena.overflowed());
+    CHECK(p1 == nullptr); // malloc fails on SIZE_MAX request, safely returning nullptr
+
+    // allocate_zeroed with count * size overflowing size_t saturates and marks overflowed
+    void* p2 = arena.allocate_zeroed(std::numeric_limits<size_t>::max() / 2, 4);
+    CHECK(arena.overflowed());
+    CHECK(p2 == nullptr); // calloc fails on overflowed request, safely returning nullptr
 }

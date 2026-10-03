@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cstdint>
+#include <numeric>
 #include <set>
 #include <iterator>
 #include <algorithm>
@@ -657,9 +658,7 @@ static std::string canonical_type_hint(std::string s) {
 
 static int64_t parse_max_bytes(yyjson_val* params, int64_t default_value = 16000) {
     int64_t max_bytes = params ? json_get_int(params, "max_bytes", default_value) : default_value;
-    if (max_bytes < 0) max_bytes = 0;
-    if (max_bytes > 100000) max_bytes = 100000;
-    return max_bytes;
+    return std::clamp<int64_t>(max_bytes, 0, 100000);
 }
 
 static CallsiteCandidateOptions parse_callsite_candidate_options(yyjson_val* params) {
@@ -1456,7 +1455,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
         const auto& row = *row_ptr;
         size_t item_bytes = estimate_callsite_candidate_bytes(row, options.include_handles);
         if (result.max_bytes > 0 && !result.rows.empty() &&
-            approx_bytes + item_bytes > static_cast<size_t>(result.max_bytes)) {
+            std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(result.max_bytes)) {
             result.budget_exceeded = true;
             result.has_more = true;
             break;
@@ -1466,7 +1465,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
             break;
         }
         result.rows.push_back(row);
-        approx_bytes += item_bytes + 1;
+        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
     }
     if (result.total > static_cast<int64_t>(result.rows.size()))
         result.filtered_hidden = result.total - static_cast<int64_t>(result.rows.size());
@@ -3387,7 +3386,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
-    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
+    int64_t max_bytes = parse_max_bytes(params);
 
     std::unordered_set<std::string> fields_set;
     bool fields_provided = false;
@@ -3396,11 +3395,8 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
         return McpError::invalid_input(fields_error).to_json_rpc(0);
     }
 
-    if (limit > 2000) limit = 2000;
-    if (limit < 1) limit = 1;
-    if (offset < 0) offset = 0;
-    if (max_bytes < 0) max_bytes = 0;
-    if (max_bytes > 100000) max_bytes = 100000;
+    limit = std::clamp<int64_t>(limit, 1, 2000);
+    offset = std::max<int64_t>(0, offset);
 
     std::string base_where_sql = " WHERE 1=1";
     if (has_file) base_where_sql += " AND f.path = ?";
@@ -3506,7 +3502,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
         const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
-        if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
+        if (max_bytes > 0 && count > 0 && std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
             has_more = true;
             budget_exceeded = true;
             break;
@@ -3520,7 +3516,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
 
         yyjson_mut_arr_append(results, item);
         count++;
-        approx_bytes += item_bytes + 1;
+        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
@@ -3529,7 +3525,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
     yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
-    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::add_sat(offset, static_cast<int64_t>(count)));
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
@@ -3557,12 +3553,9 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     int64_t min_span_lines = params ? json_get_int(params, "min_span_lines", 0) : 0;
     int64_t limit = params ? json_get_int(params, "limit", 200) : 200;
     int64_t offset = params ? json_get_int(params, "offset", 0) : 0;
-    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
-    if (limit > 2000) limit = 2000;
-    if (limit < 1) limit = 1;
-    if (offset < 0) offset = 0;
-    if (max_bytes < 0) max_bytes = 0;
-    if (max_bytes > 100000) max_bytes = 100000;
+    int64_t max_bytes = parse_max_bytes(params);
+    limit = std::clamp<int64_t>(limit, 1, 2000);
+    offset = std::max<int64_t>(0, offset);
 
     std::unordered_set<std::string> fields_set;
     bool fields_provided = false;
@@ -3728,7 +3721,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
-        if (max_bytes > 0 && count > 0 && approx_bytes + item_bytes > static_cast<size_t>(max_bytes)) {
+        if (max_bytes > 0 && count > 0 && std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
             has_more = true;
             budget_exceeded = true;
             break;
@@ -3741,7 +3734,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
             include_handles, compact, false, "file_path", fields_set, fields_provided);
         yyjson_mut_arr_append(results, item);
         count++;
-        approx_bytes += item_bytes + 1;
+        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
@@ -3750,7 +3743,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
     yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
-    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", offset + count);
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::add_sat(offset, static_cast<int64_t>(count)));
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
@@ -6498,16 +6491,12 @@ std::string code_search(yyjson_val* params, Connection& conn,
     }
 
     int limit = params ? static_cast<int>(json_get_int(params, "limit", 50)) : 50;
-    if (limit > 500) limit = 500;
-    if (limit < 1) limit = 1;
+    limit = std::clamp<int>(limit, 1, 500);
 
     int context_lines = params ? static_cast<int>(json_get_int(params, "context_lines", 0)) : 0;
-    if (context_lines > 5) context_lines = 5;
-    if (context_lines < 0) context_lines = 0;
+    context_lines = std::clamp<int>(context_lines, 0, 5);
 
-    int64_t max_bytes = params ? json_get_int(params, "max_bytes", 16000) : 16000;
-    if (max_bytes < 0) max_bytes = 0;
-    if (max_bytes > 100000) max_bytes = 100000;
+    int64_t max_bytes = parse_max_bytes(params);
 
     bool case_sensitive = params ? json_get_bool(params, "case_sensitive", false) : false;
 
@@ -6671,13 +6660,13 @@ std::string code_search(yyjson_val* params, Connection& conn,
 
             size_t match_bytes = 48 + lm.line_text.size() + ctx.size();
             if (max_bytes > 0 && (files_returned > 0 || shown > 0) &&
-                approx_bytes + match_bytes > static_cast<size_t>(max_bytes)) {
+                std::add_sat(approx_bytes, match_bytes) > static_cast<size_t>(max_bytes)) {
                 budget_exceeded = true;
                 break;
             }
 
             shown++;
-            approx_bytes += match_bytes + 1;
+            approx_bytes = std::add_sat(approx_bytes, match_bytes + 1);
 
             auto* match_obj = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, match_obj, "line", lm.line_num);
@@ -7124,7 +7113,7 @@ std::string list_http_calls(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(results, item);
     }
 
-    add_pagination_fields(doc, root, results, total, offset + limit < total, offset, limit);
+    add_pagination_fields(doc, root, results, total, std::add_sat(offset, limit) < total, offset, limit);
     return doc.to_string();
 }
 

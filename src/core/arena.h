@@ -8,6 +8,10 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <numeric>
+#include <memory>
+#include <cassert>
+#include <limits>
 
 namespace codetopo {
 
@@ -39,9 +43,9 @@ public:
     void* allocate(size_t size, size_t alignment = alignof(std::max_align_t)) {
         size_t current = offset_;
         size_t aligned = (current + alignment - 1) & ~(alignment - 1);
-        size_t new_offset = aligned + size;
+        size_t new_offset = std::add_sat(aligned, size);
 
-        if (new_offset > capacity_) {
+        if (new_offset > capacity_ || new_offset == std::numeric_limits<size_t>::max()) {
             overflowed_ = true;
             void* p = std::malloc(size);
             if (p) overflow_ptrs_.push_back(p);
@@ -49,18 +53,24 @@ public:
         }
 
         offset_ = new_offset;
-        return buffer_ + aligned;
+        void* ptr = buffer_ + aligned;
+#if defined(__cpp_lib_is_sufficiently_aligned) && __cpp_lib_is_sufficiently_aligned >= 202411L
+        if (alignment >= alignof(std::max_align_t)) {
+            assert(std::is_sufficiently_aligned<alignof(std::max_align_t)>(ptr));
+        }
+#endif
+        return ptr;
     }
 
     // calloc semantics: allocate + zero-fill
     void* allocate_zeroed(size_t count, size_t size) {
-        size_t total = count * size;
+        size_t total = std::mul_sat(count, size);
         size_t current = offset_;
         size_t aligned = (current + alignof(std::max_align_t) - 1)
                        & ~(alignof(std::max_align_t) - 1);
-        size_t new_offset = aligned + total;
+        size_t new_offset = std::add_sat(aligned, total);
 
-        if (new_offset > capacity_) {
+        if (new_offset > capacity_ || total == std::numeric_limits<size_t>::max()) {
             overflowed_ = true;
             void* p = std::calloc(count, size);
             if (p) overflow_ptrs_.push_back(p);
@@ -69,6 +79,9 @@ public:
 
         offset_ = new_offset;
         void* ptr = buffer_ + aligned;
+#if defined(__cpp_lib_is_sufficiently_aligned) && __cpp_lib_is_sufficiently_aligned >= 202411L
+        assert(std::is_sufficiently_aligned<alignof(std::max_align_t)>(ptr));
+#endif
         std::memset(ptr, 0, total);
         return ptr;
     }
