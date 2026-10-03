@@ -101,6 +101,39 @@ The entire operation runs in a single transaction.
 \texttt{workspace\_list} returns all roots with path, symbol count, file
 count, last-indexed timestamp, and indexing status.
 
+\subsubsection{Refreshing a root}
+
+\texttt{workspace\_refresh} triggers an incremental re-index restricted to a
+specific secondary root. It identifies changed or deleted files within that
+root, parses updated ASTs, and merges changes into the shared database
+without re-indexing the primary project or other roots.
+
+\subsection{Asynchronous background jobs}
+
+Adding, removing, or refreshing external workspace roots can be long-running
+operations when repositories contain thousands of source files. Running these
+operations synchronously inside the JSON-RPC request handler would block the
+stdio communication channel and trigger client timeouts.
+
+To keep the server responsive, \texttt{workspace\_add}, \texttt{workspace\_remove},
+and \texttt{workspace\_refresh} execute asynchronously:
+\begin{enumerate}
+  \item The tool call immediately validates arguments, generates a unique
+        \texttt{job\_id}, spawns or queues a background worker, and returns
+        an initial acknowledgment.
+  \item The background worker advances through distinct phases (\texttt{indexing},
+        \texttt{merging}, \texttt{fts\_rebuild}, \texttt{completed}, or
+        \texttt{failed}).
+  \item Clients query \texttt{workspace\_job\_status} by \texttt{job\_id} to
+        inspect the active phase, elapsed time, and error states without
+        holding RPC frames open.
+  \item \texttt{workspace\_job\_cancel} signals graceful cancellation. The
+        worker checks cancellation tokens at safe phase boundaries (e.g.,
+        between file batches or before beginning table merges) so that
+        in-progress SQLite transactions commit cleanly and the database is
+        never left in a partially merged state.
+\end{enumerate}
+
 \subsection{Indexer guard}
 
 The normal \texttt{codetopo index} command only re-indexes files belonging to
@@ -114,3 +147,4 @@ roots.
 SQLite WAL mode allows the Query Engine to serve reads while the Indexer is
 writing. The Indexer acquires a write lock only during the commit phase of each
 file transaction; reads proceed unblocked during parse and extraction.
+

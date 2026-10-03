@@ -50,6 +50,10 @@
 %   \tritonsetup{opts}                        default \includegraphics options
 %   \tritoncli{cmd}                           CLI invocation (default: triton-latex)
 %   \tritontheme{name}                        theme preset for inline renders
+%   \tritonthemefile{path}                    explicit .triton-theme.json file
+%   \tritonthemesdir{dir}                     directory of .triton-theme.json files
+%   \tritoniconsdir{dir}                      directory of .triton-icons.json packs
+%   \tritoniconpack{path}                     explicit .triton-icons.json pack file
 %   \tritonscale{n}                           scale passed to the CLI (default 1)
 %   \tritoncachedir{dir}                      render cache (default \jobname.triton-cache)
 %
@@ -95,6 +99,52 @@
 \newcommand{\tritonscale}[1]{\def\triton@scale{#1}}
 \def\triton@themearg{}
 \newcommand{\tritontheme}[1]{\def\triton@themearg{\space--theme #1}}
+% \tritonthemefile{path} — pass an explicit .triton-theme.json file to the CLI.
+% The theme-file PATH is folded into the cache key (see \triton@render below).
+% KNOWN LIMITATION: the cache key includes the path, NOT the file content hash.
+% If you edit a .triton-theme.json in-place without changing its path, the cached
+% PDF will be stale. Clear the cache with: rm -r <cachedir>  or  latexmk -C
+% Content-aware hashing is deferred to a future Tier-2 release.
+\def\triton@themefilearg{}
+\newcommand{\tritonthemefile}[1]{\def\triton@themefilearg{\space--theme-file #1}}
+% \tritonthemesdir{dir} — directory of .triton-theme.json files; merged on top of
+% any auto-discovered .triton/themes/ ancestor.  Use with \tritontheme{name}.
+% Path is folded into the cache key (same in-place-edit caveat as above).
+\def\triton@themesdirarg{}
+\newcommand{\tritonthemesdir}[1]{\def\triton@themesdirarg{\space--themes-dir #1}}
+%
+% ── Icon-pack arguments ──────────────────────────────────────────────────────
+% \tritoniconsdir{dir} — directory of .triton-icons.json icon packs; merged on top
+% of any auto-discovered .triton/icons/ ancestor.
+% CACHE KEY: the directory PATH is included in the key for the icons-dir case,
+% which carries the same in-place-edit limitation as the theme path-only key.
+% For the --icon-pack case (explicit file), see \tritoniconpack below.
+\def\triton@iconsdirarg{}
+\newcommand{\tritoniconsdir}[1]{\def\triton@iconsdirarg{\space--icons-dir #1}}
+% \tritoniconpack{path} — explicit .triton-icons.json file; highest precedence,
+% overrides --icons-dir and auto-discovery on duplicate prefix.
+%
+% CACHE KEY — CONTENT HASH (better than theme's path-only key):
+% For a known --icon-pack file we CAN content-hash the pack: we use
+% \pdf@filemdfivesum{<path>} (provided by pdftexcmds, already \RequirePackage'd)
+% to hash the pack FILE CONTENT and fold that hash into the %% triton-key comment
+% that drives the render cache. This means editing a pack file in-place invalidates
+% the cache automatically — no stale renders.
+%
+% RESIDUAL LIMITATION: auto-discovered packs (ancestor .triton/icons/ walk) and
+% --icons-dir packs are NOT content-hashed here — only their directory path appears
+% in the cache key. Editing a pack inside those directories in-place without
+% changing the directory path will produce a stale cache entry. To force
+% re-render, clear the cache with: rm -r <cachedir>  or  latexmk -C
+%
+% Implementation: \triton@iconpackhash is computed just before the key-append
+% \write18 in \triton@render; it is empty when \triton@iconpackarg is unset.
+\def\triton@iconpackarg{}
+\def\triton@iconpackpath{}
+\newcommand{\tritoniconpack}[1]{%
+  \def\triton@iconpackarg{\space--icon-pack #1}%
+  \def\triton@iconpackpath{#1}%
+}
 \def\triton@cachedir{\jobname.triton-cache}
 \newcommand{\tritoncachedir}[1]{\def\triton@cachedir{#1}}
 % Temp file the verbatim diagram source is written to before rendering. The
@@ -120,12 +170,33 @@
 % holds the \includegraphics options. Content-hash → cache → shell-out → include.
 \newcommand{\triton@render}{%
   \ifnum\pdf@shellescape=\@ne
+    % Fold theme + scale + icon flags into the hashed file so that changing any
+    % of \tritontheme{}, \tritonscale{}, \tritoniconsdir{}, or \tritoniconpack{}
+    % correctly invalidates the cache. The appended line is a full-line %%
+    % comment, stripped by stripComments() before the CLI parses the diagram,
+    % so the compiler never sees it and IR/SVG output is byte-identical. The
+    % temp file is freshly written before every call to \triton@render, so this
+    % append is idempotent per render.
+    % NOTE: echo (not printf) is used deliberately — printf treats %% as a
+    % format escape; echo passes characters through verbatim, so '%%' stays '%%'.
+    %
+    % ICON PACK CONTENT HASH: when \tritoniconpack{path} is set, compute an MD5
+    % of the pack file content (via \pdf@filemdfivesum) and embed it in the key.
+    % This means editing the pack file in-place invalidates the cache — unlike the
+    % path-only approach used for themes. \triton@iconpackhash is empty when no
+    % explicit pack is set (residual limitation: --icons-dir packs are path-keyed).
+    \ifx\triton@iconpackpath\@empty
+      \def\triton@iconpackhash{}%
+    \else
+      \edef\triton@iconpackhash{\space icon-pack-md5=\pdf@filemdfivesum{\triton@iconpackpath}}%
+    \fi
+    \immediate\write18{echo '\@percentchar\@percentchar triton-key:\triton@themearg\triton@themefilearg\triton@themesdirarg\triton@iconsdirarg\triton@iconpackarg\triton@iconpackhash\space scale=\triton@scale' >> "\triton@tmpfile"}%
     \edef\triton@hash{\pdf@filemdfivesum{\triton@tmpfile}}%
     \edef\triton@pdf{\triton@cachedir/\triton@hash.pdf}%
     % Only render when this exact source has not been rendered before.
     \IfFileExists{\triton@pdf}{}{%
       \immediate\write18{\triton@cli\space render "\triton@tmpfile" -o
-        "\triton@pdf" --scale \triton@scale\triton@themearg}%
+        "\triton@pdf" --scale \triton@scale\triton@themearg\triton@themefilearg\triton@themesdirarg\triton@iconsdirarg\triton@iconpackarg}%
     }%
     \IfFileExists{\triton@pdf}{%
       % \triton@curopts is a macro (e.g. width=\linewidth); graphicx mis-parses

@@ -16,7 +16,7 @@ callable operations with typed input schemas.
 The tool-call pattern maps naturally to code intelligence queries. An AI agent
 can call \texttt{symbol\_search} as naturally as it calls any other function.
 The structured JSON input/output means the agent never needs to parse
-grep-style output or interpret editor hover text. codetopo registers 27 tools
+grep-style output or interpret editor hover text. codetopo registers 41 tools
 that cover the full range of structural queries an AI agent needs when
 working on a codebase.
 
@@ -64,28 +64,37 @@ effect immediately.
 
 \subsection{Tool catalogue}
 
-The 27 tools are organized into eight categories.
+The 41 tools are organized into nine categories.
 
 \subsubsection{Navigation}
 
 \begin{description}
   \item[\texttt{dir\_list}] List files and directories under a path.
-  \item[\texttt{file\_search}] Find files by name pattern across all roots.
+  \item[\texttt{dir\_tree}] Return full directory subtree up to depth $N$ with
+        file sizes and language classification.
+  \item[\texttt{file\_search}] Find files by path pattern (GLOB syntax) across all roots.
   \item[\texttt{file\_summary}] Return symbol-annotated outline of a file.
-  \item[\texttt{source\_at}] Read raw source content at a given path.
+  \item[\texttt{file\_overview}] Return structural overview of top-level symbols,
+        signatures, and doc comments for a file without loading bodies.
+  \item[\texttt{source\_at}] Read raw source content for a given line range.
 \end{description}
 
 \subsubsection{Symbol lookup}
 
 \begin{description}
-  \item[\texttt{symbol\_search}] FTS5 prefix search over symbol names,
-        qualified names, signatures, and docstrings. \texttt{kind='function'}
-        matches both \texttt{function} and \texttt{method} nodes for
-        polyglot parity.
-  \item[\texttt{symbol\_list}] List all symbols of a given kind in a root.
-  \item[\texttt{symbol\_get}] Fetch a single symbol by ID.
+  \item[\texttt{symbol\_search}] FTS5 prefix and ranked search over symbol names,
+        qualified names, signatures, and docstrings. Supports stable keys and
+        kind filtering.
+  \item[\texttt{symbol\_list}] List and filter symbols in a root or file without
+        full-text search, with listing-safe payload pruning.
+  \item[\texttt{symbols\_in\_path}] Enumerate symbols under a directory path with
+        listing-safe filtering and candidate metrics.
+  \item[\texttt{symbol\_get}] Fetch detailed symbol information and source code
+        by reindex-proof \texttt{stable\_key} or \texttt{node\_id}.
   \item[\texttt{symbol\_get\_batch}] Fetch multiple symbols by ID in one
         round-trip.
+  \item[\texttt{context\_by\_name}] Look up a symbol by name and return its full
+        structural context, or a disambiguation list if ambiguous.
 \end{description}
 
 \subsubsection{Graph traversal}
@@ -93,29 +102,31 @@ The 27 tools are organized into eight categories.
 \begin{description}
   \item[\texttt{callers\_approx}] Direct callers of a symbol (inbound
         \texttt{calls} edges). Named ``approx'' because call edges are
-        AST-derived without full type resolution.
+        AST-derived without full type resolution; includes fallback candidate
+        resolution and receiver type filtering.
   \item[\texttt{callees\_approx}] Direct callees of a symbol (outbound
         \texttt{calls} edges), including unresolved name-only entries.
   \item[\texttt{references}] All reference sites for a symbol across all roots.
-  \item[\texttt{context\_for}] Return the symbol context (enclosing function
-        or class) for a given file location.
+  \item[\texttt{context\_for}] Return the full structural context of a symbol
+        (definition, source, exact callers/callees, container, siblings, bases).
   \item[\texttt{entrypoints}] Identify symbols with no callers (potential
-        entry points or public API).
+        entry points or public APIs).
 \end{description}
 
-\subsubsection{Impact analysis}
+\subsubsection{Impact and change analysis}
 
 \begin{description}
-  \item[\texttt{impact\_of}] Transitive BFS/DFS over the call graph from a
-        seed node; returns all symbols reachable via \texttt{calls} edges.
-  \item[\texttt{subgraph}] Extract the subgraph reachable from a set of seed
-        nodes up to a given depth.
+  \item[\texttt{impact\_of}] Transitive BFS/DFS blast radius over the call
+        graph from a seed node up to depth $N$.
+  \item[\texttt{detect\_changes}] PR blast-radius analysis: maps \texttt{git diff}
+        changes against a base ref to AST symbols, then BFS-traverses reverse
+        call edges to find impacted callers.
+  \item[\texttt{subgraph}] Extract the dependency neighborhood graph reachable
+        from a set of seed nodes up to a given depth.
   \item[\texttt{shortest\_path}] Find the shortest call path between two
         symbols using BFS.
-  \item[\texttt{dependency\_cluster}] Group symbols by mutual dependency into
-        clusters.
-  \item[\texttt{find\_implementations}] Find concrete implementations of an
-        interface, trait, or abstract method.
+  \item[\texttt{find\_similar}] Find near-duplicate functions or methods using
+        MinHash fingerprints of normalized AST leaf trigrams.
 \end{description}
 
 Figure~\ref{fig:dependency-clusters} illustrates the partitioned output shape
@@ -135,32 +146,33 @@ unionfind 7
   \label{fig:dependency-clusters}
 \end{figure}
 
-\subsubsection{Metadata}
+\subsubsection{Architecture and coupling}
 
 \begin{description}
-  \item[\texttt{repo\_stats}] Row counts, language distribution, and index
-        size.
-  \item[\texttt{server\_info}] Server version, protocol version, and
-        supported languages.
-  \item[\texttt{reindex}] Trigger an incremental or full re-index of all roots.
-\end{description}
-
-\subsubsection{File analysis}
-
-\begin{description}
+  \item[\texttt{get\_architecture}] Summarize repository architecture from the
+        indexed graph, identifying directory clusters, hotspots, boundaries,
+        and cohesion/coupling metrics.
+  \item[\texttt{dependency\_cluster}] Group methods in a file or class by
+        shared field access patterns, computing extractability scores for
+        refactoring decomposition.
+  \item[\texttt{find\_implementations}] Find concrete implementations or
+        subtypes of an interface, trait, or abstract class.
   \item[\texttt{file\_deps}] Return the import/include dependency graph for a
         file.
-  \item[\texttt{method\_fields}] List the fields accessed by a method (field
-        access edges).
+  \item[\texttt{method\_fields}] List the fields accessed by a method and
+        distinguish local versus external calls.
 \end{description}
 
-\subsubsection{Workspace management}
+\subsubsection{Distributed tracing and telemetry}
 
 \begin{description}
-  \item[\texttt{workspace\_add}] Add a new root path to the workspace.
-  \item[\texttt{workspace\_remove}] Remove a root and cascade-delete its data.
-  \item[\texttt{workspace\_list}] List all registered roots with status and
-        statistics.
+  \item[\texttt{list\_http\_calls}] Inspect protocol-aware HTTP client call
+        references and target endpoint paths captured during indexing.
+  \item[\texttt{ingest\_traces}] Ingest observed runtime call traces (e.g., from
+        OpenTelemetry) with call counts and latency percentiles to boost static
+        call-graph confidence scores.
+  \item[\texttt{get\_traces}] Query ingested runtime traces and evaluate their
+        resolution status against indexed static symbols and call edges.
 \end{description}
 
 \subsubsection{Full-text search}
@@ -169,4 +181,34 @@ unionfind 7
   \item[\texttt{code\_search}] Trigram full-text search over source lines
         using the \texttt{content\_fts} contentless FTS5 index~\cite{cox2012trigram}.
         Returns matching lines with file path and line number.
+\end{description}
+
+\subsubsection{Workspace management}
+
+\begin{description}
+  \item[\texttt{workspace\_add}] Start an asynchronous background job to index
+        and merge an extra repository root into the shared workspace.
+  \item[\texttt{workspace\_remove}] Start an asynchronous job to remove an extra
+        root and cascade-delete its rows.
+  \item[\texttt{workspace\_list}] List all registered roots with symbol, file,
+        and edge counts.
+  \item[\texttt{workspace\_refresh}] Start an asynchronous background re-index of
+        changed files within an extra root.
+  \item[\texttt{workspace\_job\_status}] Query the retained status, phase, and
+        elapsed time of an active or recent workspace job.
+  \item[\texttt{workspace\_job\_cancel}] Request graceful cancellation of an
+        asynchronous workspace job at the next safe phase boundary.
+\end{description}
+
+\subsubsection{Server lifecycle and diagnostics}
+
+\begin{description}
+  \item[\texttt{server\_info}] Server version, protocol version, schema version,
+        and supported languages.
+  \item[\texttt{server\_health}] In-memory readiness and liveness probe for
+        client orchestration.
+  \item[\texttt{repo\_stats}] Metadata summary, row counts, language
+        distribution, and index size without slow graph scans.
+  \item[\texttt{reindex}] Trigger an incremental or full background re-index of
+        the repository.
 \end{description}
