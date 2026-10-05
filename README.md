@@ -30,8 +30,8 @@ Tested on enterprise codebases with 450K+ files — indexes 100K files in ~10 mi
 
 ### Prerequisites
 
-- CMake ≥ 3.20
-- C++20 compiler (Clang, GCC, MSVC)
+- CMake ≥ 3.25
+- C++26 compiler (Clang 19+, GCC 14+, MSVC 19.40+)
 - [vcpkg](https://vcpkg.io/) with `VCPKG_ROOT` set
 
 ### Build
