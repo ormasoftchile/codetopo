@@ -9,6 +9,8 @@
 #include "mcp/error.h"
 #include "db/schema.h"
 #include "db/bind.h"
+#include "index/quality.h"
+#include "index/diff.h"
 #include "core/inplace_vector.h"
 #include <sqlite3.h>
 #include <sstream>
@@ -6872,9 +6874,11 @@ std::string ingest_traces(yyjson_val* params, Connection& conn,
         schema::ensure_schema(write_conn);
         write_conn.exec("BEGIN IMMEDIATE");
 
+        schema::ensure_edges_provenance_schema(write_conn);
         sqlite3_stmt* upsert_trace = nullptr;
         sqlite3_stmt* resolve_node = nullptr;
         sqlite3_stmt* update_edge = nullptr;
+        sqlite3_stmt* insert_runtime_edge = nullptr;
 
         sqlite3_prepare_v2(write_conn.raw(),
             "INSERT OR REPLACE INTO traces("
@@ -6903,9 +6907,16 @@ std::string ingest_traces(yyjson_val* params, Connection& conn,
             "LIMIT 1",
             -1, &resolve_node, nullptr);
         sqlite3_prepare_v2(write_conn.raw(),
-            "UPDATE edges SET confidence = MIN(1.0, confidence + ?3) "
+            "UPDATE edges SET confidence = MIN(1.0, confidence + ?3), "
+            "observed_count = observed_count + ?4, "
+            "last_seen = datetime('now'), "
+            "first_seen = COALESCE(first_seen, datetime('now')) "
             "WHERE src_id = ?1 AND dst_id = ?2 AND kind = 'calls'",
             -1, &update_edge, nullptr);
+        sqlite3_prepare_v2(write_conn.raw(),
+            "INSERT INTO edges (src_id, dst_id, kind, confidence, evidence, source, observed_count, first_seen, last_seen) "
+            "VALUES (?1, ?2, 'calls', 0.8, 'runtime-trace', 'runtime', ?3, datetime('now'), datetime('now'))",
+            -1, &insert_runtime_edge, nullptr);
 
         if (!upsert_trace || !resolve_node || !update_edge) {
             throw std::runtime_error("failed to prepare trace ingestion SQL");
@@ -6953,17 +6964,27 @@ std::string ingest_traces(yyjson_val* params, Connection& conn,
             double boost = 0.1 * std::log10(static_cast<double>(count));
             if (boost < 0.0) boost = 0.0;
 
-            db::bind(update_edge, caller_node.node_id, callee_node.node_id, boost);
+            db::bind(update_edge, caller_node.node_id, callee_node.node_id, boost, count);
             if (sqlite3_step(update_edge) != SQLITE_DONE) {
                 throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
             }
             if (sqlite3_changes(write_conn.raw()) > 0) {
                 resolved_edges++;
             } else {
-                unresolved++;
+                if (insert_runtime_edge) {
+                    sqlite3_reset(insert_runtime_edge);
+                    db::bind(insert_runtime_edge, caller_node.node_id, callee_node.node_id, count);
+                    if (sqlite3_step(insert_runtime_edge) != SQLITE_DONE) {
+                        throw std::runtime_error(sqlite3_errmsg(write_conn.raw()));
+                    }
+                    resolved_edges++;
+                } else {
+                    unresolved++;
+                }
             }
         }
 
+        if (insert_runtime_edge) sqlite3_finalize(insert_runtime_edge);
         sqlite3_finalize(update_edge);
         sqlite3_finalize(resolve_node);
         sqlite3_finalize(upsert_trace);
@@ -7314,6 +7335,317 @@ std::string workspace_list(yyjson_val* /*params*/, Connection& conn,
         return doc.to_string();
     } catch (const std::exception& e) {
         return std::string(R"({"error":")") + e.what() + R"("})";
+    }
+}
+
+std::string graph_quality(yyjson_val* /*params*/, Connection& conn,
+                          QueryCache& /*cache*/, const std::string& /*repo_root*/) {
+    try {
+        GraphQuality q = compute_graph_quality(conn);
+        return format_quality_json(q);
+    } catch (const std::exception& e) {
+        return tool_error_json(e.what());
+    }
+}
+
+std::string get_edge_evidence(yyjson_val* params, Connection& conn,
+                              QueryCache& /*cache*/, const std::string& /*repo_root*/) {
+    try {
+        int64_t node_id = -1;
+        if (params) {
+            node_id = json_get_int(params, "node_id", -1);
+            if (node_id < 0) {
+                const char* sym = json_get_str(params, "symbol");
+                if (sym && *sym) {
+                    sqlite3_stmt* s = nullptr;
+                    if (sqlite3_prepare_v2(conn.raw(),
+                        "SELECT id FROM nodes WHERE node_type = 'symbol' AND (name = ?1 OR qualname = ?1) ORDER BY is_definition DESC, id ASC LIMIT 1",
+                        -1, &s, nullptr) == SQLITE_OK) {
+                        sqlite3_bind_text(s, 1, sym, -1, SQLITE_TRANSIENT);
+                        if (sqlite3_step(s) == SQLITE_ROW) {
+                            node_id = sqlite3_column_int64(s, 0);
+                        }
+                        sqlite3_finalize(s);
+                    }
+                }
+            }
+        }
+
+        int64_t caller_id = -1;
+        int64_t callee_id = -1;
+        const char* caller_str = params ? json_get_str(params, "caller") : nullptr;
+        const char* callee_str = params ? json_get_str(params, "callee") : nullptr;
+
+        if (caller_str && *caller_str) {
+            sqlite3_stmt* s = nullptr;
+            if (sqlite3_prepare_v2(conn.raw(),
+                "SELECT id FROM nodes WHERE node_type = 'symbol' AND (name = ?1 OR qualname = ?1) ORDER BY is_definition DESC, id ASC LIMIT 1",
+                -1, &s, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(s, 1, caller_str, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) {
+                    caller_id = sqlite3_column_int64(s, 0);
+                }
+                sqlite3_finalize(s);
+            }
+        }
+        if (callee_str && *callee_str) {
+            sqlite3_stmt* s = nullptr;
+            if (sqlite3_prepare_v2(conn.raw(),
+                "SELECT id FROM nodes WHERE node_type = 'symbol' AND (name = ?1 OR qualname = ?1) ORDER BY is_definition DESC, id ASC LIMIT 1",
+                -1, &s, nullptr) == SQLITE_OK) {
+                sqlite3_bind_text(s, 1, callee_str, -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) {
+                    callee_id = sqlite3_column_int64(s, 0);
+                }
+                sqlite3_finalize(s);
+            }
+        }
+
+        std::string mode = "all";
+        if (params) {
+            const char* m = json_get_str(params, "mode");
+            if (m && *m) mode = m;
+        }
+
+        std::string kind_filter = "";
+        if (params) {
+            const char* k = json_get_str(params, "kind");
+            if (k && *k) kind_filter = k;
+        }
+
+        int64_t limit = params ? json_get_int(params, "limit", 50) : 50;
+        if (limit < 1) limit = 1;
+        if (limit > 200) limit = 200;
+
+        bool has_source = false;
+        {
+            sqlite3_stmt* check_col = nullptr;
+            if (sqlite3_prepare_v2(conn.raw(), "PRAGMA table_info(edges)", -1, &check_col, nullptr) == SQLITE_OK) {
+                while (sqlite3_step(check_col) == SQLITE_ROW) {
+                    const char* col = reinterpret_cast<const char*>(sqlite3_column_text(check_col, 1));
+                    if (col && std::strcmp(col, "source") == 0) {
+                        has_source = true;
+                        break;
+                    }
+                }
+                sqlite3_finalize(check_col);
+            }
+        }
+
+        struct BindParam {
+            bool is_int = false;
+            int64_t int_val = 0;
+            std::string text_val;
+        };
+        std::vector<BindParam> binds;
+
+        std::ostringstream sql;
+        sql << "SELECT "
+            << "  e.id, "
+            << "  e.src_id, sn.name, sn.qualname, sn.kind, COALESCE(sf.path, ''), "
+            << "  e.dst_id, dn.name, dn.qualname, dn.kind, COALESCE(df.path, ''), "
+            << "  e.kind, e.confidence, COALESCE(e.evidence, 'ast') ";
+        if (has_source) {
+            sql << ", COALESCE(e.source, 'static'), e.observed_count, e.first_seen, e.last_seen ";
+        } else {
+            sql << ", 'static', 1, NULL, NULL ";
+        }
+        sql << "FROM edges e "
+            << "JOIN nodes sn ON sn.id = e.src_id "
+            << "LEFT JOIN files sf ON sf.id = sn.file_id "
+            << "JOIN nodes dn ON dn.id = e.dst_id "
+            << "LEFT JOIN files df ON df.id = dn.file_id "
+            << "WHERE 1=1 ";
+
+        if (caller_id > 0) {
+            sql << " AND e.src_id = ? ";
+            binds.push_back({true, caller_id, ""});
+        } else if (caller_str && *caller_str) {
+            sql << " AND (sn.name = ? OR sn.qualname = ?) ";
+            binds.push_back({false, 0, caller_str});
+            binds.push_back({false, 0, caller_str});
+        }
+
+        if (callee_id > 0) {
+            sql << " AND e.dst_id = ? ";
+            binds.push_back({true, callee_id, ""});
+        } else if (callee_str && *callee_str) {
+            sql << " AND (dn.name = ? OR dn.qualname = ?) ";
+            binds.push_back({false, 0, callee_str});
+            binds.push_back({false, 0, callee_str});
+        }
+
+        if (node_id > 0 && caller_id <= 0 && callee_id <= 0 && (!caller_str || !*caller_str) && (!callee_str || !*callee_str)) {
+            sql << " AND (e.src_id = ? OR e.dst_id = ?) ";
+            binds.push_back({true, node_id, ""});
+            binds.push_back({true, node_id, ""});
+        }
+
+        if (!kind_filter.empty()) {
+            sql << " AND e.kind = ? ";
+            binds.push_back({false, 0, kind_filter});
+        }
+
+        if (has_source) {
+            if (mode == "observed") {
+                sql << " AND (e.source != 'static' OR e.observed_count > 1 OR e.last_seen IS NOT NULL) ";
+            } else if (mode == "unobserved_static") {
+                sql << " AND (e.source = 'static' AND e.observed_count <= 1 AND e.last_seen IS NULL) ";
+            } else if (mode == "runtime_only") {
+                sql << " AND e.source = 'runtime' ";
+            }
+        }
+
+        sql << " ORDER BY e.confidence DESC ";
+        if (has_source) {
+            sql << ", e.observed_count DESC ";
+        }
+        sql << " LIMIT ? ";
+        binds.push_back({true, limit, ""});
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(conn.raw(), sql.str().c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            return tool_error_json(sqlite3_errmsg(conn.raw()));
+        }
+
+        for (size_t i = 0; i < binds.size(); ++i) {
+            int idx = static_cast<int>(i + 1);
+            if (binds[i].is_int) {
+                sqlite3_bind_int64(stmt, idx, binds[i].int_val);
+            } else {
+                sqlite3_bind_text(stmt, idx, binds[i].text_val.c_str(), -1, SQLITE_TRANSIENT);
+            }
+        }
+
+        sqlite3_stmt* trace_stmt = nullptr;
+        sqlite3_prepare_v2(conn.raw(),
+            "SELECT call_count, p50_ms, p99_ms, error_rate, COALESCE(source, ''), ingested_at "
+            "FROM traces "
+            "WHERE (caller_name = ?1 OR caller_name = ?2) AND (callee_name = ?3 OR callee_name = ?4) "
+            "ORDER BY call_count DESC LIMIT 5", -1, &trace_stmt, nullptr);
+
+        JsonMutDoc doc;
+        auto* root = doc.new_obj();
+        doc.set_root(root);
+        yyjson_mut_obj_add_strcpy(doc.doc, root, "mode", mode.c_str());
+        auto* edges_arr = doc.new_arr();
+
+        int count = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            count++;
+            auto* item = doc.new_obj();
+            int64_t edge_id = sqlite3_column_int64(stmt, 0);
+            int64_t src_id = sqlite3_column_int64(stmt, 1);
+            const char* src_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            const char* src_qual = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            const char* src_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
+            const char* src_file = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+
+            int64_t dst_id = sqlite3_column_int64(stmt, 6);
+            const char* dst_name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
+            const char* dst_qual = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 8));
+            const char* dst_kind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
+            const char* dst_file = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
+
+            const char* ekind = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+            double conf = sqlite3_column_double(stmt, 12);
+            const char* evid = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 13));
+            const char* src_source = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 14));
+            int64_t obs_count = sqlite3_column_int64(stmt, 15);
+            const char* f_seen = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 16));
+            const char* l_seen = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 17));
+
+            yyjson_mut_obj_add_int(doc.doc, item, "edge_id", edge_id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "kind", ekind ? ekind : "");
+            yyjson_mut_obj_add_real(doc.doc, item, "confidence", conf);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", evid ? evid : "");
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "source", src_source ? src_source : "static");
+            yyjson_mut_obj_add_int(doc.doc, item, "observed_count", obs_count);
+            if (f_seen) yyjson_mut_obj_add_strcpy(doc.doc, item, "first_seen", f_seen);
+            if (l_seen) yyjson_mut_obj_add_strcpy(doc.doc, item, "last_seen", l_seen);
+
+            auto* src_obj = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, src_obj, "node_id", src_id);
+            yyjson_mut_obj_add_strcpy(doc.doc, src_obj, "name", src_name ? src_name : "");
+            if (src_qual) yyjson_mut_obj_add_strcpy(doc.doc, src_obj, "qualname", src_qual);
+            yyjson_mut_obj_add_strcpy(doc.doc, src_obj, "kind", src_kind ? src_kind : "");
+            yyjson_mut_obj_add_strcpy(doc.doc, src_obj, "file", src_file ? src_file : "");
+            yyjson_mut_obj_add_val(doc.doc, item, "src", src_obj);
+
+            auto* dst_obj = doc.new_obj();
+            yyjson_mut_obj_add_int(doc.doc, dst_obj, "node_id", dst_id);
+            yyjson_mut_obj_add_strcpy(doc.doc, dst_obj, "name", dst_name ? dst_name : "");
+            if (dst_qual) yyjson_mut_obj_add_strcpy(doc.doc, dst_obj, "qualname", dst_qual);
+            yyjson_mut_obj_add_strcpy(doc.doc, dst_obj, "kind", dst_kind ? dst_kind : "");
+            yyjson_mut_obj_add_strcpy(doc.doc, dst_obj, "file", dst_file ? dst_file : "");
+            yyjson_mut_obj_add_val(doc.doc, item, "dst", dst_obj);
+
+            if (trace_stmt && src_name && dst_name) {
+                sqlite3_reset(trace_stmt);
+                sqlite3_bind_text(trace_stmt, 1, src_name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(trace_stmt, 2, src_qual ? src_qual : src_name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(trace_stmt, 3, dst_name, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(trace_stmt, 4, dst_qual ? dst_qual : dst_name, -1, SQLITE_TRANSIENT);
+
+                auto* traces_arr = doc.new_arr();
+                while (sqlite3_step(trace_stmt) == SQLITE_ROW) {
+                    auto* tr = doc.new_obj();
+                    yyjson_mut_obj_add_int(doc.doc, tr, "call_count", sqlite3_column_int64(trace_stmt, 0));
+                    yyjson_mut_obj_add_real(doc.doc, tr, "p50_ms", sqlite3_column_double(trace_stmt, 1));
+                    yyjson_mut_obj_add_real(doc.doc, tr, "p99_ms", sqlite3_column_double(trace_stmt, 2));
+                    yyjson_mut_obj_add_real(doc.doc, tr, "error_rate", sqlite3_column_double(trace_stmt, 3));
+                    const char* tr_src = reinterpret_cast<const char*>(sqlite3_column_text(trace_stmt, 4));
+                    const char* tr_ing = reinterpret_cast<const char*>(sqlite3_column_text(trace_stmt, 5));
+                    yyjson_mut_obj_add_strcpy(doc.doc, tr, "source", tr_src ? tr_src : "");
+                    yyjson_mut_obj_add_strcpy(doc.doc, tr, "ingested_at", tr_ing ? tr_ing : "");
+                    yyjson_mut_arr_append(traces_arr, tr);
+                }
+                if (yyjson_mut_arr_size(traces_arr) > 0) {
+                    yyjson_mut_obj_add_val(doc.doc, item, "traces", traces_arr);
+                }
+            }
+
+            yyjson_mut_arr_append(edges_arr, item);
+        }
+
+        if (trace_stmt) sqlite3_finalize(trace_stmt);
+        sqlite3_finalize(stmt);
+
+        yyjson_mut_obj_add_int(doc.doc, root, "total", count);
+        yyjson_mut_obj_add_val(doc.doc, root, "edges", edges_arr);
+        return doc.to_string();
+    } catch (const std::exception& e) {
+        return tool_error_json(e.what());
+    }
+}
+
+std::string graph_diff(yyjson_val* params, Connection& conn,
+                       QueryCache& /*cache*/, const std::string& repo_root) {
+    try {
+        std::string base = "HEAD";
+        std::string target = "working-tree";
+        std::string file_pattern = "";
+        std::string root = repo_root;
+
+        if (params) {
+            const char* b = json_get_str(params, "base");
+            if (!b) b = json_get_str(params, "since");
+            if (b && *b) base = b;
+
+            const char* t = json_get_str(params, "target");
+            if (t && *t) target = t;
+
+            const char* fp = json_get_str(params, "file_pattern");
+            if (fp && *fp) file_pattern = fp;
+
+            const char* r = json_get_str(params, "repo_root");
+            if (r && *r) root = r;
+        }
+
+        GraphDiffReport report = compute_semantic_diff(conn, root, base, target, file_pattern);
+        return format_diff_json(report);
+    } catch (const std::exception& e) {
+        return tool_error_json(e.what());
     }
 }
 

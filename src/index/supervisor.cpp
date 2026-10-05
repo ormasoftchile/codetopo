@@ -124,6 +124,10 @@ int run_index_supervisor(const Config& config,
         if (config.turbo) args.push_back("--turbo");
         if (config.force_reindex) args.push_back("--force");
         if (config.profile) args.push_back("--profile");
+        if (!config.profile_json.empty()) {
+            args.push_back("--profile-json");
+            args.push_back(config.profile_json);
+        }
         if (config.max_files > 0) {
             args.push_back("--max-files");
             args.push_back(std::to_string(config.max_files));
@@ -165,9 +169,9 @@ int run_index_supervisor(const Config& config,
         // confuse it with the new child's progress.
         std::filesystem::remove(progress_path);
 
-        // Use stall-timeout waiting: if child makes no progress for 120s,
+        // Use stall-timeout waiting: if child makes no progress for 1800s (30m),
         // kill it (handles infinite parse loops that ignore cancellation flag).
-        constexpr int STALL_TIMEOUT_S = 120;
+        constexpr int STALL_TIMEOUT_S = 1800;
         int exit_code = spawn_and_wait_with_stall_timeout(
             self, args, progress_path.string(), STALL_TIMEOUT_S);
 

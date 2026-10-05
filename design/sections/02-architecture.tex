@@ -7,23 +7,58 @@ adjacent layers through a narrow interface.
 
 \begin{figure}[htbp]
 \centering
-\begin{tikzpicture}[
-  layer/.style={draw, fill=blue!8, rounded corners,
-                minimum width=9.5cm, minimum height=1.1cm, text centered,
-                font=\small\sffamily},
-  ann/.style={font=\scriptsize\ttfamily, text=gray},
-  >=stealth
-]
-\node[layer] (mcp)     at (0,4.5) {MCP Server \quad (JSON-RPC 2.0 / stdio)};
-\node[layer] (query)   at (0,3.0) {Query Engine \quad (41 tools + QueryCache)};
-\node[layer] (storage) at (0,1.5) {Storage \quad (SQLite --- index.sqlite)};
-\node[layer] (indexer) at (0,0.0) {Indexer \quad (tree-sitter, C++26) + Watcher};
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "CodeTopo Platform Architecture"
+  figure "FIGURE 01 · SYSTEM TOPOLOGY & EVENT PIPELINE"
+  desc "Five-tier live software-topology engine connecting multi-language source trees, change pipelines, and SQLite storage to AI agents."
 
-\draw[<->] (mcp)     -- (query)   node[ann,right,midway] {tool dispatch};
-\draw[<->] (query)   -- (storage) node[ann,right,midway] {SQL (prepared)};
-\draw[->]  (indexer) -- (storage) node[ann,right,midway] {batched writes};
-\end{tikzpicture}
-\caption{codetopo four-layer architecture.}
+  legend
+    square static "Static Evidence" #3b82f6
+    circle runtime "Runtime Trace" #10b981
+    diamond agent "Agent Query" #8b5cf6
+  end
+
+  tier sources "SOURCE EVIDENCE"
+    card roots "Workspace Roots" [13 Polyglot Trees] @icon:globe
+    card git "Git VCS State" [HEAD · Diffs · Branches] @icon:api
+    card traces "Runtime Telemetry" [OTel Spans · HTTP Routes] @icon:lightning
+  end
+
+  tier indexing "CHANGE & INDEXING"
+    card watcher "Watcher & Coalescer" [FSEvents · Inotify · Queue] @icon:server
+    card parser "Tree-sitter Parser" [CST · xxHash Verification] @icon:robot
+    card attraction "Symbol Attraction" [Cross-File Rebind Engine] @icon:lightning
+  end
+
+  tier topology "LIVE TOPOLOGY"
+    card fts "FTS5 Trigram Indexes" [Contentless Fast Search] @icon:storage
+    card db "SQLite Topology DB" [nodes · edges · refs (WAL)] @icon:database
+    card pagerank "Structural Centrality" [PageRank Power Iteration] @icon:cloud
+  end
+
+  tier intelligence "TOPOLOGY REASONING"
+    card blast "Blast-Radius Engine" [PR Diff & Transitive BFS] @icon:lightning
+    card qe "Query Engine" [41 MCP Tools · Prepared Cache] @icon:api
+    card arch "Architecture Analysis" [Coupling & Subsystems] @icon:server
+  end
+
+  tier consumers "AGENT CONSUMERS"
+    card mcp "MCP Server" [JSON-RPC 2.0 / stdio] @icon:api
+    card cli "CodeTopo CLI" [quality · diff · doctor] @icon:server
+    card agents "AI Coding Agents" [Context-Lean Navigation] @icon:robot
+  end
+
+  bus roots, git, traces -->|"Events & Diffs"| watcher @anim:stream
+  bus watcher --> parser
+  bus parser --> attraction
+  bus parser, attraction -->|"Batch WAL Write"| db
+  bus fts, db, pagerank -->|"Indexed Lookups"| qe
+  bus blast --> qe
+  bus qe --> arch
+  bus qe -->|"Structured Output"| mcp, cli, agents @anim:flow
+\end{triton}
+\caption{CodeTopo platform architecture. Five horizontal tiers connect heterogeneous source evidence, a continuous change-detection and indexing pipeline, the live SQLite topology model, topological reasoning engines, and autonomous agent consumers.}
 \label{fig:architecture}
 \end{figure}
 
@@ -38,10 +73,13 @@ single SQLite transaction per file. The Indexer runs at startup (governed by a
 
 A platform-native filesystem \emph{watcher} (FSEvents on macOS,
 inotify on Linux, ReadDirectoryChangesW on Windows) monitors each workspace
-root. On a create, modify, or delete event the watcher schedules an incremental
-re-index of the affected file. A branch-switch event (detected by watching
-\texttt{.git/HEAD}) triggers re-indexing of all files whose content has changed
-since the previous HEAD.
+root. On a create, modify, or delete event the watcher schedules a targeted incremental
+re-index of the affected files, debounced through a quiet window and serialized via an
+in-flight change coalescing state machine (\S\ref{sec:watcher-concurrency}). A branch-switch
+event (detected by watching \texttt{.git/HEAD}) isolates changed files using \texttt{git diff}
+reconciliation with fallback to two-tier metadata and content verification
+(\S\ref{sec:border-cases}). Incremental updates bypass repo-wide graph scans via a targeted
+symbol attraction query (\S\ref{sec:incremental-reindexing}).
 
 \subsection{Storage}
 

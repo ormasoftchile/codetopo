@@ -22,8 +22,9 @@ namespace codetopo {
 // Schema version 12 = drop node_vectors (semantic embedding subsystem removed).
 // Schema version 13 = files.language CHECK allows 'powershell' and 'batch'.
 // Schema version 14 = symbol structural centrality / PageRank (nodes.rank column).
-static constexpr int CURRENT_SCHEMA_VERSION = 14;
-static constexpr const char* INDEXER_VERSION = "1.7.0";
+// Schema version 15 = edge provenance and observation metrics (edges.source, observed_count, first_seen, last_seen).
+static constexpr int CURRENT_SCHEMA_VERSION = 15;
+static constexpr const char* INDEXER_VERSION = "1.8.0";
 
 namespace schema {
 
@@ -189,11 +190,16 @@ inline void create_tables(Connection& conn) {
             dst_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
             kind TEXT NOT NULL CHECK(kind IN ('calls','includes','inherits','references','contains')),
             confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0.3),
-            evidence TEXT
+            evidence TEXT,
+            source TEXT NOT NULL DEFAULT 'static' CHECK(source IN ('static','semantic','runtime','build','protocol','inferred')),
+            observed_count INTEGER NOT NULL DEFAULT 1,
+            first_seen TEXT,
+            last_seen TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind);
         CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence);
+        CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
     )SQL");
 
     conn.exec(R"SQL(
@@ -446,6 +452,23 @@ inline void ensure_nodes_rank_schema(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_nodes_rank ON nodes(rank) WHERE rank > 0");
 }
 
+inline void ensure_edges_provenance_schema(Connection& conn) {
+    if (!table_exists(conn, "edges")) return;
+    if (!table_has_column(conn, "edges", "source")) {
+        conn.exec("ALTER TABLE edges ADD COLUMN source TEXT NOT NULL DEFAULT 'static'");
+    }
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)");
+    if (!table_has_column(conn, "edges", "observed_count")) {
+        conn.exec("ALTER TABLE edges ADD COLUMN observed_count INTEGER NOT NULL DEFAULT 1");
+    }
+    if (!table_has_column(conn, "edges", "first_seen")) {
+        conn.exec("ALTER TABLE edges ADD COLUMN first_seen TEXT");
+    }
+    if (!table_has_column(conn, "edges", "last_seen")) {
+        conn.exec("ALTER TABLE edges ADD COLUMN last_seen TEXT");
+    }
+}
+
 // Restore secondary indexes without invalidating concurrent readers.
 inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)");
@@ -463,6 +486,7 @@ inline void rebuild_indexes(Connection& conn) {
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
     conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence)");
+    conn.exec("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)");
     conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key)");
 }
 
@@ -486,6 +510,7 @@ inline int ensure_schema(Connection& conn) {
         ensure_nodes_fingerprint_schema(conn);
         ensure_nodes_rank_schema(conn);
         ensure_content_fts_tracker_rowid_schema(conn);
+        ensure_edges_provenance_schema(conn);
         return 0;  // Compatible
     }
 
@@ -607,6 +632,12 @@ inline int ensure_schema(Connection& conn) {
         version = 14;
     }
 
+    // v14→v15: add edge provenance and observation metrics (edges.source, observed_count, first_seen, last_seen).
+    if (version == 14) {
+        ensure_edges_provenance_schema(conn);
+        version = 15;
+    }
+
     if (version == CURRENT_SCHEMA_VERSION) {
         if (recreate_nodes_fts) {
             create_fts(conn);
@@ -618,6 +649,7 @@ inline int ensure_schema(Connection& conn) {
         set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         ensure_content_fts_tracker_rowid_schema(conn);
         ensure_nodes_rank_schema(conn);
+        ensure_edges_provenance_schema(conn);
         return 0;
     }
 

@@ -5,7 +5,27 @@
 #include <iostream>
 #include <iomanip>
 
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/resource.h>
+#endif
+#include <fstream>
+
 namespace codetopo {
+
+inline double get_peak_rss_mb() {
+#if defined(__APPLE__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return ru.ru_maxrss / (1024.0 * 1024.0); // bytes on macOS
+    }
+#elif defined(__linux__)
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+        return ru.ru_maxrss / 1024.0; // kilobytes on Linux
+    }
+#endif
+    return 0.0;
+}
 
 // Accumulator for a single profiling phase.
 struct PhaseTimer {
@@ -43,6 +63,7 @@ struct ScopedPhase {
 struct Profiler {
     bool enabled = false;
 
+    PhaseTimer scan;
     PhaseTimer arena_lease;
     PhaseTimer file_read;
     PhaseTimer hash;
@@ -56,6 +77,7 @@ struct Profiler {
     PhaseTimer resolve_refs;
     PhaseTimer idx_write;
     PhaseTimer fts_rebuild;
+    PhaseTimer pagerank;
     PhaseTimer metadata;
     PhaseTimer wal_ckpt;
 
@@ -77,13 +99,16 @@ struct Profiler {
 
         double total_ms = total_us / 1000.0;
         double files_per_sec = total_ms > 0 ? (total_files * 1000.0 / total_ms) : 0;
+        double peak_rss = get_peak_rss_mb();
 
         std::cerr << "\n=== Profile Report ===\n";
         std::cerr << "Total: " << std::fixed << std::setprecision(1) << total_ms << " ms"
                   << " | " << total_files << " files"
                   << " | " << std::setprecision(0) << files_per_sec << " files/s"
-                  << " | " << thread_count << " threads\n\n";
+                  << " | " << thread_count << " threads"
+                  << " | Peak RSS: " << std::fixed << std::setprecision(1) << peak_rss << " MB\n\n";
 
+        print_phase("scan", scan);
         print_phase("arena_lease", arena_lease);
         print_phase("file_read", file_read);
         print_phase("hash", hash);
@@ -97,9 +122,59 @@ struct Profiler {
         print_phase("resolve_refs", resolve_refs);
         print_phase("idx_write", idx_write);
         print_phase("fts_rebuild", fts_rebuild);
+        print_phase("pagerank", pagerank);
         print_phase("metadata", metadata);
         print_phase("wal_ckpt", wal_ckpt);
         std::cerr << "======================\n";
+    }
+
+    void write_json(const std::string& path, int64_t total_us, int total_files, int thread_count) const {
+        if (path.empty()) return;
+        std::ofstream out(path);
+        if (!out.is_open()) return;
+
+        double total_ms = total_us / 1000.0;
+        double files_per_sec = total_ms > 0 ? (total_files * 1000.0 / total_ms) : 0;
+        double peak_rss = get_peak_rss_mb();
+
+        out << "{\n";
+        out << "  \"total_ms\": " << std::fixed << std::setprecision(1) << total_ms << ",\n";
+        out << "  \"total_files\": " << total_files << ",\n";
+        out << "  \"files_per_sec\": " << std::fixed << std::setprecision(1) << files_per_sec << ",\n";
+        out << "  \"thread_count\": " << thread_count << ",\n";
+        out << "  \"peak_rss_mb\": " << std::fixed << std::setprecision(1) << peak_rss << ",\n";
+        out << "  \"phases\": {\n";
+
+        auto write_phase = [&](const char* name, const PhaseTimer& p, bool is_last = false) {
+            double ms = p.total_us.load(std::memory_order_relaxed) / 1000.0;
+            int64_t n = p.count.load(std::memory_order_relaxed);
+            double avg_ms = n > 0 ? ms / n : 0;
+            out << "    \"" << name << "\": {\"ms\": " << std::fixed << std::setprecision(1) << ms
+                << ", \"calls\": " << n
+                << ", \"avg_ms\": " << std::fixed << std::setprecision(3) << avg_ms << "}"
+                << (is_last ? "" : ",") << "\n";
+        };
+
+        write_phase("scan", scan);
+        write_phase("arena_lease", arena_lease);
+        write_phase("file_read", file_read);
+        write_phase("hash", hash);
+        write_phase("parse", parse);
+        write_phase("extract", extract);
+        write_phase("contention", contention);
+        write_phase("persist", persist);
+        write_phase("persist_wait", persist_wait);
+        write_phase("flush", flush);
+        write_phase("idx_read", idx_read);
+        write_phase("resolve_refs", resolve_refs);
+        write_phase("idx_write", idx_write);
+        write_phase("fts_rebuild", fts_rebuild);
+        write_phase("pagerank", pagerank);
+        write_phase("metadata", metadata);
+        write_phase("wal_ckpt", wal_ckpt, true);
+
+        out << "  }\n";
+        out << "}\n";
     }
 };
 

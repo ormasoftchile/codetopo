@@ -8,11 +8,8 @@
 
 all: pdf
 
-pdf: triton.sty
+pdf:
 	tectonic -Z shell-escape -Z shell-escape-cwd=. codetopo.tex
-
-triton.sty: /Users/cristianormazabal/Projects/triton/latex/triton.sty
-	cp $< $@
 
 clean:
 	rm -f *.aux *.bbl *.blg *.out *.toc *.log *.xdv triton.sty

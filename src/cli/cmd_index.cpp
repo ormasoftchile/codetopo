@@ -198,21 +198,25 @@ int run_index(const Config& config) {
         Scanner scanner(config);
         std::vector<ScannedFile> scanned_files;
         std::vector<std::string> targeted_deleted_paths;
-        if (targeted_mode) {
-            scanned_files = scanner.scan_paths(target_paths, targeted_deleted_paths);
-            std::cerr << "Targeted scan: " << scanned_files.size()
-                      << " source files, " << targeted_deleted_paths.size()
-                      << " deleted paths\n";
-        } else {
-            std::cerr << "Scanning " << repo_root.string() << "...\n";
-            scanned_files = scanner.scan();
-            std::cerr << "Found " << scanned_files.size() << " source files\n";
-        }
+        ChangeDetector::ChangeResult changes;
+        {
+            ScopedPhase _sc(profiler.scan);
+            if (targeted_mode) {
+                scanned_files = scanner.scan_paths(target_paths, targeted_deleted_paths);
+                std::cerr << "Targeted scan: " << scanned_files.size()
+                          << " source files, " << targeted_deleted_paths.size()
+                          << " deleted paths\n";
+            } else {
+                std::cerr << "Scanning " << repo_root.string() << "...\n";
+                scanned_files = scanner.scan();
+                std::cerr << "Found " << scanned_files.size() << " source files\n";
+            }
 
-        ChangeDetector detector(conn, config.force_reindex);
-        auto changes = targeted_mode
-            ? detector.detect_targeted(scanned_files, targeted_deleted_paths)
-            : detector.detect(scanned_files);
+            ChangeDetector detector(conn, config.force_reindex);
+            changes = targeted_mode
+                ? detector.detect_targeted(scanned_files, targeted_deleted_paths)
+                : detector.detect(scanned_files);
+        }
 
         std::cerr << "New: " << changes.new_files.size()
                   << " Changed: " << changes.changed_files.size()
@@ -366,7 +370,7 @@ int run_index(const Config& config) {
         std::cerr << "SAFE MODE: commit after every file\n";
     }
     if (config.turbo) {
-        effective_batch_size = (std::max)(effective_batch_size, 5000);
+        effective_batch_size = (std::max)(effective_batch_size, 1000);
         conn.enable_turbo();
     }
     // On resume with a small remaining worklist, cap batch size so progress
@@ -792,10 +796,13 @@ int run_index(const Config& config) {
             
             persist_state.persisted_count.store(local_count, std::memory_order_relaxed);
             
-            if (config.supervised && committed) {
+            static auto last_pf_update = std::chrono::steady_clock::now();
+            auto now_pf = std::chrono::steady_clock::now();
+            if (config.supervised && (committed || local_count % 100 == 0 || now_pf - last_pf_update > std::chrono::seconds(3))) {
                 std::ofstream pf(progress_path, std::ios::trunc);
                 pf << work_list[item.work_list_index].relative_path << '\n';
                 pf.flush();
+                last_pf_update = now_pf;
             }
         }
         
@@ -804,6 +811,7 @@ int run_index(const Config& config) {
         // Phase 2: Bulk-insert content FTS from stashed content (no disk re-reads).
         // Runs in its own transaction after structural persist is fully committed.
         if (!fts_pending.empty()) {
+            ScopedPhase _fts(profiler.fts_rebuild);
             std::cerr << "Building content search index...\n";
             auto cfts_ins = content_fts::prepare(conn.raw(),
                 "INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)");
@@ -814,15 +822,22 @@ int run_index(const Config& config) {
             conn.exec("BEGIN IMMEDIATE");
             int fts_count = 0;
             auto fts_start = std::chrono::steady_clock::now();
+            auto fts_last_pf = fts_start;
             for (auto& [fid, content] : fts_pending) {
                 content_fts::insert_lines(cfts_ins.get(), cfts_trk.get(), fid, content);
                 content.clear();           // free memory incrementally
                 ++fts_count;
-                if (fts_count % fts_batch == 0) {
+                auto now = std::chrono::steady_clock::now();
+                if (fts_count % fts_batch == 0 || (config.supervised && now - fts_last_pf > std::chrono::seconds(5))) {
                     conn.exec("COMMIT");
                     conn.exec(kWalCheckpoint);
                     conn.exec("BEGIN IMMEDIATE");
-                    auto now = std::chrono::steady_clock::now();
+                    if (config.supervised) {
+                        std::ofstream pf(progress_path, std::ios::trunc);
+                        pf << "fts: " << fts_count << '\n';
+                        pf.flush();
+                        fts_last_pf = now;
+                    }
                     auto secs = std::chrono::duration_cast<std::chrono::seconds>(now - fts_start).count();
                     double rate = secs > 0 ? static_cast<double>(fts_count) / secs : 0;
                     std::cerr << "\r\033[K  " << fts_count << "/" << fts_pending.size()
@@ -965,7 +980,8 @@ int run_index(const Config& config) {
             changed_paths.reserve(work_list.size());
             for (const auto& f : work_list) changed_paths.push_back(f.relative_path);
         }
-        auto [refs_resolved, edges_created] = persister.resolve_references(targeted_mode, changed_paths);
+        std::string prog_str = config.supervised ? progress_path.string() : "";
+        auto [refs_resolved, edges_created] = persister.resolve_references(targeted_mode, changed_paths, prog_str);
         conn.exec("PRAGMA foreign_keys=ON");
         auto resolve_elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - resolve_start).count();
@@ -975,8 +991,9 @@ int run_index(const Config& config) {
 
     // Structural graph centrality (PageRank) ranking
     {
+        ScopedPhase _pr(profiler.pagerank);
         auto pr_start = std::chrono::steady_clock::now();
-        int ranked = compute_and_persist_pagerank(conn);
+        int ranked = compute_and_persist_pagerank(conn, {}, progress_path);
         auto pr_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - pr_start).count();
         std::cerr << "Ranked " << ranked << " symbols by centrality in " << pr_elapsed << "ms\n";
@@ -1028,6 +1045,9 @@ int run_index(const Config& config) {
     auto total_elapsed = std::chrono::steady_clock::now() - start_time;
     auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(total_elapsed).count();
     profiler.print_report(total_us, total, thread_count);
+    if (!config.profile_json.empty()) {
+        profiler.write_json(config.profile_json, total_us, total, thread_count);
+    }
 
     // If any worker threads were stuck (infinite parse loop, unresponsive to
     // cancellation) and had to be detached, use _exit() to prevent UB: the

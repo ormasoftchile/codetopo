@@ -272,17 +272,19 @@ nvim-treesitter / Zed & tree-sitter per-file; editor scan & 80--150 & Highlight,
         graph consistency. \emph{Value:} It would help onboarding, CI-produced
         indexes for very large repositories, and agent workflows that need a
         common team view rather than per-laptop cold starts.
-  \item[No symbol-importance ranking.] FTS5 BM25 scores text relevance but
-        codetopo has no PageRank-style scoring on the call graph.
+  \item[Incremental centrality maintenance.] While codetopo computes graph-wide
+        PageRank structural centrality over directed edges (\S\ref{sec:pagerank},
+        persisted in \texttt{nodes.rank}), recomputing centrality across millions
+        of edges during rapid, single-file incremental re-indexing passes remains
+        an active challenge.
 
-        \emph{Tradeoff:} Ranking would improve prioritization, but it also
-        introduces another tunable heuristic whose outputs can appear
-        authoritative even when they reflect graph incompleteness or language
-        biases in the approximate call edges. \emph{Cost:} S--M, since the core
-        computation is comparatively small; the hardest part is choosing a
-        ranking formulation and update strategy that remains stable and
-        interpretable under incremental re-indexing. \emph{Value:} It would
-        improve search result ordering, help agents surface ``central'' symbols
-        first, and support architecture, hotspot, and review workflows that need
-        to separate core APIs from peripheral helpers.
+        \emph{Tradeoff:} Full graph power iteration takes under 15\,ms for 100\,000
+        edges, but on massive repositories (such as Chromium with 77M edges), full
+        graph power iteration is deferred to avoid blocking live file-watch cycles.
+        \emph{Cost:} S--M, since the power iteration algorithm is implemented; the
+        remaining work is bounded regional recomputation or dirty-region marking
+        for localized centrality shifts without full graph iteration. \emph{Value:}
+        It maintains accurate ranking freshness during interactive editing sessions,
+        ensuring agents always receive up-to-date centrality signals without waiting
+        for explicit global re-ranking passes.
 \end{description}

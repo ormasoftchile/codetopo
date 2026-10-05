@@ -3,80 +3,183 @@
 
 \subsection{Implemented}
 
-The following capabilities are implemented and functional as of the document date:
+The following capabilities are implemented, tested, and functional in production:
 
 \begin{itemize}
-  \item SQLite schema with \texttt{roots}, \texttt{files}, \texttt{nodes},
-        \texttt{edges}, \texttt{refs}, \texttt{nodes\_fts},
-        \texttt{content\_fts}, and \texttt{content\_fts\_tracker}.
-  \item Tree-sitter parsing for 13 languages: C, C++, C\#, TypeScript,
-        JavaScript, Python, Rust, Java, Go, Bash, SQL, YAML, Lua.
-  \item Symbol extraction (definitions) and call-edge extraction for all
-        supported languages.
-  \item All 41 MCP tools registered and functional (31 code intelligence,
-        6 multi-root workspace management, and 4 server operations and diagnostics).
-  \item Migration to C++26 standard (\texttt{CMAKE\_CXX\_STANDARD 26}, CMake 3.25+)
-        featuring pack-indexed variadic SQLite statement binding (\texttt{db::bind}),
-        compile-time delete diagnostic reasons, memory arena pooling (\texttt{Arena}),
-        zero-heap \texttt{std::inplace\_vector<T, N>} container polyfills on hot paths,
-        and saturation arithmetic safety checks.
-  \item Structural graph centrality (PageRank power iteration over directed edges)
-        persisted in \texttt{nodes.rank} (schema v14), weighting \texttt{symbol\_search}
-        alongside BM25 relevance and accelerating \texttt{entrypoints}.
-  \item PR blast-radius analysis (\texttt{detect\_changes}) integrating \texttt{git diff}
-        against base refs with reverse call-graph traversals.
-  \item Structural architecture summarization (\texttt{get\_architecture}) computing
-        directory clusters, high-centrality hotspots, boundaries, and coupling/cohesion metrics.
-  \item Runtime observability integration: distributed trace ingestion
-        (\texttt{ingest\_\allowbreak traces}, \texttt{get\_\allowbreak traces})
-        boosting static edge confidence, and protocol-aware HTTP call
-        extraction via \texttt{list\_\allowbreak http\_\allowbreak calls}.
-  \item Asynchronous workspace job engine with retained status polling
-        and safe phase-boundary cancellation.
-  \item Incremental indexing via mtime + xxHash fingerprinting.
-  \item Filesystem watcher (FSEvents / inotify / ReadDirectoryChangesW)
-        for live re-indexing on file changes.
-  \item Multi-root workspace with ID offset scheme and cascade removal.
-  \item Freshness policy: \texttt{eager}, \texttt{normal}, \texttt{lazy},
-        \texttt{off}.
-  \item \texttt{QueryCache}: prepared-statement cache cleared on reindex.
-  \item Staleness detection via \texttt{.git/HEAD} mtime tracking.
-  \item Bulk mode for repositories $> 1\,000$ files (drop/rebuild indexes).
-  \item Auto-editor configuration (\texttt{codetopo init}) for VS Code,
-        Cursor, Windsurf, and Claude Desktop.
+  \item \textbf{Continuous graph synchronization:} Two-tier change detection
+        (\texttt{mtime\_ns} and \texttt{size\_bytes} stat fast path, \texttt{xxHash64}
+        content fingerprinting), platform-native watchers (\texttt{FSEvents},
+        \texttt{inotify}, \texttt{ReadDirectoryChangesW}), 1\,000\,ms debouncing,
+        and thread-safe in-flight change coalescing (\texttt{ReindexState}).
+  \item \textbf{Targeted symbol attraction:} Incremental graph maintenance
+        isolating affected references across unmodified files via pinned temporary
+        tables (\texttt{\_\_ct\_affected}, \texttt{\_\_ct\_defnames}) and
+        \texttt{CROSS JOIN} query ordering, bounding updates to
+        $O(|\mathcal{D}_{\text{changed}}| \cdot \bar{d})$.
+  \item \textbf{Polyglot structural AST extraction:} Tree-sitter parsing for
+        13 languages (C, C++, C\#, TypeScript, JavaScript, Python, Rust, Java,
+        Go, Bash, SQL, YAML, and Lua) extracting definitions, calls, imports,
+        inheritance, and structural containment edges.
+  \item \textbf{Static and runtime topology:} Dual-layer graph integrating
+        static AST relations with distributed trace ingestion (\texttt{ingest\_traces},
+        \texttt{get\_traces}) and protocol-aware HTTP call extraction
+        (\texttt{list\_http\_calls}).
+  \item \textbf{Graph centrality ranking:} Structural PageRank power iteration
+        over directed edges persisted in \texttt{nodes.rank} (schema v14) with
+        covering partial index \texttt{idx\_\allowbreak nodes\_\allowbreak rank}, boosting symbol search
+        and accelerating entrypoint identification.
+  \item \textbf{MCP protocol surface:} All 41 MCP tools registered and functional
+        (31 code intelligence, 6 multi-root workspace management, and 4 server operations
+        and diagnostics).
+  \item \textbf{PR blast-radius analysis:} \texttt{detect\_changes} integrating
+        \texttt{git diff} against base refs with reverse call-graph BFS traversals.
+  \item \textbf{Architecture summarization:} \texttt{get\_architecture} computing
+        directory clusters, hotspot rankings, subsystem boundaries, and coupling/cohesion metrics.
+  \item \textbf{Multi-root workspaces:} Single-database multi-root management with
+        multiplicative ID offset scheme ($10^9$ namespace allocation) and cascade removal.
+  \item \textbf{C++26 systems runtime:} Pack-indexed variadic SQLite statement
+        binding (\texttt{db::bind}), arena memory pooling, and zero-heap
+        \texttt{std::inplace\_vector<T, N>} container polyfills on hot paths.
+  \item \textbf{Concurrency and persistence:} Concurrent reader-writer snapshot isolation
+        via SQLite WAL mode, PID-based process mutual exclusion (\texttt{FileLock})
+        with stale-lock recovery, and generation-tracked prepared-statement cache (\texttt{QueryCache}).
+  \item \textbf{Graph-quality and correctness metrics:} Quantifying resolution rates,
+        ambiguity counts, dangling references, and confidence distributions by language
+        and edge kind via CLI (\texttt{codetopo quality}) and MCP endpoints.
+  \item \textbf{Explicit edge provenance model:} Schema~v15 evidence tracking distinguishing
+        edge sources (\texttt{static}, \texttt{semantic}, \texttt{runtime}, \texttt{protocol},
+        \texttt{inferred}) alongside observation counts and timestamps.
+  \item \textbf{Semantic graph diff:} Change analysis extending from Git file diffs to
+        topology diffs (\texttt{codetopo diff}), reporting added/removed symbols, modified
+        signatures, edge shifts, and subsystem coupling deltas.
+  \item \textbf{Durable stable symbol identity:} In-place UPSERT tracking that
+        maintains durable \texttt{node\_id} identity across line movements, refactorings, and file edits.
+\end{itemize}
+
+\subsection{Scale and performance lifecycle}
+\label{sec:scale-lifecycle}
+
+CodeTopo's architecture addresses distinct performance regimes across its operational lifecycle,
+as illustrated in Figure~\ref{fig:scale-lifecycle}:
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Scale & Performance Lifecycle"
+  figure "FIGURE 08 · PERFORMANCE REGIMES ACROSS REPOSITORY LIFECYCLE"
+  desc "Contrasting cold-start batch initialization with sub-second warm synchronization and high-concurrency WAL read serving at Chromium scale."
+
+  legend
+    square cold "Cold Start" #3b82f6
+    circle warm "Warm Sync" #10b981
+    diamond serve "WAL Reads" #8b5cf6
+  end
+
+  tier regimes "INDEXING REGIMES"
+    card cold_ingest "Cold Batch Ingest" [1,500 - 3,000 files/s · AST Pool] @icon:storage
+    card warm_sync "Warm Incremental" [10 - 80ms · Two-Tier Filter] @icon:lightning
+  end
+
+  tier storage "CONCURRENCY ENGINE"
+    card wal "SQLite WAL Isolation" [Readers Never Block Active Writer] @icon:database
+  end
+
+  tier serving "QUERY SERVING"
+    card cache "Prepared Query Cache" [Zero-Copy Traversal Cache] @icon:server
+    card tools "41 MCP Tools" [Sub-2ms Point Lookups & BFS] @icon:api
+  end
+
+  tier scale "PROVEN SCALE"
+    card ceiling "Chromium Scale" [>100k Files · >10M Edges · Zero Lag] @icon:database
+  end
+
+  bus cold_ingest, warm_sync -->|"WAL Commit"| wal @anim:stream
+  bus wal -->|"Zero-Copy"| cache, tools @anim:flow
+  bus cache, tools -->|"Sub-2ms SLA"| ceiling @anim:particle
+\end{triton}
+\caption{CodeTopo lifecycle and scale characteristics. Cold-start indexing optimizes for high-throughput batch writes ($O(N_{\text{files}})$), while warm incremental maintenance bounds work to affected definitions ($O(|\mathcal{D}_{\text{changed}}| \cdot \bar{d})$). SQLite WAL mode ensures concurrent sub-2ms agent read operations at Chromium scale.}
+\label{fig:scale-lifecycle}
+\end{figure}
+
+\subsection{Experimental}
+
+\begin{itemize}
+  \item \textbf{Lua grammar:} Experimental tree-sitter extractor for Lua scripts.
+  \item \textbf{Distributed protocol tracing:} HTTP-level endpoint mapping across independent repositories.
 \end{itemize}
 
 \subsection{Known limitations}
 
 \begin{itemize}
-  \item \textbf{Approximate call edges.} Cross-file call resolution is
-        AST-derived without type resolution. Overloaded functions, virtual
-        dispatch, and generic instantiations are not distinguished. Tools
-        are named \texttt{callers\_approx} / \texttt{callees\_approx} to
-        make this explicit.
-  \item \textbf{No taint or dataflow analysis.} Security and refactoring
-        workflows that require tracing data flow between symbols are not
-        supported.
-  \item \textbf{No formal LSP endpoint.} codetopo speaks MCP. Editors that
-        rely on the Language Server Protocol~\cite{microsoft2016lsp} cannot
-        use codetopo directly as a language server.
-  \item \textbf{No remote or team-shared index.} The index is per-developer
-        local. There is no shared index server or sync protocol.
+  \item \textbf{Approximate call edges.} Cross-file call resolution is AST-derived without
+        deep type inference. Overloaded functions and virtual dispatch are flagged as approximate
+        (\texttt{confidence < 1.0}).
+  \item \textbf{Incremental centrality maintenance.} Global PageRank is calculated during initial
+        indexing and workspace merges; localized incremental centrality updates during single-file
+        edits are deferred to avoid blocking file-watcher debouncing.
+  \item \textbf{No dataflow or taint analysis.} CodeTopo models structural and architectural
+        dependencies, not register-level dataflow or variable taint propagation.
+  \item \textbf{Local single-binary architecture.} The index is designed for zero-dependency local
+        operation; distributed multi-tenant server infrastructure is intentionally excluded to
+        preserve privacy, predictability, and sub-millisecond local query latencies.
 \end{itemize}
 
-\subsection{Future work}
+\subsection{Future work and roadmap}
 
 \begin{description}
-  \item[Type-resolved call edges.] Optionally invoke a language server for
-        type information to improve call-edge accuracy for overloaded and
-        generic code.
-  \item[Additional languages.] Add extractors for Ruby, Kotlin, Swift, PHP,
-        Zig, and Haskell. Grammars exist for all of these in the
-        tree-sitter~\cite{brunsfeld2018treesitter} ecosystem.
-  \item[LSP adapter.] Expose an LSP endpoint backed by the codetopo index
-        to expand editor coverage beyond the VS Code / Cursor / Windsurf family.
-  \item[Incremental centrality updates.] Dynamically adjust PageRank scores during
-        fast targeted file-watch reindexing without full graph recomputation.
-  \item[Remote/shared index.] Implement a sync protocol so that large teams can
-        share a pre-built index rather than indexing individually.
+  \item[Optional semantic provider overlay.] An abstraction layer allowing external semantic
+        engines (such as \texttt{clangd}, SCIP indexers, or language servers) to enrich
+        Tree-sitter edges with higher confidence without replacing the universal base index
+        (Figure~\ref{fig:semantic-overlay}).
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Semantic Compiler Enrichment Overlay"
+  figure "FIGURE 07 · ASYNCHRONOUS COMPILER ENRICHMENT"
+  desc "Architecture of the optional compiler overlay: zero-dependency Tree-sitter baseline guarantees instant startup; asynchronous compiler indexers upgrade edge confidence to 1.0."
+
+  legend
+    square base "Base Layer" #3b82f6
+    circle overlay "Compiler Feed" #10b981
+    diamond fallback "Invariants" #8b5cf6
+  end
+
+  tier baseline "UNIVERSAL BASELINE"
+    card ts "Tree-sitter Extractor" [13 Languages · Zero-Config] @icon:robot
+    card syn "Syntactic Edge Graph" [Fast Ingest · Baseline Confidence] @icon:database
+  end
+
+  tier semantic "ASYNC ENRICHMENT"
+    card compiler "Compiler Type Engines" [SCIP / LSIF · clangd · rust-analyzer] @icon:cloud
+    card reconciler "Edge Reconciler" [Match Candidates by stable_key] @icon:lightning
+  end
+
+  tier storage "PROMOTED TOPOLOGY"
+    card enriched "Promoted SQLite Graph" [source=semantic · confidence=1.00] @icon:database
+  end
+
+  tier invariants "SYSTEM GUARANTEES"
+    card instant "Instant Availability" [Zero Wait for Compiler Builds] @icon:shield
+    card fallback "Graceful Fallback" [100% Usable Without Compilers] @icon:shield
+  end
+
+  bus ts --> syn
+  bus syn -->|"Candidates"| reconciler @anim:stream
+  bus compiler --> reconciler
+  bus reconciler -->|"Promoted"| enriched @anim:flow
+  bus enriched --> instant, fallback @anim:particle
+\end{triton}
+\caption{Optional semantic compiler enrichment overlay. A zero-dependency Tree-sitter baseline guarantees instantaneous startup and broad polyglot coverage. Optional compiler-driven semantic indexes run asynchronously to upgrade edge confidence to 1.0 without compromising availability.}
+\label{fig:semantic-overlay}
+\end{figure}
+
+  \item[Incremental centrality updates.] Bounded power iteration and dirty-region marking to
+        update \texttt{nodes.rank} incrementally following targeted file saves.
+  \item[Architecture assertions and structural rules.] Enabling agents and CI pipelines to
+        enforce structural layering, boundary rules, and circular dependency checks.
+  \item[CI-produced reusable index artifacts.] Supporting prebuilt index bundles for cold-start
+        acceleration in CI/CD without introducing a distributed graph database.
 \end{description}

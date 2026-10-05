@@ -129,6 +129,7 @@ For each traversed node the extractor identifies:
 \end{itemize}
 
 \subsection{Persistence}
+\label{sec:persistence}
 
 Extracted symbols, edges, and references are written to SQLite in
 \emph{batched inserts} (\texttt{src/index/persister.h:117--380}):
@@ -195,3 +196,339 @@ runs a second phase that populates \texttt{content\_fts}. This table is a
 from another database; they must be inserted by reading source files from
 disk line-by-line. Deferring this phase means the write lock is held for only
 as long as the structural data requires.
+
+\subsection{Incremental re-indexing and change detection}
+\label{sec:incremental-reindexing}
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Incremental Graph Maintenance"
+  figure "FIGURE 02 · LOCAL PARSE VS REPOSITORY GRAPH MAINTENANCE"
+  desc "Two-phase live synchronization: Phase 1 isolates local syntactic modifications; Phase 2 maintains global relational graph consistency via symbol attraction."
+
+  legend
+    square local "Local Parse" #3b82f6
+    circle repo "Repo Rebind" #10b981
+    diamond query "Agent Query" #8b5cf6
+  end
+
+  tier workspace "DEVELOPER WORKSPACE"
+    card edit "Source File Edit" [Editor Save / Keystrokes] @icon:robot
+    card checkout "Git Branch Switch" [HEAD Ref Change] @icon:api
+  end
+
+  tier phase1 "PHASE 1: LOCAL FILE PARSING"
+    card watcher "Watcher & Debounce" [Kernel Events · Quiet Window] @icon:server
+    card detector "Change Detector" [Tier 1 stat · Tier 2 xxHash64] @icon:shield
+    card parser "Tree-sitter Parser" [Changed File AST Only] @icon:robot
+  end
+
+  tier phase2 "PHASE 2: REPO MAINTENANCE"
+    card attraction "Symbol Attraction" [Probe idx_refs_kind_name] @icon:lightning
+    card rebind "Reference Rebind" [Cross-File Edge Updates] @icon:api
+    card wal "Atomic WAL Commit" [Consistent SQLite Snapshot] @icon:database
+  end
+
+  tier agent "AGENT INTERACTION"
+    card mcp "Deterministic Tools" [impact_of · context_for] @icon:server
+    card llm "Autonomous Agent" [Sub-5ms Fresh Context] @icon:robot
+  end
+
+  bus edit, checkout -->|"Events"| watcher @anim:stream
+  bus watcher --> detector
+  bus detector --> parser
+  bus parser -->|"Definitions"| attraction @anim:flow
+  bus attraction --> rebind
+  bus rebind --> wal
+  bus wal --> mcp, llm @anim:stream
+\end{triton}
+\caption{Two-phase incremental graph maintenance pipeline. Phase~1 isolates file-level syntactic changes using kernel watchers, quiet-window debouncing, and xxHash fingerprints before parsing the modified file. Phase~2 maintains global relational integrity across unmodified repository files via symbol attraction without whole-repository reparsing.}
+\label{fig:incremental-maintenance}
+\end{figure}
+
+While cold-start indexing constructs the graph across the entire repository in hundreds
+or thousands of seconds for large software systems (\S\ref{sec:status}), interactive developer
+workflows demand latency on the order of tens to hundreds of milliseconds. Full graph reconstruction
+on each file save is computationally infeasible. codetopo therefore implements an incremental
+re-indexing pipeline founded on two-tier change detection~\cite{ryder1988incremental} and
+targeted symbol attraction.
+
+\paragraph{Two-tier change detection.} The change detection engine (\texttt{src/\allowbreak index/\allowbreak change\_detector.h})
+identifies filesystem changes without reading unnecessary file bodies into memory:
+\begin{enumerate}
+  \item \textbf{Tier 1: Metadata fast path ($O(1)$ stat).} Each discovered file's filesystem metadata
+        --- specifically modification timestamp in nanoseconds (\texttt{mtime\_ns}) and size in bytes
+        (\texttt{size\_bytes}) --- is compared directly against the corresponding row in SQLite's
+        \texttt{files} table. If both values match the stored record, the file is classified as
+        unmodified, completely bypassing disk I/O and syntax parsing.
+  \item \textbf{Tier 2: Content fingerprint verification (xxHash64).} When either \texttt{mtime\_ns} or
+        \texttt{size\_bytes} differs (e.g., an editor timestamp update, a file touch, or formatting pass),
+        codetopo reads the file and computes a 64-bit non-cryptographic xxHash fingerprint. If the newly
+        computed digest matches \texttt{files.content\_hash}, the file's semantic content is identical;
+        the stored metadata is updated in SQLite, and parsing is skipped.
+\end{enumerate}
+The detector partitions the workspace into four disjoint sets: $\mathcal{F}_{\text{new}}$,
+$\mathcal{F}_{\text{changed}}$, $\mathcal{F}_{\text{deleted}}$, and $\mathcal{F}_{\text{unchanged}}$.
+
+\paragraph{Targeted persistence and atomic cascades.} For each file in $\mathcal{F}_{\text{changed}}$
+or $\mathcal{F}_{\text{deleted}}$, codetopo executes an atomic deletion in SQLite:
+\begin{lstlisting}[language=sql]
+DELETE FROM files WHERE path = ?;
+\end{lstlisting}
+Because foreign keys are enforced (\texttt{PRAGMA foreign\_keys = ON}), this single deletion triggers
+cascading drops across all related tables:
+\begin{itemize}
+  \item In \texttt{nodes}: all symbol and file nodes belonging to \texttt{file\_id} are removed.
+  \item In \texttt{edges}: all directed edges with matching \texttt{file\_id}, \texttt{src\_id}, or
+        \texttt{dst\_id} are deleted.
+  \item In \texttt{refs} and \texttt{content\_fts\_tracker}: fine-grained reference sites and FTS tracking
+        entries for that file are expunged.
+\end{itemize}
+Files in $\mathcal{F}_{\text{new}}$ and $\mathcal{F}_{\text{changed}}$ are then parsed by tree-sitter,
+and their newly extracted nodes, intra-file edges, and references are inserted within a batched
+transaction (\S\ref{sec:persistence}).
+
+\paragraph{The symbol attraction mechanism.} A fundamental challenge in incremental graph updating is
+cross-file edge resolution:
+\begin{enumerate}
+  \item \emph{Outgoing calls:} Newly introduced or modified calls within the changed files must be
+        resolved against the global symbol table.
+  \item \emph{Incoming calls (Attraction):} Unmodified files across the rest of the repository may contain
+        previously unresolved call references (\texttt{edges.dst\_id IS NULL} or dangling approximate
+        edges) whose target definition was just added or renamed in the modified files.
+\end{enumerate}
+Scanning millions of existing edges across the entire repository to resolve these incoming calls would
+destroy incremental performance. Furthermore, SQLite's cost-based query planner does not collect
+distribution statistics (\texttt{ANALYZE}) over temporary tables created during incremental runs;
+without intervention, the planner may default to a full table scan over the global \texttt{nodes} or
+\texttt{refs} tables.
+
+codetopo resolves this bottleneck through a targeted multi-stage join query driven by temporary
+in-memory tables (\texttt{src/index/persister.h:638--735}) with explicit \texttt{CROSS JOIN} ordering:
+\begin{itemize}
+  \item \texttt{temp.\_\_ct\_changed(path)}: Holds the subset of changed file paths.
+  \item \texttt{temp.\_\_ct\_defnames(name)}: Populated via a \texttt{CROSS JOIN} from \texttt{\_\_ct\_changed}
+        to \texttt{nodes} indexed on \texttt{idx\_nodes\_file\_id}, collecting only the symbol names defined
+        by the newly persisted files.
+  \item \texttt{temp.\_\_ct\_kinds(kind)}: Restricts queries to resolvable edge kinds (\texttt{call},
+        \texttt{include}, \texttt{inherit}, \texttt{type\_ref}).
+  \item \texttt{temp.\_\_ct\_affected(id)}: Collects the exact row IDs of references in \texttt{refs} requiring
+        re-resolution by taking the union of: (1)~unresolved references belonging to the changed files themselves,
+        and (2)~global unresolved references in unmodified files that match any symbol name defined in
+        \texttt{\_\_ct\_defnames}, probed through the composite index \texttt{idx\_refs\_kind\_name}.
+  \item \texttt{temp.\_\_ct\_want(name)}: Holds the candidate symbol names and their bare suffixes.
+\end{itemize}
+By pinning the small temporary tables as the outer driving loops via \texttt{CROSS JOIN}, SQLite is forced
+to access \texttt{refs} and \texttt{nodes} via point lookups on their primary keys and covering indexes.
+The total incremental resolution complexity is bounded by $O(|\mathcal{D}_{\text{changed}}| \cdot \bar{d})$,
+where $|\mathcal{D}_{\text{changed}}|$ is the number of symbol definitions in the changed files and $\bar{d}$
+is the average in-degree, executing in milliseconds even in repositories with millions of edges.
+Figure~\ref{fig:symbol-attraction} details the execution path and index-driven bypass guarantees.
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Symbol Attraction Algorithm"
+  figure "FIGURE 03 · INDEX-DRIVEN RELATIONAL RESOLUTION"
+  desc "Targeted graph update mechanics: newly defined symbols drive point lookups across covering indexes, strictly bypassing unchanged files and repository-wide scans."
+
+  legend
+    square defs "Definitions" #3b82f6
+    circle index "B-Tree Index" #10b981
+    diamond bypass "Bypass Set" #ef4444
+  end
+
+  tier mutation "INCREMENTAL MUTATION"
+    card file "Changed File" [storage.cpp · Modified AST] @icon:robot
+    card defs "Definition Set" [AllocatePage · FreePage] @icon:lightning
+  end
+
+  tier probing "INDEX PROBING"
+    card btree "Covering Index" [idx_refs_kind_name(kind, name)] @icon:database
+    card unres "Dangling Refs" [Candidate Sites in Other Files] @icon:queue
+  end
+
+  tier rebind "RELATIONAL REBIND"
+    card resolver "In-Memory Rebind" [resolved_node_id <- stable_id] @icon:api
+    card edges "Committed Edges" [caller -> AllocatePage] @icon:database
+  end
+
+  tier guarantees "BYPASS GUARANTEES"
+    card no_parse "10,000 Files Unparsed" [Zero Reparsing of Unchanged Code] @icon:shield
+    card no_scan "Zero Table Scans" [Point Lookups in O(|D| · d)] @icon:shield
+  end
+
+  bus file, defs -->|"New Defs"| btree @anim:stream
+  bus btree --> unres
+  bus unres -->|"Matched Sites"| resolver @anim:flow
+  bus resolver --> edges
+  bus edges --> no_parse, no_scan @anim:particle
+\end{triton}
+\caption{Mechanics of targeted symbol attraction. Rather than rescanning the full graph or reparsing unmodified files, CodeTopo uses newly persisted definition names $\mathcal{D}_{\text{changed}}$ to drive indexed point lookups over \texttt{idx\_refs\_kind\_name}, rebounding dangling references in $O(|\mathcal{D}_{\text{changed}}| \cdot \bar{d})$ time.}
+\label{fig:symbol-attraction}
+\end{figure}
+
+\subsection{Filesystem watching and in-flight change coalescing}
+\label{sec:watcher-concurrency}
+
+In an active development session, file changes arrive in asynchronous bursts: rapid keystrokes, compiler
+artifacts, multi-file code generator executions, or branch checkouts. The watcher subsystem
+(\texttt{src/watch/watcher.h}) and MCP server harness (\texttt{src/cli/cmd\_mcp.h}) coordinate live
+synchronization through kernel event streaming, debouncing, and in-flight change coalescing.
+
+\paragraph{Native filesystem backends.} Rather than polling the directory tree, codetopo binds to
+platform-native kernel event facilities:
+\begin{itemize}
+  \item \textbf{macOS}: Apple \texttt{FSEvents} framework, providing recursive file monitoring with
+        kernel-level stream coalescing and low wake-up overhead.
+  \item \textbf{Linux}: \texttt{inotify} directory watches with descriptor multiplexing via \texttt{epoll}.
+  \item \textbf{Windows}: \texttt{ReadDirectory\allowbreak ChangesW} serviced via asynchronous I/O completion ports (IOCP).
+\end{itemize}
+
+\paragraph{Quiet-window debouncing.} Filesystem events trigger a quiet-window debounce timer
+(configurable, defaulting to $1\,000\,\mathrm{ms}$). Successive file write notifications received before the
+window expires reset the timer, collapsing intermediate editor saves and batch file emissions into a single
+synthesized notification. Internal files under \texttt{.codetopo/} (the active SQLite database, write-ahead
+logs, and temporary file lists) and transient \texttt{.git/} internal indices are strictly filtered out
+to prevent self-triggering feedback loops.
+
+\paragraph{In-flight change coalescing (\texttt{ReindexState}).} A critical concurrency dilemma arises
+when additional files are modified while an incremental re-indexing job is \emph{already actively executing}:
+\begin{itemize}
+  \item Spawning a concurrent child indexer process against the same SQLite database leads to database write
+        lock contention (\texttt{SQLITE\_BUSY}) or process deadlock.
+  \item Aborting the running indexer wastes completed tree-sitter parse work and can lead to starvation under
+        continuous file saves.
+  \item Dropping the incoming event results in permanent graph desynchronization, where the database reflects
+        an obsolete file snapshot.
+\end{itemize}
+
+codetopo resolves this with an explicit, thread-safe coalescing state machine, encapsulated in
+\texttt{ReindexState} (\texttt{src/cli/cmd\_mcp.h:30--145}) and coordinated by a dedicated background
+\texttt{monitor\_thread}. Figure~\ref{fig:reindex-coalescing} depicts the state transitions.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  state/.style={draw, fill=blue!8, rounded corners,
+                minimum width=3.6cm, minimum height=1.1cm,
+                align=center, font=\small\sffamily},
+  edge_label/.style={font=\scriptsize\sffamily, text=black!85, align=center},
+  >=stealth, node distance=2.2cm and 2.5cm
+]
+\node[state] (idle) {Idle\\{\scriptsize\ttfamily running=false, queued=false}};
+\node[state, right=of idle] (active) {Active Indexing\\{\scriptsize\ttfamily running=true, queued=false}};
+\node[state, below=2.0cm of active] (coalesce) {Coalescing In-Flight\\{\scriptsize\ttfamily running=true, queued=true}};
+
+\draw[->, thick] (idle) -- node[edge_label, above] {Watcher event\\(debounce elapsed)} (active);
+\draw[->, thick] (active) to[bend right=25] node[edge_label, below] {Indexer completes\\and \texttt{queued=false}} (idle);
+\draw[->, thick] (active) to[bend left=25] node[edge_label, right] {New file change while\\indexer is active} (coalesce);
+\draw[->, thick] (coalesce) to[bend left=25] node[edge_label, left] {Indexer completes;\\drain \texttt{queued\_paths}} (active);
+\draw[->, thick] (coalesce) to[loop below] node[edge_label, below] {Subsequent change events\\merged into \texttt{queued\_paths}} (coalesce);
+\end{tikzpicture}
+\caption{State machine for in-flight change coalescing (\texttt{ReindexState}). Incoming
+         file modification events while an indexer process is active are safely
+         accumulated into \texttt{queued\_paths} without dropping events or spawning
+         conflicting writers.}
+\label{fig:reindex-coalescing}
+\end{figure}
+
+The state machine operates under mutual exclusion (\texttt{std::mutex}):
+\begin{enumerate}
+  \item \textbf{Transition to Active:} When the server is in the \texttt{Idle} state (\texttt{running = false}),
+        a debounced watcher event sets \texttt{running = true}, stores the affected paths in
+        \texttt{queued\_paths}, and launches \texttt{monitor\_thread}.
+  \item \textbf{Coalescing During Execution:} While the child indexer process runs in the background, any newly
+        arriving watcher events observe \texttt{running == true}. Under the mutex lock, the event handler
+        appends the new relative paths into \texttt{queued\_paths}, flags \texttt{queued = true}, logs the
+        deferral, and returns immediately. If an event indicates a repository-wide change (such as a branch switch),
+        \texttt{queued\_full = true} is set, clearing individual paths.
+  \item \textbf{Serialized Handoff:} When the active child indexer completes its SQLite commit and exits, the
+        \texttt{monitor\_thread} re-acquires the mutex. If \texttt{queued == true}, it atomically drains
+        \texttt{queued\_paths} into a local buffer, resets \texttt{queued = false}, writes the paths to a unique
+        staging file (\texttt{.codetopo/\allowbreak changed-files-\allowbreak\textless timestamp\textgreater-\allowbreak\textless seq\textgreater.lst}),
+        and immediately launches a subsequent targeted indexing pass.
+  \item \textbf{Return to Idle:} Only when the child completes and no pending events have been queued during its run
+        (\texttt{queued == false}) does the monitor set \texttt{running = false} and terminate.
+\end{enumerate}
+This ensures strict serial transactional execution against the SQLite database with zero dropped notifications and
+zero redundant process spawns.
+
+\subsection{Border cases and fault tolerance}
+\label{sec:border-cases}
+
+Real-world code editing presents complex edge cases across version control operations, filesystem race conditions,
+and concurrent database access. codetopo incorporates systematic defenses for these edge scenarios:
+
+\paragraph{Git branch switching and commit tracking.} A Git branch checkout or fast-forward pull can atomically
+modify, add, and delete thousands of files simultaneously. Tracking individual filesystem timestamps during a switch
+can overwhelm event queues or trigger false intermediate states.
+\begin{itemize}
+  \item \textbf{HEAD monitoring:} The watcher explicitly observes \texttt{.git/HEAD} and ref changes. When a
+        branch switch is detected, codetopo extracts the new commit SHA and compares it to \texttt{last\_known\_head}
+        stored in the \texttt{kv} metadata table.
+  \item \textbf{Targeted Git diff reconciliation:} Rather than walking the entire workspace filesystem, codetopo
+        executes \texttt{git diff -{}-name-only \textless old\_head\textgreater\ \textless new\_head\textgreater}. The resulting file list is passed directly to
+        the targeted re-indexer, restricting parsing exclusively to files modified between the two commits.
+  \item \textbf{Automatic fallback:} If Git history was rewritten (e.g., an interactive rebase, squashed commits, or
+        a detached HEAD where commit ancestry is severed), or if the diff command fails, codetopo automatically
+        escalates to a repository-wide two-tier reconciliation pass (\texttt{queued\_full = true}).
+\end{itemize}
+
+\paragraph{File renames and directory moves.} A file rename is surfaced by kernel watchers as an asynchronous pair
+of delete and create events. codetopo guarantees consistency regardless of event order:
+\begin{enumerate}
+  \item Deletion of the old path triggers SQLite's foreign key cascade (\texttt{ON DELETE CASCADE}), removing the
+        old \texttt{files} row and purging its associated nodes, edges, and FTS tokens.
+  \item Creation of the new path inserts the new file and parses its definitions.
+  \item The symbol attraction probe (\texttt{\_\_ct\_defnames}) detects the symbols now defined at the new path,
+        querying \texttt{idx\_refs\_kind\_name} to automatically re-bind existing call sites across unmodified files
+        to the new node IDs.
+\end{enumerate}
+
+\paragraph{Partial and syntactically malformed writes.} During rapid editing, language server formatting passes, or
+interrupted disk flushes, source files frequently exist in syntactically incomplete states (e.g., unclosed delimiters,
+truncated tokens).
+\begin{itemize}
+  \item Rather than failing or rejecting the file, tree-sitter employs resilient GLR/LR error-recovery parsing,
+        constructing concrete syntax trees containing \texttt{ERROR} and \texttt{MISSING} nodes.
+  \item The extractor isolates valid symbol declarations and intra-function blocks around the malformed regions,
+        marking the database record as \texttt{parse\_status = 'partial'}.
+  \item When the editor completes the write, the filesystem mtime changes, the debounce timer elapses, and the
+        file is cleanly re-parsed, atomically replacing the partial CST with the valid syntax graph.
+\end{itemize}
+
+\paragraph{Concurrent reader-writer isolation (SQLite WAL).} During active re-indexing, AI coding agents and MCP clients
+continue issuing high-frequency read queries (\texttt{context\_for}, \texttt{symbol\_search}, \texttt{callers\_approx}).
+codetopo configures SQLite in Write-Ahead Logging mode (\texttt{PRAGMA journal\_mode = WAL}):
+\begin{itemize}
+  \item Writers write new database pages sequentially into the \texttt{-wal} log file without acquiring exclusive
+        locks on the main database file.
+  \item Readers read concurrently from a fixed snapshot of the database and WAL log, never blocking or being blocked
+        by the active indexer.
+  \item Upon transaction finalization, the indexer triggers \texttt{server.request\_refresh()}, which advances an internal
+        generation counter and purges cached prepared statements in \texttt{QueryCache} (\S\ref{sec:querycache}),
+        ensuring subsequent MCP queries immediately observe the committed changes.
+\end{itemize}
+
+\paragraph{Multi-process mutual exclusion (\texttt{FileLock}).} A developer may invoke the CLI indexer (\texttt{codetopo index})
+in a terminal while an MCP server daemon is concurrently monitoring the same repository in the background.
+codetopo enforces mutual exclusion at the operating system level using PID-based file locks (\texttt{src/util/lock.h}):
+\begin{itemize}
+  \item The writer process creates an exclusive lock file at \texttt{.codetopo/index.sqlite.lock} using atomic system calls
+        (\texttt{O\_CREAT | O\_EXCL} on POSIX, \texttt{CREATE\_NEW} on Windows) and records its process identifier (PID).
+  \item \textbf{Stale lock detection:} If a preceding indexer process was terminated abruptly (e.g., via \texttt{SIGKILL},
+        out-of-memory killer, or power failure) without removing its lock file, subsequent processes inspect the stored PID
+        using \texttt{kill(pid, 0)} on Unix or \texttt{OpenProcess} on Windows. If the recorded PID is no longer alive, the
+        stale lock is broken automatically, logging a warning and resuming operation without requiring manual cleanup.
+  \item \textbf{Cooperative backoff:} If the lock is held by an active live process, secondary indexers block with an exponential
+        backoff up to a 30-second timeout before aborting with a descriptive error message indicating the holder PID.
+\end{itemize}
+
+\paragraph{Crash resilience and transactional rollback.} If power failure or hardware interruption occurs in the middle
+of an incremental pass, SQLite's write-ahead log ensures ACID transactional integrity. Any uncommitted index updates or
+partial batches are automatically rolled back upon reopening the database, preventing structural corruptions in B-tree
+indices or dangling edges.
