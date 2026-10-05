@@ -183,6 +183,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_bind.cpp
     tests/unit/test_inplace_vector.cpp
     tests/unit/test_pagerank.cpp
+    tests/unit/test_quality_and_provenance.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests

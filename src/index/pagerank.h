@@ -4,6 +4,9 @@
 #include "db/schema.h"
 #include <cmath>
 #include <cstdint>
+#include <atomic>
+#include <thread>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,8 +27,20 @@ struct EdgeWeight {
 // Computes PageRank centrality over directed graph edges ('calls', 'inherits', 'references')
 // and updates nodes.rank with normalized scores in [0.0, 1.0].
 // Returns the number of ranked nodes.
-inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions& options = {}) {
+inline int compute_and_persist_pagerank(Connection& conn,
+                                        const PageRankOptions& options = {},
+                                        const std::string& progress_path = "") {
     schema::ensure_nodes_rank_schema(conn);
+
+    auto touch_progress = [&](const std::string& msg) {
+        if (!progress_path.empty()) {
+            std::ofstream pf(progress_path, std::ios::trunc);
+            if (pf.is_open()) {
+                pf << msg << '\n';
+                pf.flush();
+            }
+        }
+    };
 
     // Read edges from the DB.
     // Directed: caller -> callee, subclass -> base, referrer -> target.
@@ -57,6 +72,7 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
     };
     std::vector<RawEdge> raw_edges;
 
+    int64_t loaded_edges = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         int64_t src = sqlite3_column_int64(stmt, 0);
         int64_t dst = sqlite3_column_int64(stmt, 1);
@@ -65,33 +81,63 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
         uint32_t u = get_or_add_idx(src);
         uint32_t v = get_or_add_idx(dst);
         raw_edges.push_back({u, v, conf});
+        if (++loaded_edges % 2000000 == 0) {
+            touch_progress("pagerank_loading_edges: " + std::to_string(loaded_edges));
+        }
     }
     sqlite3_finalize(stmt);
 
     const size_t num_nodes = idx_to_id.size();
     if (num_nodes == 0) return 0;
 
+    // Build flat CSR (Compressed Sparse Row) incoming graph representation.
+    // Avoids vector-of-vectors heap fragmentation and enables vectorized FMA inner loop.
     std::vector<double> out_weights(num_nodes, 0.0);
-    std::vector<std::vector<EdgeWeight>> incoming(num_nodes);
+    std::vector<uint32_t> incoming_count(num_nodes, 0);
 
     for (const auto& edge : raw_edges) {
         out_weights[edge.src] += edge.weight;
-        incoming[edge.dst].push_back({edge.src, edge.weight});
+        incoming_count[edge.dst]++;
     }
 
-    // Power iteration
+    std::vector<uint32_t> head(num_nodes + 1, 0);
+    for (size_t i = 0; i < num_nodes; ++i) {
+        head[i + 1] = head[i] + incoming_count[i];
+    }
+
+    std::vector<uint32_t> cur_offset = head;
+    std::vector<EdgeWeight> incoming_flat(raw_edges.size());
+    for (const auto& edge : raw_edges) {
+        incoming_flat[cur_offset[edge.dst]++] = {edge.src, edge.weight};
+    }
+
+    // Free raw_edges and lookup map memory now that flat CSR is built
+    std::vector<RawEdge>().swap(raw_edges);
+    std::unordered_map<int64_t, uint32_t>().swap(id_to_idx);
+
+    std::vector<double> inv_out_weights(num_nodes, 0.0);
+    for (size_t i = 0; i < num_nodes; ++i) {
+        if (out_weights[i] > 0.0) {
+            inv_out_weights[i] = 1.0 / out_weights[i];
+        }
+    }
+
+    // Power iteration with pre-scaled rank values (FMA inner loop)
     std::vector<double> pr(num_nodes, 1.0 / static_cast<double>(num_nodes));
     std::vector<double> next_pr(num_nodes, 0.0);
+    std::vector<double> pr_scaled(num_nodes);
 
     const double d = options.damping;
     const double inv_n = 1.0 / static_cast<double>(num_nodes);
 
     for (int iter = 0; iter < options.max_iterations; ++iter) {
+        touch_progress("pagerank_iteration: " + std::to_string(iter));
         double dangling_sum = 0.0;
         for (size_t i = 0; i < num_nodes; ++i) {
             if (out_weights[i] == 0.0) {
                 dangling_sum += pr[i];
             }
+            pr_scaled[i] = pr[i] * inv_out_weights[i];
         }
 
         const double base = (1.0 - d) * inv_n + (d * dangling_sum) * inv_n;
@@ -99,8 +145,10 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
         double diff = 0.0;
         for (size_t v = 0; v < num_nodes; ++v) {
             double sum_in = 0.0;
-            for (const auto& in_edge : incoming[v]) {
-                sum_in += pr[in_edge.src_idx] * (in_edge.weight / out_weights[in_edge.src_idx]);
+            const uint32_t start = head[v];
+            const uint32_t end = head[v + 1];
+            for (uint32_t idx = start; idx < end; ++idx) {
+                sum_in += pr_scaled[incoming_flat[idx].src_idx] * incoming_flat[idx].weight;
             }
             double val = base + d * sum_in;
             next_pr[v] = val;
@@ -121,7 +169,7 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
 
     if (max_pr <= 0.0) return 0;
 
-    // Bulk persist via temporary table
+    // Bulk persist via temporary table with direct UPDATE ... FROM join
     conn.exec("CREATE TEMP TABLE IF NOT EXISTS temp_pagerank(id INTEGER PRIMARY KEY, rank REAL)");
     conn.exec("DELETE FROM temp_pagerank");
     const bool manage_tx = (sqlite3_get_autocommit(conn.raw()) != 0);
@@ -139,13 +187,26 @@ inline int compute_and_persist_pagerank(Connection& conn, const PageRankOptions&
         sqlite3_bind_int64(ins_stmt, 1, idx_to_id[i]);
         sqlite3_bind_double(ins_stmt, 2, normalized);
         sqlite3_step(ins_stmt);
+        if (i % 500000 == 0) {
+            touch_progress("pagerank_persisting: " + std::to_string(i));
+        }
     }
     sqlite3_finalize(ins_stmt);
     if (manage_tx) conn.exec("COMMIT");
 
+    touch_progress("pagerank_updating_nodes");
+    std::atomic<bool> update_done{false};
+    std::thread pr_hb([&]() {
+        while (!update_done.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            touch_progress("pagerank_updating_nodes");
+        }
+    });
     conn.exec(
-        "UPDATE nodes SET rank = (SELECT rank FROM temp_pagerank WHERE temp_pagerank.id = nodes.id) "
-        "WHERE id IN (SELECT id FROM temp_pagerank)");
+        "UPDATE nodes SET rank = temp_pagerank.rank "
+        "FROM temp_pagerank WHERE nodes.id = temp_pagerank.id");
+    update_done.store(true, std::memory_order_relaxed);
+    if (pr_hb.joinable()) pr_hb.join();
     conn.exec("DROP TABLE IF EXISTS temp_pagerank");
 
     return static_cast<int>(num_nodes);

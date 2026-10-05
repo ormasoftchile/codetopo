@@ -3,6 +3,8 @@
 #include "db/connection.h"
 #include <sqlite3.h>
 #include <string>
+#include <array>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
@@ -85,6 +87,16 @@ inline void step_write(sqlite3_stmt* stmt) {
     }
 }
 
+inline constexpr auto make_alnum_table() {
+    std::array<bool, 256> table{};
+    for (int i = 0; i < 256; ++i) {
+        table[i] = (i >= 'A' && i <= 'Z') || (i >= 'a' && i <= 'z') ||
+                   (i >= '0' && i <= '9') || i == '_';
+    }
+    return table;
+}
+inline constexpr auto kAlnumOrUnderscore = make_alnum_table();
+
 // Insert all lines of a file's content into content_fts using pre-prepared statements.
 // ins: INSERT INTO content_fts(content, file_id, line_no) VALUES(?, ?, ?)
 // trk: INSERT OR REPLACE INTO content_fts_tracker(file_id, min_rowid, max_rowid) VALUES(?,?,?)  (may be nullptr)
@@ -103,6 +115,11 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
     bool any_inserted = false;
     int line_no = 1;
     size_t pos = 0;
+
+    // Parameter 2 (file_id) is identical across all lines in this file.
+    // sqlite3_reset() preserves bindings, so bind once outside the line loop.
+    sqlite3_bind_int64(ins, 2, file_id);
+
     while (pos < content.size()) {
         size_t eol = content.find('\n', pos);
         size_t len = (eol == std::string::npos) ? content.size() - pos : eol - pos;
@@ -115,16 +132,15 @@ inline void insert_lines(sqlite3_stmt* ins, sqlite3_stmt* trk,
             // Count alphanumeric chars — lines with <3 are pure punctuation/braces
             // (e.g. "{", "};", "*/", "))") and have zero search value.
             int alnum_count = 0;
-            for (size_t i = 0; i < line_len && alnum_count < 3; ++i) {
-                unsigned char c = static_cast<unsigned char>(content[pos + i]);
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                    (c >= '0' && c <= '9') || c == '_') ++alnum_count;
+            for (size_t i = 0; i < line_len; ++i) {
+                if (kAlnumOrUnderscore[static_cast<unsigned char>(content[pos + i])]) {
+                    if (++alnum_count >= 3) break;
+                }
             }
             if (alnum_count >= 3) {
                 int bind_len = static_cast<int>(std::min(line_len, size_t(200)));
                 sqlite3_reset(ins);
                 sqlite3_bind_text(ins, 1, content.data() + pos, bind_len, SQLITE_STATIC);
-                sqlite3_bind_int64(ins, 2, file_id);
                 sqlite3_bind_int(ins, 3, line_no);
                 step_write(ins);
                 int64_t rid = sqlite3_last_insert_rowid(db);

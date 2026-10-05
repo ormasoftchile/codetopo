@@ -12,7 +12,9 @@ static int run_codetopo(const std::string& args) {
     // Find the built executable — try platform-specific paths
     auto exe = fs::current_path() / "build" / "Release" / "codetopo.exe";  // Windows Release
     if (!fs::exists(exe)) exe = fs::current_path() / "build" / "codetopo.exe";  // Windows Debug
-    if (!fs::exists(exe)) exe = fs::current_path() / "build" / "codetopo";       // Unix/macOS
+    if (!fs::exists(exe)) exe = fs::current_path() / "build" / "codetopo";       // Unix/macOS from repo root
+    if (!fs::exists(exe)) exe = fs::current_path() / "codetopo";               // Unix/macOS from build dir
+    if (!fs::exists(exe)) exe = fs::current_path() / "codetopo.exe";           // Windows from build dir
     if (!fs::exists(exe)) return -1;
 
 #ifdef _WIN32

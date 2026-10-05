@@ -534,6 +534,18 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "In-memory readiness probe: ready or explicit busy, no graph counts or integrity scan.",
         R"J({"type":"object","properties":{}})J");
 
+    server.register_tool("graph_quality", tools::graph_quality,
+        "Compute comprehensive graph quality, reference disambiguation, confidence distribution, and resolution metrics across languages and edge kinds.",
+        R"J({"type":"object","properties":{}})J");
+
+    server.register_tool("get_edge_evidence", tools::get_edge_evidence,
+        "Query epistemic provenance and runtime observation evidence for edges (static, runtime, semantic, protocol). Supports filtering by caller, callee, symbol, or observation mode.",
+        R"J({"type":"object","properties":{"symbol":{"type":"string","description":"Symbol name or qualname to inspect incoming and outgoing edges for"},"node_id":{"type":"integer","description":"Symbol node ID"},"caller":{"type":"string","description":"Caller symbol name or qualname"},"callee":{"type":"string","description":"Callee symbol name or qualname"},"mode":{"type":"string","enum":["all","observed","unobserved_static","runtime_only"],"description":"Filter mode for observations (default: 'all')"},"kind":{"type":"string","description":"Edge kind filter (e.g. 'calls', 'includes')"},"limit":{"type":"integer","description":"Max edges to return (default 50, max 200)"}}})J");
+
+    server.register_tool("graph_diff", tools::graph_diff,
+        "Compute semantic graph diff between working tree, commits, or index. Reports symbols added/removed/modified, call edges added/removed, and fan-in topology deltas.",
+        R"J({"type":"object","properties":{"base":{"type":"string","description":"Base git ref or 'index' (default: 'HEAD')"},"target":{"type":"string","description":"Target git ref or 'working-tree' (default: 'working-tree')"},"since":{"type":"string","description":"Alias for base"},"file_pattern":{"type":"string","description":"Optional file path glob pattern to filter changes"}}})J");
+
     mcp_log("codetopo mcp started");
     mcp_log("lifecycle: ready elapsed=" +
         format_duration_seconds(std::chrono::steady_clock::now() - startup_started));
@@ -686,6 +698,10 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         {"workspace_add", tools::workspace_add},
         {"workspace_remove", tools::workspace_remove},
         {"workspace_list", tools::workspace_list},
+        {"graph_quality", tools::graph_quality},
+        {"quality", tools::graph_quality},
+        {"get_edge_evidence", tools::get_edge_evidence},
+        {"graph_diff", tools::graph_diff},
     };
 
     auto it = all_tools.find(tool_name);

@@ -11,6 +11,8 @@
 #include "db/bind.h"
 #include <sqlite3.h>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cctype>
 #include <string>
 #include <string_view>
@@ -231,33 +233,129 @@ public:
         if (own_txn) conn_.exec("BEGIN IMMEDIATE");
 
         try {
-            // Delete existing file record (cascades to nodes → edges, refs)
-            // R4: Skip on cold index — DELETE is a guaranteed no-op on empty tables
+            int64_t file_id = 0;
+            int64_t file_node_id = 0;
+            std::vector<int64_t> symbol_ids;
+            symbol_ids.reserve(extraction.symbols.size());
+
+            int64_t existing_file_id = 0;
             if (!cold_index_) {
-                sqlite3_stmt* find_file_stmt = nullptr;
-                sqlite3_prepare_v2(conn_.raw(),
-                    "SELECT id FROM files WHERE path = ? AND root_id IS NULL",
-                    -1, &find_file_stmt, nullptr);
-                sqlite3_bind_text(find_file_stmt, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
-                const int find_rc = sqlite3_step(find_file_stmt);
-                const int64_t existing_file_id = find_rc == SQLITE_ROW
-                    ? sqlite3_column_int64(find_file_stmt, 0) : 0;
-                sqlite3_finalize(find_file_stmt);
-                if (find_rc != SQLITE_ROW && find_rc != SQLITE_DONE)
+                sqlite3_reset(stmt_find_file_);
+                sqlite3_bind_text(stmt_find_file_, 1, file.relative_path.c_str(), -1, SQLITE_STATIC);
+                const int find_rc = sqlite3_step(stmt_find_file_);
+                if (find_rc == SQLITE_ROW) {
+                    existing_file_id = sqlite3_column_int64(stmt_find_file_, 0);
+                } else if (find_rc != SQLITE_DONE) {
+                    sqlite3_reset(stmt_find_file_);
                     throw SqliteError(find_rc, "Find existing file failed: " + std::string(sqlite3_errmsg(conn_.raw())));
-                if (existing_file_id > 0) content_fts::delete_file(conn_, existing_file_id);
-
-                auto file_key = make_file_stable_key(file.relative_path);
-                db::bind(stmt_delete_file_node_, file_key);
-                step_write(stmt_delete_file_node_);
-
-                db::bind(stmt_delete_file_, file.relative_path);
-                step_write(stmt_delete_file_);
+                }
+                sqlite3_reset(stmt_find_file_);
             }
 
-            // Insert file record
-            int64_t file_id;
-            {
+            if (existing_file_id > 0) {
+                // In-place UPSERT path: preserves durable node identity, centrality rank,
+                // external incoming edges from other files, and runtime trace evidence!
+                file_id = existing_file_id;
+                last_file_id_ = file_id;
+                content_fts::delete_file(conn_, existing_file_id);
+
+                // Update files row in place
+                db::bind(stmt_update_file_,
+                         file.language,
+                         file.size_bytes,
+                         file.mtime_ns,
+                         content_hash,
+                         parse_status,
+                         parse_error.empty() ? nullptr : parse_error.c_str(),
+                         file_id);
+                step_write(stmt_update_file_);
+
+                // Find or insert file node
+                auto file_key = make_file_stable_key(file.relative_path);
+                sqlite3_reset(stmt_find_file_node_);
+                sqlite3_bind_text(stmt_find_file_node_, 1, file_key.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt_find_file_node_) == SQLITE_ROW) {
+                    file_node_id = sqlite3_column_int64(stmt_find_file_node_, 0);
+                }
+                sqlite3_reset(stmt_find_file_node_);
+                if (file_node_id == 0) {
+                    db::bind(stmt_insert_file_node_, file.relative_path, file_key);
+                    step_write(stmt_insert_file_node_);
+                    file_node_id = sqlite3_last_insert_rowid(conn_.raw());
+                }
+
+                // Load existing symbol nodes for this file into map (stable_key -> node_id)
+                std::unordered_map<std::string, int64_t> existing_symbols;
+                sqlite3_stmt* sym_stmt = nullptr;
+                sqlite3_prepare_v2(conn_.raw(),
+                    "SELECT id, stable_key FROM nodes WHERE file_id = ? AND node_type = 'symbol'",
+                    -1, &sym_stmt, nullptr);
+                sqlite3_bind_int64(sym_stmt, 1, file_id);
+                while (sqlite3_step(sym_stmt) == SQLITE_ROW) {
+                    int64_t nid = sqlite3_column_int64(sym_stmt, 0);
+                    const unsigned char* sk = sqlite3_column_text(sym_stmt, 1);
+                    if (sk) existing_symbols[reinterpret_cast<const char*>(sk)] = nid;
+                }
+                sqlite3_finalize(sym_stmt);
+
+                // Match and upsert symbols
+                for (const auto& sym : extraction.symbols) {
+                    auto it = existing_symbols.find(sym.stable_key);
+                    if (it != existing_symbols.end()) {
+                        int64_t existing_id = it->second;
+                        db::bind(stmt_update_symbol_,
+                                 sym.kind,
+                                 sym.name,
+                                 sym.qualname,
+                                 sym.signature.empty() ? nullptr : sym.signature.c_str(),
+                                 sym.fingerprint.empty() ? nullptr : sym.fingerprint.c_str(),
+                                 sym.start_line,
+                                 sym.start_col,
+                                 sym.end_line,
+                                 sym.end_col,
+                                 sym.is_definition,
+                                 sym.visibility.empty() ? nullptr : sym.visibility.c_str(),
+                                 sym.doc.empty() ? nullptr : sym.doc.c_str(),
+                                 existing_id);
+                        step_write(stmt_update_symbol_);
+                        symbol_ids.push_back(existing_id);
+                        existing_symbols.erase(it);
+                    } else {
+                        db::bind(stmt_insert_symbol_,
+                                 file_id,
+                                 sym.kind,
+                                 sym.name,
+                                 sym.qualname,
+                                 sym.signature.empty() ? nullptr : sym.signature.c_str(),
+                                 sym.fingerprint.empty() ? nullptr : sym.fingerprint.c_str(),
+                                 sym.start_line,
+                                 sym.start_col,
+                                 sym.end_line,
+                                 sym.end_col,
+                                 sym.is_definition,
+                                 sym.visibility.empty() ? nullptr : sym.visibility.c_str(),
+                                 sym.doc.empty() ? nullptr : sym.doc.c_str(),
+                                 sym.stable_key);
+                        step_write(stmt_insert_symbol_);
+                        symbol_ids.push_back(sqlite3_last_insert_rowid(conn_.raw()));
+                    }
+                }
+
+                // Delete symbols that were removed from the file
+                for (const auto& [_, old_id] : existing_symbols) {
+                    db::bind(stmt_delete_symbol_, old_id);
+                    step_write(stmt_delete_symbol_);
+                }
+
+                // Delete old refs for this file
+                db::bind(stmt_delete_refs_, file_id);
+                step_write(stmt_delete_refs_);
+
+                // Delete old outgoing static edges from this file
+                db::bind(stmt_delete_file_edges_, file_node_id, file_id);
+                step_write(stmt_delete_file_edges_);
+            } else {
+                // Cold insert branch
                 db::bind(stmt_insert_file_,
                          file.relative_path,
                          file.language,
@@ -269,25 +367,17 @@ public:
                 step_write(stmt_insert_file_);
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
                 last_file_id_ = file_id;
-            }
 
-            // Insert file node
-            int64_t file_node_id;
-            {
                 auto file_key = make_file_stable_key(file.relative_path);
                 db::bind(stmt_insert_file_node_, file.relative_path, file_key);
                 step_write(stmt_insert_file_node_);
                 file_node_id = sqlite3_last_insert_rowid(conn_.raw());
-            }
 
-            // Insert symbol nodes (DEC-039 OPT-1: batched 100-row INSERT)
-            std::vector<int64_t> symbol_ids;
-            {
+                // Insert symbol nodes (DEC-039 OPT-1: batched 100-row INSERT)
                 const int SYMBOL_BATCH_SIZE = 100;
                 int num_syms = static_cast<int>(extraction.symbols.size());
                 int full_chunks = num_syms / SYMBOL_BATCH_SIZE;
                 int remainder = num_syms % SYMBOL_BATCH_SIZE;
-                symbol_ids.reserve(num_syms);
 
                 // Full chunks: use batch INSERT
                 if (full_chunks > 0) {
@@ -552,7 +642,8 @@ public:
     // repo-relative paths of the re-persisted files. Full reindex (incremental=false) is
     // unchanged: it loads every symbol and re-resolves the entire ref table.
     std::pair<int,int> resolve_references(bool incremental = false,
-                                          const std::vector<std::string>& changed_paths = {}) {
+                                          const std::vector<std::string>& changed_paths = {},
+                                          const std::string& progress_path = "") {
         int total_resolved = 0;
         int edges_created = 0;
 
@@ -756,18 +847,15 @@ public:
                     is_test_or_mock_path(path_it->second);
 
                 auto& entries = symbol_map[name];
-                if (entries.size() < 50) {
+                if (entries.size() < 64) {
                     entries.push_back({id, file_id, is_def, is_test_or_mock});
-                    std::sort(entries.begin(), entries.end(),
-                        [](const SymbolEntry& a, const SymbolEntry& b) {
-                            if (a.is_test_or_mock != b.is_test_or_mock) {
-                                return !a.is_test_or_mock;
-                            }
-                            if (a.is_definition != b.is_definition) {
-                                return a.is_definition;
-                            }
-                            return a.id < b.id;
-                        });
+                } else if (is_def && !is_test_or_mock) {
+                    for (auto& entry : entries) {
+                        if (entry.is_test_or_mock || !entry.is_definition) {
+                            entry = {id, file_id, is_def, is_test_or_mock};
+                            break;
+                        }
+                    }
                 }
 
                 // Build class_map inline (replaces former Step 4 scan)
@@ -795,8 +883,28 @@ public:
                 }
 
                 ++loaded;
+                if (!progress_path.empty() && loaded % 200000 == 0) {
+                    std::ofstream pf(progress_path, std::ios::trunc);
+                    pf << "loading_symbols: " << loaded << '\n';
+                    pf.flush();
+                }
             }
             sqlite3_finalize(stmt);
+
+            // Sort each candidate list once after all symbols are loaded and cap at 50
+            for (auto& [_, entries] : symbol_map) {
+                std::sort(entries.begin(), entries.end(),
+                    [](const SymbolEntry& a, const SymbolEntry& b) {
+                        if (a.is_test_or_mock != b.is_test_or_mock) {
+                            return !a.is_test_or_mock;
+                        }
+                        if (a.is_definition != b.is_definition) {
+                            return a.is_definition;
+                        }
+                        return a.id < b.id;
+                    });
+                if (entries.size() > 50) entries.resize(50);
+            }
             const bool color_output = stderr_is_tty();
             std::cerr << "  Loaded " << stderr_cyan(format_with_commas(loaded), color_output)
                       << " symbols into lookup map ("
@@ -874,7 +982,38 @@ public:
         };
         std::vector<EdgeTuple> edge_tuples;
         edge_tuples.reserve(1000000);
-        std::unordered_set<std::string> seen_edge_keys;
+        struct EdgeKey {
+            int64_t src_id;
+            int64_t dst_id;
+            uint8_t kind_id; // 1: calls, 2: includes, 3: inherits, 4: references
+
+            bool operator==(const EdgeKey& o) const noexcept {
+                return src_id == o.src_id && dst_id == o.dst_id && kind_id == o.kind_id;
+            }
+        };
+
+        struct EdgeKeyHash {
+            size_t operator()(const EdgeKey& k) const noexcept {
+                uint64_t h = static_cast<uint64_t>(k.src_id) ^ (static_cast<uint64_t>(k.dst_id) * 0x9e3779b97f4a7c15ULL);
+                h ^= (static_cast<uint64_t>(k.kind_id) << 56);
+                h ^= h >> 30;
+                h *= 0xbf58476d1ce4e5b9ULL;
+                h ^= h >> 27;
+                h *= 0x94d049bb133111ebULL;
+                h ^= h >> 31;
+                return static_cast<size_t>(h);
+            }
+        };
+
+        auto edge_kind_to_id = [](std::string_view k) noexcept -> uint8_t {
+            if (k == "calls") return 1;
+            if (k == "includes") return 2;
+            if (k == "inherits") return 3;
+            if (k == "references") return 4;
+            return 0;
+        };
+
+        std::unordered_set<EdgeKey, EdgeKeyHash> seen_edge_keys;
         seen_edge_keys.reserve(1000000);
 
         // Incremental mode skips the global name-match edge wipe below. The cascade delete
@@ -894,13 +1033,10 @@ public:
                 "  WHERE r.resolved_node_id IS NULL)",
                 -1, &pe, nullptr);
             while (pe && sqlite3_step(pe) == SQLITE_ROW) {
-                std::string key = std::to_string(sqlite3_column_int64(pe, 0));
-                key.push_back('|');
-                key += std::to_string(sqlite3_column_int64(pe, 1));
-                key.push_back('|');
+                int64_t s = sqlite3_column_int64(pe, 0);
+                int64_t d = sqlite3_column_int64(pe, 1);
                 const char* k = reinterpret_cast<const char*>(sqlite3_column_text(pe, 2));
-                if (k) key += k;
-                seen_edge_keys.insert(std::move(key));
+                seen_edge_keys.insert(EdgeKey{s, d, edge_kind_to_id(k ? k : "")});
             }
             sqlite3_finalize(pe);
         }
@@ -1030,12 +1166,7 @@ public:
                             int64_t src_id = (containing_node_id > 0) ? containing_node_id : fn_it->second;
                             for (size_t i = 0; i < std::min(candidates.size(), MAX_EDGES_PER_REF); ++i) {
                                 const auto& [cand_id, cand_conf] = candidates[i];
-                                std::string edge_key = std::to_string(src_id);
-                                edge_key.push_back('|');
-                                edge_key += std::to_string(cand_id);
-                                edge_key.push_back('|');
-                                edge_key += edge_kind;
-                                if (seen_edge_keys.insert(edge_key).second) {
+                                if (seen_edge_keys.insert(EdgeKey{src_id, cand_id, 1}).second) {
                                     edge_tuples.push_back({src_id, cand_id, edge_kind, cand_conf});
                                 }
                             }
@@ -1086,12 +1217,8 @@ public:
                     auto fn_it = file_node_map.find(path_it->second);
                     if (fn_it != file_node_map.end()) {
                         int64_t src_id = (containing_node_id > 0) ? containing_node_id : fn_it->second;
-                        std::string edge_key = std::to_string(src_id);
-                        edge_key.push_back('|');
-                        edge_key += std::to_string(resolved_id);
-                        edge_key.push_back('|');
-                        edge_key += edge_kind;
-                        if (seen_edge_keys.insert(edge_key).second) {
+                        uint8_t kid = edge_kind_to_id(edge_kind);
+                        if (seen_edge_keys.insert(EdgeKey{src_id, resolved_id, kid}).second) {
                             edge_tuples.push_back({src_id, resolved_id, edge_kind});
                         }
                     }
@@ -1101,6 +1228,11 @@ public:
                     conn_.exec("COMMIT");
                     conn_.exec("BEGIN TRANSACTION");
                     batch = 0;
+                    if (!progress_path.empty()) {
+                        std::ofstream pf(progress_path, std::ios::trunc);
+                        pf << "resolving_refs: " << total_resolved << '\n';
+                        pf.flush();
+                    }
                 }
             }
         }
@@ -1122,16 +1254,26 @@ public:
             std::cerr << "  " << stderr_bold("Clearing old cross-ref edges...", color_output) << "\n";
             conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
         }
+        // Defer edge index updates during full indexing if there are many edges.
+        // Dropping indexes before bulk insert and recreating them via sequential
+        // CREATE INDEX avoids updating 3 random-access B-trees on every batch.
+        bool defer_edge_indexes = !incremental && edge_tuples.size() >= 50000;
+        if (defer_edge_indexes) {
+            conn_.exec("DROP INDEX IF EXISTS idx_edges_src");
+            conn_.exec("DROP INDEX IF EXISTS idx_edges_dst");
+            conn_.exec("DROP INDEX IF EXISTS idx_edges_dst_conf");
+            conn_.exec("DROP INDEX IF EXISTS idx_edges_source");
+        }
+
         std::cerr << "  Inserting " << stderr_cyan(format_with_commas(static_cast<int64_t>(edge_tuples.size())), color_output)
                   << " edges...\n";
         conn_.exec("BEGIN TRANSACTION");
 
-        // R3: Batch edge INSERT using 150-row chunks. edge_tuples is pre-deduped
-        // in memory because edges has no UNIQUE constraint to rely on here.
-        const int RESOLVE_EDGE_BATCH = 150;
+        // Batch edge INSERT using 400-row chunks (1,600 SQL parameters, well within SQLite limit).
+        const int RESOLVE_EDGE_BATCH = 400;
         const int PARAMS_PER_EDGE = 4;  // src_id, dst_id, kind, confidence
 
-        // Prepare batch statement: 150 rows × "(?,?,?,?, 'name-match')"
+        // Prepare batch statement: 400 rows × "(?,?,?,?, 'name-match')"
         std::string batch_sql = "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) VALUES ";
         for (int i = 0; i < RESOLVE_EDGE_BATCH; ++i) {
             if (i > 0) batch_sql += ",";
@@ -1169,6 +1311,11 @@ public:
                 conn_.exec("COMMIT");
                 conn_.exec("BEGIN TRANSACTION");
                 commit_counter = 0;
+                if (!progress_path.empty()) {
+                    std::ofstream pf(progress_path, std::ios::trunc);
+                    pf << "resolving_edges: " << edges_created << '\n';
+                    pf.flush();
+                }
             }
         }
 
@@ -1182,6 +1329,39 @@ public:
         conn_.exec("COMMIT");
         sqlite3_finalize(batch_edge_stmt);
         sqlite3_finalize(single_edge_stmt);
+
+        if (defer_edge_indexes) {
+            std::cerr << "  " << stderr_bold("Rebuilding edge indexes...", color_output) << "\n";
+            std::atomic<bool> rebuild_done{false};
+            std::thread heartbeat([&]() {
+                while (!rebuild_done.load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    if (!progress_path.empty()) {
+                        std::ofstream pf(progress_path, std::ios::trunc);
+                        pf << "rebuilding_edge_indexes\n";
+                        pf.flush();
+                    }
+                }
+            });
+            conn_.exec("PRAGMA threads = 4");
+            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
+            if (!progress_path.empty()) {
+                std::ofstream pf(progress_path, std::ios::trunc);
+                pf << "rebuilt_idx_edges_src\n";
+                pf.flush();
+            }
+            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
+            if (!progress_path.empty()) {
+                std::ofstream pf(progress_path, std::ios::trunc);
+                pf << "rebuilt_idx_edges_dst\n";
+                pf.flush();
+            }
+            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence)");
+            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)");
+            rebuild_done.store(true, std::memory_order_relaxed);
+            if (heartbeat.joinable()) heartbeat.join();
+        }
+
         std::cerr << "  Created " << stderr_cyan(format_with_commas(edges_created), color_output)
                   << " edges\n";
 
@@ -1218,11 +1398,18 @@ private:
     }
 
     // Cached prepared statements for persist_file() — prepared once, reused via reset/clear_bindings
+    sqlite3_stmt* stmt_find_file_ = nullptr;
+    sqlite3_stmt* stmt_find_file_node_ = nullptr;
     sqlite3_stmt* stmt_delete_file_ = nullptr;
     sqlite3_stmt* stmt_delete_file_node_ = nullptr;
     sqlite3_stmt* stmt_insert_file_ = nullptr;
+    sqlite3_stmt* stmt_update_file_ = nullptr;
     sqlite3_stmt* stmt_insert_file_node_ = nullptr;
     sqlite3_stmt* stmt_insert_symbol_ = nullptr;
+    sqlite3_stmt* stmt_update_symbol_ = nullptr;
+    sqlite3_stmt* stmt_delete_symbol_ = nullptr;
+    sqlite3_stmt* stmt_delete_refs_ = nullptr;
+    sqlite3_stmt* stmt_delete_file_edges_ = nullptr;
     sqlite3_stmt* stmt_insert_ref_ = nullptr;
     sqlite3_stmt* stmt_insert_edge_ = nullptr;
     
@@ -1240,6 +1427,12 @@ private:
         if (stmts_cached_) return;
 
         prepare_cached(
+            "SELECT id FROM files WHERE path = ? AND root_id IS NULL", &stmt_find_file_);
+
+        prepare_cached(
+            "SELECT id FROM nodes WHERE node_type = 'file' AND stable_key = ?", &stmt_find_file_node_);
+
+        prepare_cached(
             "DELETE FROM files WHERE path = ? AND root_id IS NULL", &stmt_delete_file_);
 
         prepare_cached(
@@ -1251,6 +1444,10 @@ private:
             "VALUES(?, ?, ?, ?, ?, ?, ?)", &stmt_insert_file_);
 
         prepare_cached(
+            "UPDATE files SET language = ?, size_bytes = ?, mtime_ns = ?, content_hash = ?, parse_status = ?, parse_error = ? WHERE id = ?",
+            &stmt_update_file_);
+
+        prepare_cached(
             "INSERT INTO nodes(node_type, file_id, kind, name, stable_key) "
             "VALUES('file', NULL, 'file', ?, ?)", &stmt_insert_file_node_);
 
@@ -1258,6 +1455,19 @@ private:
             "INSERT INTO nodes(node_type, file_id, kind, name, qualname, signature, fingerprint, "
             "start_line, start_col, end_line, end_col, is_definition, visibility, doc, stable_key) "
             "VALUES('symbol', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", &stmt_insert_symbol_);
+
+        prepare_cached(
+            "UPDATE nodes SET kind = ?, name = ?, qualname = ?, signature = ?, fingerprint = ?, "
+            "start_line = ?, start_col = ?, end_line = ?, end_col = ?, is_definition = ?, visibility = ?, doc = ? WHERE id = ?",
+            &stmt_update_symbol_);
+
+        prepare_cached("DELETE FROM nodes WHERE id = ?", &stmt_delete_symbol_);
+
+        prepare_cached("DELETE FROM refs WHERE file_id = ?", &stmt_delete_refs_);
+
+        prepare_cached(
+            "DELETE FROM edges WHERE (src_id = ? OR src_id IN (SELECT id FROM nodes WHERE file_id = ?)) AND source = 'static'",
+            &stmt_delete_file_edges_);
 
         prepare_cached(
             "INSERT INTO refs(file_id, kind, name, start_line, start_col, end_line, end_col, evidence, containing_node_id, "
@@ -1312,11 +1522,18 @@ private:
     }
 
     void finalize_cached_stmts() {
+        if (stmt_find_file_)       { sqlite3_finalize(stmt_find_file_);       stmt_find_file_ = nullptr; }
+        if (stmt_find_file_node_)  { sqlite3_finalize(stmt_find_file_node_);  stmt_find_file_node_ = nullptr; }
         if (stmt_delete_file_)     { sqlite3_finalize(stmt_delete_file_);     stmt_delete_file_ = nullptr; }
         if (stmt_delete_file_node_){ sqlite3_finalize(stmt_delete_file_node_);stmt_delete_file_node_ = nullptr; }
         if (stmt_insert_file_)     { sqlite3_finalize(stmt_insert_file_);     stmt_insert_file_ = nullptr; }
+        if (stmt_update_file_)     { sqlite3_finalize(stmt_update_file_);     stmt_update_file_ = nullptr; }
         if (stmt_insert_file_node_){ sqlite3_finalize(stmt_insert_file_node_);stmt_insert_file_node_ = nullptr; }
         if (stmt_insert_symbol_)   { sqlite3_finalize(stmt_insert_symbol_);   stmt_insert_symbol_ = nullptr; }
+        if (stmt_update_symbol_)   { sqlite3_finalize(stmt_update_symbol_);   stmt_update_symbol_ = nullptr; }
+        if (stmt_delete_symbol_)   { sqlite3_finalize(stmt_delete_symbol_);   stmt_delete_symbol_ = nullptr; }
+        if (stmt_delete_refs_)     { sqlite3_finalize(stmt_delete_refs_);     stmt_delete_refs_ = nullptr; }
+        if (stmt_delete_file_edges_){ sqlite3_finalize(stmt_delete_file_edges_); stmt_delete_file_edges_ = nullptr; }
         if (stmt_insert_ref_)      { sqlite3_finalize(stmt_insert_ref_);      stmt_insert_ref_ = nullptr; }
         if (stmt_insert_edge_)     { sqlite3_finalize(stmt_insert_edge_);     stmt_insert_edge_ = nullptr; }
         if (stmt_batch_insert_ref_) { sqlite3_finalize(stmt_batch_insert_ref_); stmt_batch_insert_ref_ = nullptr; }

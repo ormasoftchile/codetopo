@@ -91,7 +91,7 @@ public:
     // - cache_size=512 MB: larger page cache
     void enable_turbo() {
         exec("PRAGMA synchronous=OFF");
-        exec("PRAGMA wal_autocheckpoint=0");
+        exec("PRAGMA wal_autocheckpoint=10000");  // 40 MB checkpoints avoid multi-GB WAL bloat
         exec("PRAGMA temp_store=MEMORY");
         exec("PRAGMA cache_size=-524288");  // 512 MB page cache (covers UNIQUE B-tree for 3M+ rows)
     }

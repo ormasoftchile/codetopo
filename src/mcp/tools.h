@@ -153,5 +153,15 @@ std::string workspace_remove(yyjson_val* params, Connection& conn,
 std::string workspace_list(yyjson_val* params, Connection& conn,
                            QueryCache& cache, const std::string& repo_root);
 
+// Graph quality & edge provenance tools
+std::string graph_quality(yyjson_val* params, Connection& conn,
+                          QueryCache& cache, const std::string& repo_root);
+std::string get_edge_evidence(yyjson_val* params, Connection& conn,
+                              QueryCache& cache, const std::string& repo_root);
+
+// Semantic graph diff tool
+std::string graph_diff(yyjson_val* params, Connection& conn,
+                       QueryCache& cache, const std::string& repo_root);
+
 } // namespace tools
 } // namespace codetopo

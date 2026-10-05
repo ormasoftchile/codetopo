@@ -26,6 +26,7 @@ struct Config {
     int max_ast_depth = 200;
     int max_files = 0;  // 0 = unlimited; truncate scanned file list for profiling
     bool profile = false;  // Enable per-phase profiling output
+    std::string profile_json;  // Path to write JSON profiling report
     bool no_gitignore = false;
     bool turbo = false;  // Aggressive perf: synchronous=OFF, batch=1000, larger cache
     bool workspace_content_fts = false;  // workspace add: opt in to line-level content FTS

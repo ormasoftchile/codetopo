@@ -18,7 +18,9 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -2105,23 +2107,38 @@ std::string read_file_content(const std::filesystem::path& path) {
     }
     return content;
 #else
-    // POSIX: use open() with posix_fadvise for sequential read-ahead
-    std::error_code _fs_ec;
-    auto size = std::filesystem::file_size(path, _fs_ec);
-    if (_fs_ec || size == 0) return "";
-
+    // POSIX: direct open, fstat, OS read-ahead hint, uninitialized buffer read
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return "";
 
-    #ifdef POSIX_FADV_SEQUENTIAL
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    #endif
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        ::close(fd);
+        return "";
+    }
+    const size_t size = static_cast<size_t>(st.st_size);
 
-    std::string content(size, '\0');
-    auto nread = ::read(fd, content.data(), size);
+#if defined(POSIX_FADV_SEQUENTIAL)
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+
+    std::string content;
+    content.resize_and_overwrite(size, [fd, size](char* buf, size_t) -> size_t {
+        size_t total_read = 0;
+        while (total_read < size) {
+            ssize_t n = ::read(fd, buf + total_read, size - total_read);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return 0; // read error
+            }
+            if (n == 0) break; // EOF
+            total_read += static_cast<size_t>(n);
+        }
+        return total_read;
+    });
     ::close(fd);
 
-    if (nread != static_cast<ssize_t>(size)) return "";
+    if (content.size() != size) return "";
     return content;
 #endif
 }

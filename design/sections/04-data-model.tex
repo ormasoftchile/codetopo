@@ -123,13 +123,17 @@ The \texttt{kind} field takes one of: \texttt{function}, \texttt{method},
 
 \begin{lstlisting}[language=sql]
 CREATE TABLE edges (
-  id         INTEGER PRIMARY KEY,
-  src_id     INTEGER REFERENCES nodes(id),
-  dst_id     INTEGER REFERENCES nodes(id),
-  dst_name   TEXT,     -- unresolved callee name (approx edges)
-  kind       TEXT NOT NULL,
-  file_id    INTEGER REFERENCES files(id),
-  confidence REAL DEFAULT 1.0
+  id               INTEGER PRIMARY KEY,
+  src_id           INTEGER REFERENCES nodes(id),
+  dst_id           INTEGER REFERENCES nodes(id),
+  dst_name         TEXT,     -- unresolved callee name (approx edges)
+  kind             TEXT NOT NULL,
+  file_id          INTEGER REFERENCES files(id),
+  confidence       REAL DEFAULT 1.0,
+  source           TEXT NOT NULL DEFAULT 'static', -- static|runtime|protocol|inferred|semantic
+  evidence_json    TEXT,     -- provenance metadata (AST token, route, span)
+  observed_count   INTEGER NOT NULL DEFAULT 0,     -- execution count
+  last_observed_at INTEGER                           -- epoch timestamp
 );
 \end{lstlisting}
 
@@ -146,6 +150,72 @@ Edges with \texttt{confidence} below 0.3 are discarded at extraction time.
   \item[\texttt{contains}] A structural containment edge (e.g., method
         contained in a class).
 \end{description}
+
+\subsubsection{Edge provenance and epistemic classifications}
+\label{sec:edge-provenance}
+
+Beginning with schema~v15, CodeTopo replaces homogeneous edge assumptions with an
+explicit provenance and evidence model (\texttt{src/db/provenance.h}). Each edge
+is annotated with its origin (\texttt{source}), confidence score ($0.3 \le c \le 1.0$),
+execution frequency (\texttt{observed\_count}), and verifiable evidence payload
+(\texttt{evidence\_json}). As illustrated in Figure~\ref{fig:edge-provenance}, this allows
+agents to reason with four distinct epistemic certainties:
+\begin{enumerate}
+  \item \textbf{POSSIBLE} ($0.30 \le c < 0.80$): Syntactically conceivable candidate edges
+        originating from dynamic dispatch or heuristic name matching.
+  \item \textbf{PROBABLE} ($0.80 \le c < 1.00$): Disambiguated static references with high-confidence
+        structural heuristics.
+  \item \textbf{RESOLVED} ($c = 1.00$): Exact static AST or compiler-verified definitions.
+  \item \textbf{OBSERVED} (\texttt{observed\_count} $\ge 1$): Concrete empirical executions verified
+        by runtime traces or HTTP protocol spans.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Edge Evidence & Provenance Model"
+  figure "FIGURE 06 · MULTI-SOURCE EVIDENCE & EPISTEMIC CATEGORIES"
+  desc "Schema v15 provenance architecture: multi-source evidence extraction annotates edges with granular confidence and execution metrics, mapped into formal epistemic categories."
+
+  legend
+    square source "Evidence" #3b82f6
+    circle schema "Schema v15" #10b981
+    diamond epistemic "Epistemic" #8b5cf6
+  end
+
+  tier sources "EVIDENCE SOURCES"
+    card s_ast "Static AST Extraction" [Tree-sitter · source=static] @icon:robot
+    card s_trace "Runtime Telemetry" [OTel Spans · source=runtime] @icon:lightning
+    card s_sem "Semantic Compiler Feed" [SCIP / clangd · source=semantic] @icon:cloud
+  end
+
+  tier edge "CANONICAL RELATION"
+    card canonical "Schema v15 Edge Table" [edges(src, dst, kind, confidence)] @icon:database
+    card payload "Provenance Metadata" [evidence_json · observed_count] @icon:storage
+  end
+
+  tier epistemic "EPISTEMIC CLASSES"
+    card resolved "RESOLVED (1.00)" [Compiler-Verified / Exact AST] @icon:database
+    card probable "PROBABLE (0.80 - 0.99)" [Disambiguated Inferences] @icon:shield
+    card observed "OBSERVED (count >= 1)" [Empirical Trace Paths] @icon:lightning
+    card possible "POSSIBLE (0.30 - 0.79)" [Approximate Candidates] @icon:queue
+  end
+
+  tier agent "AGENT REASONING"
+    card safe "Safe Refactoring" [Guaranteed by RESOLVED & OBSERVED] @icon:robot
+    card audit "Dead Code Auditing" [Identified by Static-Only count=0] @icon:server
+  end
+
+  bus s_ast, s_trace, s_sem -->|"Ingest"| canonical @anim:stream
+  bus canonical --> payload
+  bus payload -->|"Categories"| resolved, probable, observed, possible @anim:flow
+  bus resolved --> safe
+  bus possible --> audit
+\end{triton}
+\caption{Edge evidence and epistemic provenance model. CodeTopo annotates each topological relation with granular provenance attributes in schema v15, empowering agents to assess edge certainty across four distinct epistemic classifications.}
+\label{fig:edge-provenance}
+\end{figure}
 
 \subsection{refs}
 

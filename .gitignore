@@ -1,5 +1,7 @@
 # Build output
 build/
+build-*/
+build-opt/
 out/
 dist/
 cmake-build-*/

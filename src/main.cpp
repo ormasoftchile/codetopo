@@ -13,6 +13,8 @@
 #include "cli/cmd_skills.h"
 #include "cli/cmd_workspace.h"
 #include "cli/cmd_parse_file.h"
+#include "cli/cmd_quality.h"
+#include "cli/cmd_diff.h"
 #include "index/supervisor.h"
 #include "util/repo.h"
 
@@ -67,11 +69,13 @@ int main(int argc, char** argv) {
     int index_max_files = 0;
     int index_extract_timeout = 5;
     bool index_profile = false;
+    std::string index_profile_json;
     sub_index->add_option("--progress-offset", index_progress_offset, "Files already done (internal)")->group("");
     sub_index->add_option("--progress-total", index_progress_total, "Original total (internal)")->group("");
     sub_index->add_option("--max-files", index_max_files, "Max files to index (0=unlimited, for profiling)")->default_val(0);
     sub_index->add_option("--extract-timeout", index_extract_timeout, "Per-file extraction timeout in seconds (0=no limit)")->default_val(5);
     sub_index->add_flag("--profile", index_profile, "Enable per-phase profiling output");
+    sub_index->add_option("--profile-json", index_profile_json, "Write JSON profiling report to this file");
 
     // --- init subcommand ---
     auto* sub_init = app.add_subcommand("init", "Index a repository and configure editors for MCP");
@@ -162,6 +166,34 @@ int main(int argc, char** argv) {
 
     sub_doctor->add_option("--root", doctor_root, "Repository root directory")->default_val(".");
     sub_doctor->add_option("--db", doctor_db, "Database path (default: <root>/.codetopo/index.sqlite)");
+
+    // --- quality subcommand ---
+    auto* sub_quality = app.add_subcommand("quality", "Report graph quality and resolution metrics");
+    std::string quality_root = ".";
+    std::string quality_db;
+    bool quality_json = false;
+
+    sub_quality->add_option("--root", quality_root, "Repository root directory")->default_val(".");
+    sub_quality->add_option("--db", quality_db, "Database path (default: <root>/.codetopo/index.sqlite)");
+    sub_quality->add_flag("--json", quality_json, "Output quality metrics as JSON");
+
+    // --- diff subcommand ---
+    auto* sub_diff = app.add_subcommand("diff", "Compute semantic graph diff between working tree, commits, or index");
+    std::string diff_root = ".";
+    std::string diff_db;
+    std::string diff_base = "HEAD";
+    std::string diff_target = "working-tree";
+    bool diff_working_tree = false;
+    bool diff_json = false;
+    std::string diff_pattern;
+
+    sub_diff->add_option("base", diff_base, "Base git revision or 'index' (default: 'HEAD')");
+    sub_diff->add_option("target", diff_target, "Target git revision or 'working-tree' (default: 'working-tree')");
+    sub_diff->add_flag("--working-tree", diff_working_tree, "Diff working tree against the index (default)");
+    sub_diff->add_option("--pattern", diff_pattern, "File glob pattern filter");
+    sub_diff->add_option("--root", diff_root, "Repository root directory")->default_val(".");
+    sub_diff->add_option("--db", diff_db, "Database path (default: <root>/.codetopo/index.sqlite)");
+    sub_diff->add_flag("--json", diff_json, "Output semantic diff as JSON");
 
     // --- skills subcommand ---
     auto* sub_skills = app.add_subcommand("skills", "Install agent skill files into a repository");
@@ -270,7 +302,8 @@ int main(int argc, char** argv) {
         cfg.progress_total = index_progress_total;
         cfg.max_files = index_max_files;
         cfg.extraction_timeout_s = index_extract_timeout;
-        cfg.profile = index_profile;
+        cfg.profile = index_profile || !index_profile_json.empty();
+        cfg.profile_json = index_profile_json;
         try {
             if (cfg.supervised) {
                 // Running as a supervised child — index directly
@@ -343,6 +376,25 @@ int main(int argc, char** argv) {
         if (doctor_db.empty()) doctor_db = codetopo::default_db(doctor_root);
         try {
             return codetopo::run_doctor(doctor_db);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (sub_quality->parsed()) {
+        try {
+            return codetopo::run_quality(quality_root, quality_db, quality_json);
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
+    if (sub_diff->parsed()) {
+        if (diff_working_tree) {
+            diff_target = "working-tree";
+        }
+        try {
+            return codetopo::run_diff(diff_root, diff_db, diff_base, diff_target, diff_json, diff_pattern);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;

@@ -57,33 +57,130 @@ The model asks a precise structural question (``give me the callers of
 \texttt{foo} up to depth~3'') and receives a compact, structured answer. It
 never needs to load intermediate files. This design is motivated by empirical
 findings on how developers navigate large codebases~\cite{robillard2004codenav}.
+Figure~\ref{fig:agent-query-flow} contrasts this structural workflow with
+unindexed heuristic retrieval.
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Agent Structural Query Navigation"
+  figure "FIGURE 05 · HEURISTIC RETRIEVAL VS DETERMINISTIC GRAPH NAVIGATION"
+  desc "Contrasting brute-force context stuffing against CodeTopo's deterministic graph queries: shifting the cognitive navigation burden from the LLM to pre-indexed SQLite relations."
+
+  legend
+    square intent "Agent Intent" #3b82f6
+    circle failure "Heuristic Failure" #ef4444
+    diamond success "Structural Success" #10b981
+  end
+
+  tier task "AGENT QUERY"
+    card query "Refactoring Query" [What breaks if I modify Alloc?] @icon:robot
+  end
+
+  tier methods "RETRIEVAL METHOD"
+    card grep "Unindexed Grep" [Regex & Embedding Scan] @icon:server
+    card topo "CodeTopo Engine" [impact_of(node_id, depth=2)] @icon:api
+  end
+
+  tier processing "PROCESSING"
+    card stuff "Context Stuffing" [100k+ Tokens Dumped to LLM] @icon:queue
+    card bfs "Indexed Graph Walk" [Transitive BFS · <2ms SQLite] @icon:database
+  end
+
+  tier outcomes "AGENT OUTCOME"
+    card fail "Hallucination Risk" [High Noise · Missed Call Paths] @icon:shield
+    card exact "Exact Impact DAG" [<500 Tokens · Zero Hallucination] @icon:lightning
+  end
+
+  bus query -->|"Execution Choice"| grep, topo @anim:stream
+  bus grep -->|"100k Tokens"| stuff
+  bus stuff -->|"Context Overflow"| fail
+  bus topo -->|"Indexed Traversal"| bfs @anim:flow
+  bus bfs -->|"Structured Context"| exact @anim:flow
+\end{triton}
+\caption{Agent query navigation contrast. Unindexed heuristic grep and context stuffing overwhelm LLM context windows with thousands of irrelevant lines, whereas CodeTopo provides deterministic graph-native queries over pre-indexed SQLite relations, yielding minimal, structured answers in milliseconds.}
+\label{fig:agent-query-flow}
+\end{figure}
 
 \subsection{Design properties}
 
 \begin{description}
-  \item[Structural-first.] The primary index is a symbol graph, not a text
-        corpus. Full-text search is provided as a complement via an FTS5
-        trigram index~\cite{hipp2014fts5}, not as a substitute.
+  \item[Structural-first and continuously synchronized.] The primary substrate is a
+        live structural symbol graph, not a text corpus or an offline static snapshot.
+        Full-text search is provided as a complement via an FTS5 trigram
+        index~\cite{hipp2014fts5}, not as a substitute. The graph remains continuously
+        synchronized while the codebase actively changes: kernel-level filesystem
+        watchers debounce edit bursts, an in-flight coalescing state machine serializes
+        concurrent updates (\S\ref{sec:watcher-concurrency}), and symbol attraction
+        updates cross-file edges without global rescans.
+  \item[Symbol attraction.] codetopo draws a strict architectural distinction between
+        \emph{incremental file parsing} (re-parsing only modified files) and
+        \emph{incremental graph maintenance} (maintaining repository-wide relational
+        integrity). When a file introduces, modifies, or moves a definition, the
+        symbol attraction mechanism (\S\ref{sec:incremental-reindexing}) selectively
+        re-evaluates only dangling references in unmodified files that match the new
+        definitions, avoiding repository-wide edge scans.
+  \item[Static and runtime topology.] In addition to static AST relations, codetopo
+        ingests runtime execution evidence (distributed trace spans, invocation counts,
+        latency percentiles, and protocol-level HTTP relationships). This dual model
+        allows agents to distinguish statically possible calls from empirically observed
+        execution paths (Figure~\ref{fig:static-runtime-convergence}).
+
+\begin{figure}[htbp]
+\centering
+\tritonnext{width=\textwidth}
+\begin{triton}
+platform "Static & Runtime Topology Convergence"
+  figure "FIGURE 04 · DUAL-RAIL TOPOLOGICAL CONVERGENCE"
+  desc "Static syntactic extraction and empirical runtime observability fuse into a unified schema v15 edge graph to disambiguate possible paths from executed paths."
+
+  legend
+    square static "Static Syntax" #3b82f6
+    circle runtime "Runtime Trace" #10b981
+    diamond query "Agent Query" #8b5cf6
+  end
+
+  tier sources "EVIDENCE SOURCES"
+    card ast "Tree-sitter AST" [Calls · Types · Imports] @icon:robot
+    card otel "Distributed Traces" [OTel Spans · Invocations] @icon:lightning
+    card http "Protocol Mapping" [HTTP / RPC Endpoints] @icon:api
+  end
+
+  tier fusion "FUSION & REINFORCEMENT"
+    card fuse "Topological Fusion" [Static + Observed -> 1.0] @icon:shield
+  end
+
+  tier unified "UNIFIED LIVE TOPOLOGY"
+    card model "Unified Edge Graph" [Schema v15 · Granular Provenance] @icon:database
+  end
+
+  tier inquiries "DETERMINISTIC QUERIES"
+    card q_stat "Statically Possible?" [AST Edge Exists · 0.3-1.0] @icon:server
+    card q_obs "Empirically Executed?" [observed_count >= 1] @icon:lightning
+    card q_dead "Dead Code Candidate?" [Static-Only · count=0] @icon:shield
+    card q_dyn "Dynamic Dispatch?" [Runtime-Only Invocations] @icon:robot
+  end
+
+  bus ast, otel, http -->|"Dual-Rail Feed"| fuse @anim:stream
+  bus fuse -->|"Reinforced Edges"| model @anim:flow
+  bus model -->|"Queries"| q_stat, q_obs, q_dead, q_dyn @anim:particle
+\end{triton}
+\caption{Static and runtime topology convergence. Static AST extraction and runtime observability streams fuse into a unified schema v15 edge graph. Agents query the unified model to disambiguate statically possible execution paths from empirically observed runtime invocations.}
+\label{fig:static-runtime-convergence}
+\end{figure}
   \item[Zero-dependency runtime.] The MCP server is a single compiled binary;
-        the index is a single SQLite file. No language server, no daemon, no
-        network service is required.
-  \item[Polyglot.] Thirteen languages are supported out of the box when
-        experimental grammars are included: C, C++, C\#, TypeScript,
-        JavaScript, Python, Rust, Java, Go, Bash, SQL, YAML, and Lua.\footnote{Lua
-        is tracked as experimental; Simon's architecture notes enumerate the
-        twelve production-ready languages without Lua.} Any language with a
-        tree-sitter grammar can be added with a thin extractor.
+        the index is a single local SQLite file. No language server, background daemon,
+        container runtime, or external network service is required.
+  \item[Polyglot.] Thirteen languages are supported out of the box: C, C++, C\#,
+        TypeScript, JavaScript, Python, Rust, Java, Go, Bash, SQL, YAML, and Lua.\footnote{Lua
+        is tracked as experimental; production deployments actively utilize the twelve core
+        grammars.} Any language with a tree-sitter grammar can be added with a thin extractor.
   \item[Multi-root.] A single server instance manages multiple workspace
-        roots simultaneously (\S\ref{sec:workspace}).
-  \item[Incremental.] Files are re-indexed only when their content changes
-        (mtime $+$ xxHash check). A filesystem watcher triggers live
-        re-indexing on create, modify, and delete events.
+        roots simultaneously with deterministic ID partitioning (\S\ref{sec:workspace}).
   \item[MCP-native.] codetopo speaks the Model Context Protocol
-        (\S\ref{sec:mcp-protocol}) natively: JSON-RPC~2.0 over stdio, the
-        same transport as the Language Server Protocol~\cite{microsoft2016lsp}\footnote{LSP was
-        first announced by Microsoft and Red Hat on June~27, 2016 ---
-        coincidentally the same calendar date as this document's writing.}
-        but with a tool-call interface designed for autonomous agents.
+        (\S\ref{sec:mcp-protocol}) natively over standard I/O, exposing deterministic
+        structural tools tailored for autonomous AI agents.
 \end{description}
 
 \subsection{What codetopo is not}
