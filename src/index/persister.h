@@ -7,6 +7,7 @@
 #include "util/git.h"
 #include "util/log.h"
 #include "db/schema.h"
+#include "db/owned_nodes.h"
 #include "db/fts.h"
 #include "db/bind.h"
 #include <sqlite3.h>
@@ -270,19 +271,7 @@ public:
                          file_id);
                 step_write(stmt_update_file_);
 
-                // Find or insert file node
-                auto file_key = make_file_stable_key(file.relative_path);
-                sqlite3_reset(stmt_find_file_node_);
-                sqlite3_bind_text(stmt_find_file_node_, 1, file_key.c_str(), -1, SQLITE_STATIC);
-                if (sqlite3_step(stmt_find_file_node_) == SQLITE_ROW) {
-                    file_node_id = sqlite3_column_int64(stmt_find_file_node_, 0);
-                }
-                sqlite3_reset(stmt_find_file_node_);
-                if (file_node_id == 0) {
-                    db::bind(stmt_insert_file_node_, file.relative_path, file_key);
-                    step_write(stmt_insert_file_node_);
-                    file_node_id = sqlite3_last_insert_rowid(conn_.raw());
-                }
+                file_node_id = ensure_file_node(file.relative_path);
 
                 // Load existing symbol nodes for this file into map (stable_key -> node_id)
                 std::unordered_map<std::string, int64_t> existing_symbols;
@@ -368,10 +357,11 @@ public:
                 file_id = sqlite3_last_insert_rowid(conn_.raw());
                 last_file_id_ = file_id;
 
-                auto file_key = make_file_stable_key(file.relative_path);
-                db::bind(stmt_insert_file_node_, file.relative_path, file_key);
-                step_write(stmt_insert_file_node_);
-                file_node_id = sqlite3_last_insert_rowid(conn_.raw());
+                // File nodes have NULL file_id and can survive an earlier file prune.
+                // Reuse their stable identity so incoming include/workspace links survive.
+                file_node_id = ensure_file_node(file.relative_path);
+                db::bind(stmt_delete_file_edges_, file_node_id, file_id);
+                step_write(stmt_delete_file_edges_);
 
                 // Insert symbol nodes (DEC-039 OPT-1: batched 100-row INSERT)
                 const int SYMBOL_BATCH_SIZE = 100;
@@ -596,7 +586,7 @@ public:
     }
 
     // T049: Write kv metadata
-    void write_metadata(const std::string& repo_root) {
+    void write_metadata(const std::string& repo_root, bool complete = true) {
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
         std::tm tm_buf{};
@@ -611,6 +601,17 @@ public:
         schema::set_kv(conn_, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
         schema::set_kv(conn_, "indexer_version", INDEXER_VERSION);
         schema::set_kv(conn_, "repo_root", repo_root);
+        schema::set_kv(conn_, "index_generation",
+            std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                now.time_since_epoch()).count()));
+        schema::set_kv(conn_, "index_state",
+            complete ? "current" : "needs_reconciliation");
+        if (!complete) {
+            schema::delete_kv(conn_, "last_index_time");
+            schema::delete_kv(conn_, "git_head");
+            schema::delete_kv(conn_, "git_branch");
+            return;
+        }
         schema::set_kv(conn_, "last_index_time", time_ss.str());
         schema::set_kv(conn_, "language_coverage", "c,cpp,csharp,typescript,go,yaml");
 
@@ -636,11 +637,10 @@ public:
     //                   re-attaches incoming refs whose target node was just deleted → SET
     //                   NULL, and picks up previously-unresolvable same-name refs too }
     // Only those refs are re-resolved; symbols are loaded only for the affected refs' names
-    // plus their bare suffixes. We also (b) do NOT globally delete name-match edges — the
-    // cascade already removed exactly the edges touching the changed files, and surviving
-    // fan-out edges are preserved via a pre-seeded dedup set. changed_paths are the
-    // repo-relative paths of the re-persisted files. Full reindex (incremental=false) is
-    // unchanged: it loads every symbol and re-resolves the entire ref table.
+    // plus their bare suffixes. Existing edges are retained in both modes: persistence
+    // removes obsolete outgoing edges of changed files, while resolved references in
+    // unchanged files must keep their graph relationships. Full mode also repairs missing
+    // primary edges from persisted resolutions, without rewriting extra-root graphs.
     std::pair<int,int> resolve_references(bool incremental = false,
                                           const std::vector<std::string>& changed_paths = {},
                                           const std::string& progress_path = "") {
@@ -829,7 +829,9 @@ public:
                     ? "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind "
                       "FROM temp.__ct_want w CROSS JOIN nodes n "
                       "ON n.name = w.name AND n.node_type = 'symbol'"
-                    : "SELECT id, name, file_id, is_definition, kind FROM nodes WHERE node_type = 'symbol'",
+                    : "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind "
+                      "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id "
+                      "ON n.file_id = f.id WHERE n.node_type = 'symbol'",
                 -1, &stmt, nullptr);
 
             int loaded = 0;
@@ -913,12 +915,13 @@ public:
                       << ")\n";
         }
 
-        // --- Step 2: Build file-node lookup: file path → file node id ---
+        // --- Step 2: File nodes have NULL file_id. Reach their stable keys from files,
+        // including root-prefixed keys and the older file:<path> key format.
         std::unordered_map<std::string, int64_t> file_node_map;
         {
             sqlite3_stmt* stmt = nullptr;
             sqlite3_prepare_v2(conn_.raw(),
-                "SELECT id, name FROM nodes WHERE node_type = 'file'",
+                db::owned_file_nodes_sql,
                 -1, &stmt, nullptr);
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 int64_t id = sqlite3_column_int64(stmt, 0);
@@ -926,6 +929,65 @@ public:
                 if (name) file_node_map[name] = id;
             }
             sqlite3_finalize(stmt);
+        }
+
+        if (!incremental) {
+            sqlite3_stmt* resolved_refs = nullptr;
+            prepare_cached(
+                "SELECT COALESCE(r.containing_node_id, 0), r.resolved_node_id, r.kind, f.path "
+                "FROM files f INDEXED BY idx_files_root "
+                "CROSS JOIN refs r INDEXED BY idx_refs_file_id ON r.file_id = f.id "
+                "CROSS JOIN nodes dst ON dst.id = r.resolved_node_id "
+                "WHERE f.root_id IS NULL AND r.resolved_node_id IS NOT NULL "
+                "AND r.kind IN ('call', 'include', 'inherit', 'type_ref')",
+                &resolved_refs);
+            sqlite3_stmt* repair_edge = nullptr;
+            prepare_cached(
+                "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
+                "SELECT ?, ?, ?, 0.7, 'name-match' "
+                "WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?)"
+                "AND NOT EXISTS (SELECT 1 FROM edges e INDEXED BY idx_edges_src "
+                "WHERE e.src_id = ? AND e.kind = ? AND e.dst_id = ?)",
+                &repair_edge);
+            conn_.exec("BEGIN IMMEDIATE");
+            int repaired = 0;
+            int inspected = 0;
+            while (sqlite3_step(resolved_refs) == SQLITE_ROW) {
+                int64_t source_id = sqlite3_column_int64(resolved_refs, 0);
+                int64_t target_id = sqlite3_column_int64(resolved_refs, 1);
+                const char* ref_kind =
+                    reinterpret_cast<const char*>(sqlite3_column_text(resolved_refs, 2));
+                const char* path =
+                    reinterpret_cast<const char*>(sqlite3_column_text(resolved_refs, 3));
+                if (source_id == 0 && path) {
+                    auto file_node = file_node_map.find(path);
+                    if (file_node != file_node_map.end()) source_id = file_node->second;
+                }
+                if (source_id == 0 || !ref_kind) continue;
+                const char* edge_kind =
+                    std::string_view(ref_kind) == "call" ? "calls" :
+                    std::string_view(ref_kind) == "include" ? "includes" :
+                    std::string_view(ref_kind) == "inherit" ? "inherits" : "references";
+                db::bind(repair_edge, source_id, target_id, edge_kind,
+                         source_id, source_id, edge_kind, target_id);
+                step_write(repair_edge);
+                repaired += sqlite3_changes(conn_.raw());
+                if (++inspected % 100000 == 0) {
+                    conn_.exec("COMMIT");
+                    conn_.exec("BEGIN IMMEDIATE");
+                    if (!progress_path.empty()) {
+                        std::ofstream pf(progress_path, std::ios::trunc);
+                        pf << "repairing_resolved_edges: " << inspected
+                           << " inspected, " << repaired << " restored\n";
+                    }
+                }
+            }
+            conn_.exec("COMMIT");
+            sqlite3_finalize(resolved_refs);
+            sqlite3_finalize(repair_edge);
+            edges_created += repaired;
+            std::cerr << "  Restored " << repaired
+                      << " missing primary edges from persisted resolutions\n";
         }
 
         // --- Step 3: Build include lookup: filename → file node id ---
@@ -969,8 +1031,10 @@ public:
                 ? "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint "
                   "FROM temp.__ct_affected a CROSS JOIN refs r ON r.id = a.id "
                   "WHERE r.resolved_node_id IS NULL"
-                : "SELECT id, file_id, kind, name, containing_node_id, receiver_type_hint "
-                  "FROM refs WHERE resolved_node_id IS NULL",
+                : "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint "
+                  "FROM files f INDEXED BY idx_files_root "
+                  "CROSS JOIN refs r INDEXED BY idx_refs_file_id ON r.file_id = f.id "
+                  "WHERE f.root_id IS NULL AND r.resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
         // Edge tuples collected during resolution — avoids expensive SQL join in Step 6
@@ -1247,23 +1311,9 @@ public:
                   << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit, "
                   << stderr_cyan(format_with_commas(type_ref_resolved), color_output) << " type refs\n";
 
-        // --- Step 6: Delete stale cross-ref edges, then batch-insert from in-memory tuples ---
-        // Without a unique constraint, re-runs would accumulate duplicate edges.
-        // Delete only resolver-created edges (confidence=0.7, name-match evidence).
-        if (!cold_index_ && !incremental) {
-            std::cerr << "  " << stderr_bold("Clearing old cross-ref edges...", color_output) << "\n";
-            conn_.exec("DELETE FROM edges WHERE evidence = 'name-match'");
-        }
-        // Defer edge index updates during full indexing if there are many edges.
-        // Dropping indexes before bulk insert and recreating them via sequential
-        // CREATE INDEX avoids updating 3 random-access B-trees on every batch.
-        bool defer_edge_indexes = !incremental && edge_tuples.size() >= 50000;
-        if (defer_edge_indexes) {
-            conn_.exec("DROP INDEX IF EXISTS idx_edges_src");
-            conn_.exec("DROP INDEX IF EXISTS idx_edges_dst");
-            conn_.exec("DROP INDEX IF EXISTS idx_edges_dst_conf");
-            conn_.exec("DROP INDEX IF EXISTS idx_edges_source");
-        }
+        // --- Step 6: Add missing edges without invalidating unchanged primary or
+        // workspace relationships. Keep source/destination indexes live for readers
+        // and for bounded duplicate checks.
 
         std::cerr << "  Inserting " << stderr_cyan(format_with_commas(static_cast<int64_t>(edge_tuples.size())), color_output)
                   << " edges...\n";
@@ -1274,20 +1324,29 @@ public:
         const int PARAMS_PER_EDGE = 4;  // src_id, dst_id, kind, confidence
 
         // Prepare batch statement: 400 rows × "(?,?,?,?, 'name-match')"
-        std::string batch_sql = "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) VALUES ";
+        std::string batch_sql =
+            "WITH candidates(src_id,dst_id,kind,confidence) AS (VALUES ";
         for (int i = 0; i < RESOLVE_EDGE_BATCH; ++i) {
             if (i > 0) batch_sql += ",";
-            batch_sql += "(?,?,?,?, 'name-match')";
+            batch_sql += "(?,?,?,?)";
         }
+        batch_sql +=
+            ") INSERT INTO edges(src_id,dst_id,kind,confidence,evidence) "
+            "SELECT c.src_id,c.dst_id,c.kind,c.confidence,'name-match' FROM candidates c "
+            "WHERE NOT EXISTS (SELECT 1 FROM edges e INDEXED BY idx_edges_src "
+            "WHERE e.src_id=c.src_id AND e.kind=c.kind AND e.dst_id=c.dst_id "
+            "AND e.evidence='name-match')";
         sqlite3_stmt* batch_edge_stmt = nullptr;
-        sqlite3_prepare_v2(conn_.raw(), batch_sql.c_str(), -1, &batch_edge_stmt, nullptr);
+        prepare_cached(batch_sql.c_str(), &batch_edge_stmt);
 
         // Single-row fallback for remainder
         sqlite3_stmt* single_edge_stmt = nullptr;
-        sqlite3_prepare_v2(conn_.raw(),
+        prepare_cached(
             "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-            "VALUES(?, ?, ?, ?, 'name-match')",
-            -1, &single_edge_stmt, nullptr);
+            "SELECT ?, ?, ?, ?, 'name-match' "
+            "WHERE NOT EXISTS (SELECT 1 FROM edges e INDEXED BY idx_edges_src "
+            "WHERE e.src_id=? AND e.kind=? AND e.dst_id=? AND e.evidence='name-match')",
+            &single_edge_stmt);
 
         int total_edges = static_cast<int>(edge_tuples.size());
         int full_chunks = total_edges / RESOLVE_EDGE_BATCH;
@@ -1304,8 +1363,8 @@ public:
                 sqlite3_bind_text(batch_edge_stmt, base + 2, t.kind, -1, SQLITE_STATIC);
                 sqlite3_bind_double(batch_edge_stmt, base + 3, t.confidence);
             }
-            sqlite3_step(batch_edge_stmt);
-            edges_created += RESOLVE_EDGE_BATCH;
+            step_write(batch_edge_stmt);
+            edges_created += sqlite3_changes(conn_.raw());
             commit_counter += RESOLVE_EDGE_BATCH;
             if (commit_counter >= 100000) {
                 conn_.exec("COMMIT");
@@ -1321,46 +1380,15 @@ public:
 
         for (int e = 0; e < remainder; ++e) {
             const auto& t = edge_tuples[full_chunks * RESOLVE_EDGE_BATCH + e];
-            db::bind(single_edge_stmt, t.src_id, t.dst_id, t.kind, t.confidence);
-            sqlite3_step(single_edge_stmt);
-            ++edges_created;
+            db::bind(single_edge_stmt, t.src_id, t.dst_id, t.kind, t.confidence,
+                     t.src_id, t.kind, t.dst_id);
+            step_write(single_edge_stmt);
+            edges_created += sqlite3_changes(conn_.raw());
         }
 
         conn_.exec("COMMIT");
         sqlite3_finalize(batch_edge_stmt);
         sqlite3_finalize(single_edge_stmt);
-
-        if (defer_edge_indexes) {
-            std::cerr << "  " << stderr_bold("Rebuilding edge indexes...", color_output) << "\n";
-            std::atomic<bool> rebuild_done{false};
-            std::thread heartbeat([&]() {
-                while (!rebuild_done.load(std::memory_order_relaxed)) {
-                    std::this_thread::sleep_for(std::chrono::seconds(3));
-                    if (!progress_path.empty()) {
-                        std::ofstream pf(progress_path, std::ios::trunc);
-                        pf << "rebuilding_edge_indexes\n";
-                        pf.flush();
-                    }
-                }
-            });
-            conn_.exec("PRAGMA threads = 4");
-            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id, kind)");
-            if (!progress_path.empty()) {
-                std::ofstream pf(progress_path, std::ios::trunc);
-                pf << "rebuilt_idx_edges_src\n";
-                pf.flush();
-            }
-            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id, kind)");
-            if (!progress_path.empty()) {
-                std::ofstream pf(progress_path, std::ios::trunc);
-                pf << "rebuilt_idx_edges_dst\n";
-                pf.flush();
-            }
-            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_dst_conf ON edges(dst_id, kind, confidence)");
-            conn_.exec("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source)");
-            rebuild_done.store(true, std::memory_order_relaxed);
-            if (heartbeat.joinable()) heartbeat.join();
-        }
 
         std::cerr << "  Created " << stderr_cyan(format_with_commas(edges_created), color_output)
                   << " edges\n";
@@ -1381,6 +1409,22 @@ private:
     Connection& conn_;
     bool in_batch_ = false;
     int batch_count_ = 0;
+
+    int64_t ensure_file_node(const std::string& path) {
+        auto key = make_file_stable_key(path);
+        db::bind(stmt_find_file_node_, key);
+        int rc = sqlite3_step(stmt_find_file_node_);
+        int64_t id = rc == SQLITE_ROW ? sqlite3_column_int64(stmt_find_file_node_, 0) : 0;
+        sqlite3_reset(stmt_find_file_node_);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            throw SqliteError(rc,
+                "Find file node failed: " + std::string(sqlite3_errmsg(conn_.raw())));
+        }
+        if (id > 0) return id;
+        db::bind(stmt_insert_file_node_, path, key);
+        step_write(stmt_insert_file_node_);
+        return sqlite3_last_insert_rowid(conn_.raw());
+    }
 
     void step_write(sqlite3_stmt* stmt) {
         const int rc = sqlite3_step(stmt);
@@ -1466,7 +1510,9 @@ private:
         prepare_cached("DELETE FROM refs WHERE file_id = ?", &stmt_delete_refs_);
 
         prepare_cached(
-            "DELETE FROM edges WHERE (src_id = ? OR src_id IN (SELECT id FROM nodes WHERE file_id = ?)) AND source = 'static'",
+            "DELETE FROM edges INDEXED BY idx_edges_src "
+            "WHERE src_id IN (SELECT ? UNION SELECT id FROM nodes "
+            "INDEXED BY idx_nodes_file_id WHERE file_id = ?) AND source = 'static'",
             &stmt_delete_file_edges_);
 
         prepare_cached(

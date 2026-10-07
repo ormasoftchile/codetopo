@@ -184,6 +184,9 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_inplace_vector.cpp
     tests/unit/test_pagerank.cpp
     tests/unit/test_quality_and_provenance.cpp
+    tests/unit/test_root_ownership.cpp
+    tests/unit/test_resolver_preservation.cpp
+    tests/unit/test_schema_migrations.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
@@ -200,6 +203,16 @@ set(CODETOPO_LIB_SOURCES
 )
 
 add_executable(codetopo_tests ${CODETOPO_TEST_SOURCES} ${CODETOPO_LIB_SOURCES})
+
+if(WIN32)
+    add_executable(codetopo_crash_child
+        tests/integration/crash_child.cpp
+        src/util/process.cpp
+    )
+    target_include_directories(codetopo_crash_child PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(codetopo_crash_child PRIVATE unofficial::sqlite3::sqlite3)
+    add_dependencies(codetopo_tests codetopo codetopo_crash_child)
+endif()
 
 target_include_directories(codetopo_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -220,6 +233,30 @@ if(APPLE)
     target_link_libraries(codetopo_tests PRIVATE "-framework CoreServices")
 endif()
 
+# Imported project DLLs remain dynamic; only GNU's implicit compiler/thread
+# libraries are selected statically, so deployment never depends on compiler PATH.
+if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    foreach(_target codetopo codetopo_tests codetopo_crash_child)
+        target_link_options(${_target} PRIVATE -static -static-libgcc -static-libstdc++)
+    endforeach()
+endif()
+
 include(CTest)
 include(Catch)
 catch_discover_tests(codetopo_tests)
+
+if(WIN32 AND BUILD_TESTING)
+    find_program(CODETOPO_NODE_EXECUTABLE NAMES node)
+    if(CODETOPO_NODE_EXECUTABLE)
+        add_test(NAME portable_startup
+            COMMAND "${CODETOPO_NODE_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/tests/integration/portable_startup_stdio.js"
+                "$<TARGET_FILE:codetopo>")
+        set_tests_properties(portable_startup PROPERTIES TIMEOUT 60)
+        add_test(NAME sustained_startup
+            COMMAND "${CODETOPO_NODE_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/tests/integration/portable_startup_stdio.js"
+                "$<TARGET_FILE:codetopo>" --sustain --string-ids --duration=5)
+        set_tests_properties(sustained_startup PROPERTIES TIMEOUT 90)
+    endif()
+endif()

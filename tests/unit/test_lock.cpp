@@ -48,6 +48,37 @@ TEST_CASE("Lock detects live process holding lock", "[unit][lock]") {
     fs::remove_all(tmp);
 }
 
+TEST_CASE("Read-only lock observation never contends with other probes", "[unit][lock]") {
+    auto tmp = lock_test_dir("readonly_probe");
+    auto lock_path = tmp / "test.lock";
+    FileLock first_probe(lock_path);
+    FileLock second_probe(lock_path);
+
+    REQUIRE_FALSE(first_probe.held_by_live_process());
+    REQUIRE_FALSE(second_probe.held_by_live_process());
+    REQUIRE_FALSE(fs::exists(lock_path));
+
+    {
+        FileLock writer(lock_path);
+        REQUIRE(writer.acquire());
+        REQUIRE(first_probe.held_by_live_process());
+        REQUIRE(second_probe.held_by_live_process());
+    }
+
+    REQUIRE_FALSE(first_probe.held_by_live_process());
+    REQUIRE_FALSE(second_probe.held_by_live_process());
+    REQUIRE_FALSE(fs::exists(lock_path));
+
+    {
+        std::ofstream stale(lock_path);
+        stale << "99999999";
+    }
+    REQUIRE_FALSE(first_probe.held_by_live_process());
+    REQUIRE(fs::exists(lock_path));
+    fs::remove(lock_path);
+    fs::remove_all(tmp);
+}
+
 TEST_CASE("Lock breaks stale lock from dead PID", "[unit][lock]") {
     auto tmp = lock_test_dir("stale_holder");
     auto lock_path = tmp / "test.lock";

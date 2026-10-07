@@ -2,6 +2,7 @@
 
 #include "db/connection.h"
 #include "db/schema.h"
+#include "db/owned_nodes.h"
 #include <cmath>
 #include <cstdint>
 #include <atomic>
@@ -17,6 +18,7 @@ struct PageRankOptions {
     double damping = 0.85;
     int max_iterations = 20;
     double tolerance = 1e-5;
+    bool scope_to_owned_files = false;
 };
 
 struct EdgeWeight {
@@ -49,8 +51,27 @@ inline int compute_and_persist_pagerank(Connection& conn,
     const char* sql =
         "SELECT src_id, dst_id, confidence FROM edges "
         "WHERE kind IN ('calls', 'inherits', 'references') AND src_id != dst_id";
-    if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        return 0;
+    if (options.scope_to_owned_files) {
+        conn.exec("DROP TABLE IF EXISTS temp.__ct_pagerank_scope");
+        conn.exec("CREATE TEMP TABLE __ct_pagerank_scope(id INTEGER PRIMARY KEY)");
+        conn.exec(
+            "INSERT OR IGNORE INTO temp.__ct_pagerank_scope(id) "
+            "SELECT n.id FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id "
+            "ON n.file_id=f.id");
+        conn.exec(
+            "INSERT OR IGNORE INTO temp.__ct_pagerank_scope(id) SELECT owned.id FROM (" +
+            std::string(db::owned_file_nodes_sql) + ") owned");
+        sql =
+            "SELECT e.src_id,e.dst_id,e.confidence FROM temp.__ct_pagerank_scope s "
+            "CROSS JOIN edges e INDEXED BY idx_edges_src "
+            "WHERE e.src_id=s.id AND e.kind IN ('calls','inherits','references') "
+            "AND e.src_id!=e.dst_id";
+    }
+    int prepare_rc = sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr);
+    if (prepare_rc != SQLITE_OK) {
+        auto error = std::string(sqlite3_errmsg(conn.raw()));
+        if (options.scope_to_owned_files) conn.exec("DROP TABLE temp.__ct_pagerank_scope");
+        throw SqliteError(prepare_rc, "PageRank edge query failed: " + error);
     }
 
     std::unordered_map<int64_t, uint32_t> id_to_idx;
@@ -73,7 +94,8 @@ inline int compute_and_persist_pagerank(Connection& conn,
     std::vector<RawEdge> raw_edges;
 
     int64_t loaded_edges = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int read_rc;
+    while ((read_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         int64_t src = sqlite3_column_int64(stmt, 0);
         int64_t dst = sqlite3_column_int64(stmt, 1);
         double conf = sqlite3_column_double(stmt, 2);
@@ -86,6 +108,11 @@ inline int compute_and_persist_pagerank(Connection& conn,
         }
     }
     sqlite3_finalize(stmt);
+    if (options.scope_to_owned_files) conn.exec("DROP TABLE temp.__ct_pagerank_scope");
+    if (read_rc != SQLITE_DONE) {
+        throw SqliteError(read_rc,
+            "PageRank edge read failed: " + std::string(sqlite3_errmsg(conn.raw())));
+    }
 
     const size_t num_nodes = idx_to_id.size();
     if (num_nodes == 0) return 0;
@@ -203,8 +230,8 @@ inline int compute_and_persist_pagerank(Connection& conn,
         }
     });
     conn.exec(
-        "UPDATE nodes SET rank = temp_pagerank.rank "
-        "FROM temp_pagerank WHERE nodes.id = temp_pagerank.id");
+        "UPDATE nodes SET rank = (SELECT rank FROM temp_pagerank WHERE id=nodes.id) "
+        "WHERE nodes.id IN (SELECT id FROM temp_pagerank)");
     update_done.store(true, std::memory_order_relaxed);
     if (pr_hb.joinable()) pr_hb.join();
     conn.exec("DROP TABLE IF EXISTS temp_pagerank");

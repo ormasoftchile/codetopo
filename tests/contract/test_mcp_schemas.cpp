@@ -63,6 +63,8 @@ TEST_CASE("repo_stats response has required fields", "[contract][us2]") {
         REQUIRE_FALSE(yyjson_get_bool(yyjson_obj_get(r, "graph_counts_checked")));
         REQUIRE(yyjson_obj_get(r, "last_index_time") != nullptr);
         REQUIRE(yyjson_obj_get(r, "indexer_version") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "ownership_status") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "index_status") != nullptr);
     }
     fs::remove_all(db_path.parent_path());
 }
@@ -84,6 +86,10 @@ TEST_CASE("server_info response has required fields", "[contract][us2]") {
         REQUIRE(yyjson_obj_get(r, "indexer_version") != nullptr);
         REQUIRE(yyjson_obj_get(r, "capabilities") != nullptr);
         REQUIRE(yyjson_obj_get(r, "db_status") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "ownership_status") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "index_status") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "freshness_status") != nullptr);
+        REQUIRE(yyjson_obj_get(r, "stale") != nullptr);
     }
     fs::remove_all(db_path.parent_path());
 }

@@ -120,7 +120,8 @@ int main(int argc, char** argv) {
     int mcp_tool_timeout = 10;
     int mcp_idle_timeout = 0;
 
-    sub_mcp->add_option("--root", mcp_root, "Repository root directory")->default_val(".");
+    auto* mcp_root_option =
+        sub_mcp->add_option("--root", mcp_root, "Repository root directory")->default_val(".");
     sub_mcp->add_option("--db", mcp_db, "Database path (default: <root>/.codetopo/index.sqlite)");
     sub_mcp->add_option("--tool-timeout", mcp_tool_timeout, "Tool timeout in seconds")->default_val(10);
     sub_mcp->add_option("--idle-timeout", mcp_idle_timeout, "Idle timeout in seconds (0=disable, default for editor stdio)")->default_val(0);
@@ -144,7 +145,8 @@ int main(int argc, char** argv) {
     std::string watch_root = ".";
     std::string watch_db;
 
-    sub_watch->add_option("--root", watch_root, "Repository root directory")->default_val(".");
+    auto* watch_root_option =
+        sub_watch->add_option("--root", watch_root, "Repository root directory")->default_val(".");
     sub_watch->add_option("--db", watch_db, "Database path (default: <root>/.codetopo/index.sqlite)");
 
     // --- query subcommand ---
@@ -154,7 +156,8 @@ int main(int argc, char** argv) {
     std::string query_tool;
     std::string query_params = "{}";
 
-    sub_query->add_option("--root", query_root, "Repository root directory")->default_val(".");
+    auto* query_root_option =
+        sub_query->add_option("--root", query_root, "Repository root directory")->default_val(".");
     sub_query->add_option("--db", query_db, "Database path (default: <root>/.codetopo/index.sqlite)");
     sub_query->add_option("tool", query_tool, "Tool name")->required();
     sub_query->add_option("params", query_params, "JSON parameters")->default_val("{}");
@@ -348,7 +351,8 @@ int main(int argc, char** argv) {
         try {
             return codetopo::run_mcp(mcp_db, mcp_root, mcp_tool_timeout,
                                      mcp_idle_timeout, freshness, mcp_debounce,
-                                     mcp_watch, mcp_trajectory_log);
+                                     mcp_watch, mcp_trajectory_log,
+                                     mcp_root_option->count() > 0);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
@@ -357,7 +361,8 @@ int main(int argc, char** argv) {
     if (sub_watch->parsed()) {
         if (watch_db.empty()) watch_db = codetopo::default_db(watch_root);
         try {
-            return codetopo::run_watch(watch_root, watch_db);
+            return codetopo::run_watch(
+                watch_root, watch_db, watch_root_option->count() > 0);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;
@@ -366,7 +371,9 @@ int main(int argc, char** argv) {
     if (sub_query->parsed()) {
         if (query_db.empty()) query_db = codetopo::default_db(query_root);
         try {
-            return codetopo::run_query(query_db, query_tool, query_params);
+            return codetopo::run_query(
+                query_db, query_tool, query_params,
+                query_root, query_root_option->count() > 0);
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";
             return 1;

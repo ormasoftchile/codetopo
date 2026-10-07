@@ -4,11 +4,12 @@
 #include "db/connection.h"
 #include "db/schema.h"
 #include "db/workspace.h"
+#include "index/ownership.h"
+#include "mcp/reindex.h"
 #include "mcp/server.h"
 #include "mcp/tools.h"
 #include "util/log.h"
 #include "util/lock.h"
-#include "util/process.h"
 #include "util/git.h"
 #include "watch/watcher.h"
 #include <iostream>
@@ -25,141 +26,6 @@
 #include <unordered_set>
 
 namespace codetopo {
-
-// R8: Manages a spawned child indexer — deduplicates rapid triggers, monitors completion.
-struct ReindexState {
-    std::mutex mutex;
-    std::atomic<bool> running{false};
-    bool queued = false;
-    bool queued_full = false;
-    std::unordered_set<std::string> queued_paths;
-    std::thread monitor_thread;
-    std::atomic<uint64_t> list_counter{0};
-    std::atomic<bool> stopping{false};
-    std::mutex* writer_gate = nullptr;
-
-    ~ReindexState() { stop(); }
-
-    void stop() {
-        stopping = true;
-        if (monitor_thread.joinable()) {
-            mcp_log("shutdown: draining index child");
-            monitor_thread.join();
-        }
-    }
-
-    void trigger(const std::string& root, const std::string& db,
-                 std::function<void()> on_complete,
-                 const std::vector<std::string>& paths = {},
-                 bool full_reindex = false) {
-        {
-            std::lock_guard<std::mutex> lk(mutex);
-            if (stopping) return;
-            queued = true;
-            queued_full = queued_full || full_reindex || paths.empty();
-            if (queued_full) {
-                queued_paths.clear();
-            } else {
-                queued_paths.insert(paths.begin(), paths.end());
-            }
-            if (running) {
-                mcp_log("reindex: already running, queued");
-                return;
-            }
-            running = true;
-        }
-
-        if (monitor_thread.joinable()) monitor_thread.join();
-        monitor_thread = std::thread([=, this]() {
-            namespace fs = std::filesystem;
-            try {
-            std::unique_lock<std::mutex> gate;
-            if (writer_gate) {
-                gate = std::unique_lock<std::mutex>(*writer_gate, std::defer_lock);
-                while (!gate.try_lock()) {
-                    if (stopping) { running = false; return; }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                }
-            }
-            while (true) {
-                bool run_full = false;
-                std::unordered_set<std::string> run_paths;
-                {
-                    std::lock_guard<std::mutex> lk(mutex);
-                    if (!queued || stopping) {
-                        running = false;
-                        break;
-                    }
-                    run_full = queued_full;
-                    run_paths = queued_paths;
-                    queued = false;
-                    queued_full = false;
-                    queued_paths.clear();
-                }
-
-                if (!run_full && run_paths.empty()) run_full = true;
-
-                std::optional<fs::path> changed_file;
-                std::vector<std::string> args = {"index", "--root", root, "--db", db};
-                if (!run_full) {
-                    std::error_code ec;
-                    auto dir = fs::path(root) / ".codetopo";
-                    fs::create_directories(dir, ec);
-                    if (!ec) {
-                        auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count();
-                        auto seq = list_counter.fetch_add(1, std::memory_order_relaxed);
-                        auto path = dir / ("changed-files-" + std::to_string(now) + "-"
-                                           + std::to_string(seq) + ".lst");
-                        std::ofstream out(path, std::ios::trunc);
-                        if (out) {
-                            for (const auto& p : run_paths) out << p << '\n';
-                            out.close();
-                            if (out) changed_file = path;
-                        }
-                    }
-                    if (changed_file) {
-                        args.push_back("--changed-file");
-                        args.push_back(changed_file->string());
-                    } else {
-                        run_full = true;
-                        mcp_log("reindex: could not write changed-file list; falling back to full");
-                    }
-                }
-
-                auto started = std::chrono::steady_clock::now();
-                mcp_log(run_full ? "reindex: started (full)"
-                                  : "reindex: started (targeted, "
-                                      + std::to_string(run_paths.size()) + " paths)");
-                auto exe = get_self_executable_path();
-                int rc = spawn_and_wait(exe, args);
-                if (changed_file) {
-                    std::error_code ec;
-                    fs::remove(*changed_file, ec);
-                }
-                auto elapsed = std::chrono::steady_clock::now() - started;
-                if (rc == 0) {
-                    mcp_log("reindex: done (" + format_duration_seconds(elapsed) + ")");
-                    if (on_complete) on_complete();
-                } else {
-                    mcp_log("reindex: failed (" + format_duration_seconds(elapsed)
-                            + ", exit=" + std::to_string(rc) + ")");
-                }
-            }
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(mutex);
-                running = false;
-                queued = false;
-                mcp_log("reindex: worker failed: " + truncate_for_log(e.what()));
-            } catch (...) {
-                std::lock_guard<std::mutex> lk(mutex);
-                running = false;
-                queued = false;
-                mcp_log("reindex: worker failed: unknown error");
-            }
-        });
-    }
-};
 
 inline std::vector<std::string> split_git_paths(const std::string& output) {
     std::vector<std::string> paths;
@@ -232,23 +98,41 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                    FreshnessPolicy freshness = FreshnessPolicy::normal,
                    int debounce_ms = 1000,
                    bool watch = false,
-                   const std::string& trajectory_log = "") try {
+                   const std::string& trajectory_log = "",
+                   bool root_was_explicit = true) try {
     namespace fs = std::filesystem;
     const auto startup_started = std::chrono::steady_clock::now();
+    const auto startup_wall_time = std::chrono::system_clock::now();
     mcp_log("lifecycle: startup");
-
-    // Warn about legacy workspace.sqlite — it is no longer used.
-    {
-        std::string legacy_ws = (fs::path(root_hint) / ".codetopo" / "workspace.sqlite").string();
-        if (fs::exists(legacy_ws)) {
-            mcp_log("warning: workspace.sqlite is no longer used. Run 'codetopo workspace add <path> --root "
-                    + root_hint + "' to re-add extra roots into index.sqlite.");
-        }
-    }
 
     if (!fs::exists(db_path)) {
         mcp_log("shutdown: startup_error database not found: " + db_path);
         return 1;
+    }
+    std::error_code db_ec;
+    auto canonical_db = fs::canonical(db_path, db_ec);
+    if (db_ec) {
+        mcp_log("shutdown: startup_error cannot canonicalize database: " + db_path);
+        return 1;
+    }
+    std::string resolved_db_path = canonical_db.string();
+
+    index_ownership::RootResolution root_resolution;
+    {
+        Connection probe(resolved_db_path, true);
+        root_resolution = index_ownership::resolve_primary_root(
+            probe, root_hint, root_was_explicit, resolved_db_path);
+    }
+    std::string repo_root = root_resolution.root.string();
+
+    // Warn about legacy workspace.sqlite — it is no longer used.
+    {
+        std::string legacy_ws =
+            (root_resolution.root / ".codetopo" / "workspace.sqlite").string();
+        if (fs::exists(legacy_ws)) {
+            mcp_log("warning: workspace.sqlite is no longer used. Run 'codetopo workspace add <path> --root "
+                    + repo_root + "' to re-add extra roots into index.sqlite.");
+        }
     }
 
     // Schema version: migrate an older DB IN PLACE here instead of forcing a full
@@ -259,7 +143,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     {
         int version = 0;
         {
-            Connection probe(db_path, true);  // read-only
+            Connection probe(resolved_db_path, true);  // read-only
             version = schema::get_schema_version(probe);
         }
         if (version > CURRENT_SCHEMA_VERSION) {
@@ -272,14 +156,14 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         // Older/empty DBs would require a destructive rebuild, so leave those to
         // the read-only guard below (the user should reindex).
         if (version >= 3 && version < CURRENT_SCHEMA_VERSION) {
-            auto lock_path = db_path;
+            auto lock_path = resolved_db_path;
             lock_path += ".lock";
             FileLock lock(lock_path);
             if (lock.acquire()) {
                 mcp_log("schema: migrating db=" + std::to_string(version) + " -> "
                         + std::to_string(CURRENT_SCHEMA_VERSION) + " in place (no reindex)");
                 {
-                    Connection wconn(db_path);  // read-write
+                    Connection wconn(resolved_db_path);  // read-write
                     int rc = schema::ensure_schema(wconn);
                     if (rc != 0) {
                         lock.release();
@@ -296,14 +180,14 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                         + std::to_string(lock.holder_pid()) + ") to migrate");
                 for (int i = 0; i < 300 && version != CURRENT_SCHEMA_VERSION; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    Connection probe(db_path, true);
+                    Connection probe(resolved_db_path, true);
                     version = schema::get_schema_version(probe);
                 }
             }
         }
     }
 
-    Connection conn(db_path, true);  // read-only
+    Connection conn(resolved_db_path, true);  // read-only
 
     // Schema version check
     int version = schema::get_schema_version(conn);
@@ -313,7 +197,13 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         return 3;
     }
 
-    auto repo_root = schema::get_kv(conn, "repo_root", ".");
+    root_resolution = index_ownership::resolve_primary_root(
+        conn, repo_root, true, resolved_db_path);
+    repo_root = root_resolution.root.string();
+    if (!root_resolution.metadata_present) {
+        mcp_log("index ownership: repo_root metadata missing; the configured --root is authoritative "
+                "and the first full reconciliation will not prune deletions");
+    }
     std::string last_known_head = get_git_head(repo_root);
     if (last_known_head.empty()) {
         last_known_head = schema::get_kv(conn, "git_head", "");
@@ -326,10 +216,15 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     std::mutex writer_gate;
     McpServer server(conn, repo_root, tool_timeout, idle_timeout, &writer_gate);
     ReindexState reindex;
+    std::atomic<bool> ownership_established{root_resolution.metadata_present};
     reindex.writer_gate = &writer_gate;
     server.set_indexing_flag(&reindex.running);
-    if (freshness == FreshnessPolicy::eager || freshness == FreshnessPolicy::normal) {
-        reindex.trigger(repo_root, db_path, [&]() { server.request_refresh(); });
+    if (freshness_reconciles_on_startup(freshness)) {
+        reindex.trigger(repo_root, resolved_db_path,
+            [&]() {
+                ownership_established = true;
+                server.request_refresh();
+            }, {}, true, ReindexReason::startup, startup_wall_time);
     }
     // lazy and off: no startup reindex
 
@@ -366,7 +261,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     };
 
     server.register_tool("server_info", tools::server_info,
-        "Get server capabilities, schema version, database path, and uptime.",
+        "Get server capabilities, schema version, root ownership, and explicit index freshness state.",
         R"J({"type":"object","properties":{}})J");
 
     server.register_tool("repo_stats", tools::repo_stats,
@@ -498,11 +393,13 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","properties":{"caller":{"type":"string","description":"Optional substring filter for caller_name"},"callee":{"type":"string","description":"Optional substring filter for callee_name"},"min_count":{"type":"integer","description":"Minimum call_count filter (default 0)"},"limit":{"type":"integer","description":"Max results (default 50, max 500)"}}})J");
 
     server.register_tool("reindex",
-        [&reindex, &repo_root, &db_path, &server](yyjson_val* /*params*/, Connection& /*conn*/,
+        [&reindex, &repo_root, &resolved_db_path, &server,
+         &ownership_established](yyjson_val* /*params*/, Connection& /*conn*/,
                                           QueryCache& /*cache*/, const std::string& /*root*/) -> std::string {
-            reindex.trigger(repo_root, db_path, [&server]() {
+            reindex.trigger(repo_root, resolved_db_path, [&server, &ownership_established]() {
+                ownership_established = true;
                 server.request_refresh();
-            });
+            }, {}, true, ReindexReason::manual);
             return R"({"status":"started","message":"Re-indexing in background. Queries will reflect updated state once complete."})";
         },
         "Trigger a re-index of the repository. Runs in the background — subsequent tool calls will use fresh data once complete. Call this after making file changes (renames, moves, extractions) to ensure the index is up to date.",
@@ -531,7 +428,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         "Request cancellation at the next safe phase boundary. Running index children and merge/removal finish safely; timeout alone does not cancel.",
         R"J({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]})J");
     server.register_tool("server_health", {},
-        "In-memory readiness probe: ready or explicit busy, no graph counts or integrity scan.",
+        "Metadata-only readiness probe: ready, busy, or degraded for missing/interrupted index metadata.",
         R"J({"type":"object","properties":{}})J");
 
     server.register_tool("graph_quality", tools::graph_quality,
@@ -549,7 +446,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     mcp_log("codetopo mcp started");
     mcp_log("lifecycle: ready elapsed=" +
         format_duration_seconds(std::chrono::steady_clock::now() - startup_started));
-    mcp_log("db: " + db_path);
+    mcp_log("db: " + resolved_db_path);
     mcp_log("repo: " + repo_root);
     mcp_log("schema: v" + std::to_string(version) + "  tools: " + std::to_string(server.tool_count()));
 
@@ -560,7 +457,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     // infinite reindex loop (indexer writes to .codetopo/index.sqlite which the
     // watcher would see as a change, triggering another reindex, ad infinitum).
     std::unique_ptr<Watcher> watcher;
-    if (watch && freshness != FreshnessPolicy::off) {
+    if (watch && freshness_allows_watching(freshness)) {
         auto debounce = std::chrono::milliseconds(debounce_ms);
         watcher = std::make_unique<Watcher>(
             repo_root,
@@ -611,15 +508,20 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                 }
 
                 if (!fallback_full && changed_paths.empty()) return;
+                if (!ownership_established.load()) {
+                    fallback_full = true;
+                    changed_paths.clear();
+                }
 
                 mcp_log(fallback_full
                     ? "watcher: change detected, triggering full reindex"
                     : "watcher: change detected, triggering targeted reindex ("
                         + std::to_string(changed_paths.size()) + " paths)");
-                reindex.trigger(repo_root, db_path, [&]() {
+                reindex.trigger(repo_root, resolved_db_path, [&]() {
+                    ownership_established = true;
                     server.request_refresh();
                     mcp_log("watcher: reindex complete, cache invalidated");
-                }, changed_paths, fallback_full);
+                }, changed_paths, fallback_full, ReindexReason::watcher);
             },
             debounce
         );
@@ -645,7 +547,9 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
 
 // T076: Wire cmd_query — CLI wrapper for tool invocations.
 inline int run_query(const std::string& db_path, const std::string& tool_name,
-                      const std::string& params_json) {
+                     const std::string& params_json,
+                     const std::string& root_hint = ".",
+                     bool root_was_explicit = false) {
     namespace fs = std::filesystem;
 
     if (!fs::exists(db_path)) {
@@ -653,8 +557,16 @@ inline int run_query(const std::string& db_path, const std::string& tool_name,
         return 1;
     }
 
-    Connection conn(db_path, true);
-    auto repo_root = schema::get_kv(conn, "repo_root", ".");
+    std::error_code ec;
+    auto canonical_db = fs::canonical(db_path, ec);
+    if (ec) {
+        mcp_log("error: cannot canonicalize database: " + db_path);
+        return 1;
+    }
+    Connection conn(canonical_db.string(), true);
+    auto resolution = index_ownership::resolve_primary_root(
+        conn, root_hint, root_was_explicit, canonical_db.string());
+    auto repo_root = resolution.root.string();
     QueryCache cache(conn);
 
     // Parse params

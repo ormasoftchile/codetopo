@@ -125,6 +125,17 @@ public:
     bool was_stale_broken() const { return stale_broken_; }
     int64_t holder_pid() const { return holder_pid_; }
 
+    // Observe writer ownership without creating, deleting, or holding the lock.
+    // An empty/newly-created lock is treated as active to close the creator race.
+    bool held_by_live_process() {
+        holder_pid_ = 0;
+        if (!std::filesystem::exists(path_)) return false;
+        auto pid = read_pid();
+        if (pid <= 0) return true;
+        holder_pid_ = pid;
+        return is_process_alive(pid);
+    }
+
 private:
     std::filesystem::path path_;
     bool held_ = false;

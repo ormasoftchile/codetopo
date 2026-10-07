@@ -7,6 +7,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 
 namespace codetopo {

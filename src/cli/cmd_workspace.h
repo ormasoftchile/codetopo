@@ -2,6 +2,7 @@
 
 #include "db/workspace.h"
 #include "core/config.h"
+#include "index/ownership.h"
 #include "util/lock.h"
 #include "util/log.h"
 #include "util/repo.h"
@@ -39,6 +40,26 @@ inline void print_workspace_lock_error(const FileLock& lock, int lock_timeout_s)
         std::to_string(timeout_s) + "s)", stderr_is_tty()) << "\n";
 }
 
+inline bool validate_workspace_primary(
+    const std::string& db_path,
+    const std::string& repo_root) {
+    try {
+        Connection conn(db_path, true);
+        auto resolution = index_ownership::resolve_primary_root(
+            conn, repo_root, true, db_path);
+        if (!resolution.metadata_present) {
+            throw std::runtime_error(
+                "Primary index has no repo_root ownership metadata. Complete a full "
+                "primary index before changing extra workspace roots.");
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << stderr_bold_red(
+            std::string("ERROR: ") + e.what(), stderr_is_tty()) << "\n";
+        return false;
+    }
+}
+
 inline int run_workspace_add(const std::string& root_str, const std::string& target_path,
                              const Config& cfg, int lock_timeout_s = 30) {
     namespace fs = std::filesystem;
@@ -54,7 +75,6 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
                   << "\n";
         return 1;
     }
-
     // Acquire the same lock the indexer and MCP server use, so a running
     // `codetopo mcp --watch` (or index) can't write concurrently and corrupt
     // the DB / balloon the WAL during the merge.
@@ -67,6 +87,7 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
     if (lock.was_stale_broken()) {
         std::cerr << "WARN: Broke stale lock from dead process\n";
     }
+    if (!validate_workspace_primary(db_path, repo_root)) return 1;
 
     try {
         WorkspaceDB ws(db_path);
@@ -95,7 +116,6 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
         std::cerr << stderr_bold_red("ERROR: No index.sqlite found at " + db_path, stderr_is_tty()) << "\n";
         return 1;
     }
-
     auto lock_path = db_path + ".lock";
     FileLock lock(lock_path);
     if (!acquire_workspace_lock(lock, lock_timeout_s)) {
@@ -105,6 +125,7 @@ inline int run_workspace_remove(const std::string& root_str, const std::string& 
     if (lock.was_stale_broken()) {
         std::cerr << "WARN: Broke stale lock from dead process\n";
     }
+    if (!validate_workspace_primary(db_path, repo_root)) return 1;
 
     try {
         WorkspaceDB ws(db_path);
@@ -130,10 +151,10 @@ inline int run_workspace_list(const std::string& root_str) {
         std::cout << "No index found (no index.sqlite found).\n";
         return 0;
     }
-
     try {
         FileLock writer(db_path + ".lock");
         if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
+        if (!validate_workspace_primary(db_path, repo_root)) return 1;
         WorkspaceDB ws(db_path);
         auto roots = ws.list_roots();
 
