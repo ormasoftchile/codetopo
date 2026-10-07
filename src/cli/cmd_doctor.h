@@ -2,6 +2,8 @@
 
 #include "db/connection.h"
 #include "db/schema.h"
+#include "index/ownership.h"
+#include "util/lock.h"
 #include <iostream>
 #include <filesystem>
 #include <sqlite3.h>
@@ -54,6 +56,9 @@ inline int run_doctor(const std::string& db_path) {
     auto idx_version = schema::get_kv(const_cast<Connection&>(conn), "indexer_version", "unknown");
     auto last_index = schema::get_kv(const_cast<Connection&>(conn), "last_index_time", "never");
     auto repo_root = schema::get_kv(const_cast<Connection&>(conn), "repo_root", "unknown");
+    FileLock writer_probe(db_path + ".lock");
+    bool writer_active = writer_probe.held_by_live_process();
+    auto metadata = index_ownership::inspect_metadata(conn, writer_active);
 
     bool healthy = (integrity == "ok" && fk_violations == 0);
 
@@ -61,6 +66,8 @@ inline int run_doctor(const std::string& db_path) {
     std::cout << "schema_version: " << version << "\n";
     std::cout << "indexer_version: " << idx_version << "\n";
     std::cout << "repo_root: " << repo_root << "\n";
+    std::cout << "ownership_status: " << metadata.ownership << "\n";
+    std::cout << "index_status: " << metadata.index << "\n";
     std::cout << "last_index_time: " << last_index << "\n";
     std::cout << "integrity_check: " << integrity << "\n";
     std::cout << "foreign_key_violations: " << fk_violations << "\n";

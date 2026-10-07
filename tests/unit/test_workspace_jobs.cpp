@@ -32,6 +32,12 @@ struct JobFixture {
     }
 };
 
+void stamp_source_index(Connection& conn, const fs::path& root) {
+    schema::set_kv(conn, "repo_root", fs::canonical(root).string());
+    schema::set_kv(conn, "index_state", "current");
+    schema::set_kv(conn, "last_index_time", "2026-10-06T00:00:00Z");
+}
+
 std::string await_job(WorkspaceJobs& jobs, const std::string& id) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (jobs.active() && std::chrono::steady_clock::now() < deadline)
@@ -397,6 +403,7 @@ TEST_CASE("Committed graph reads overlap real workspace replacement through comm
                     "VALUES(1,'merged.c','c',10,1,'hash','ok')");
         source.exec("INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
                     "VALUES(1,'symbol',1,'function','oldSymbol','merged-symbol')");
+        stamp_source_index(source, fixture.extra);
     }
     Config cfg;
     {
@@ -478,6 +485,10 @@ TEST_CASE("Workspace scoped name lookup resolves both cross-root directions", "[
     seed(fixture.db, "primaryTarget", "mergedTarget");
     auto source = (fixture.extra / ".codetopo" / "index.sqlite").string();
     seed(source, "mergedTarget", "receiver.primaryTarget");
+    {
+        Connection source_conn(source);
+        stamp_source_index(source_conn, fixture.extra);
+    }
     WorkspaceDB workspace(fixture.db);
     Config cfg;
     auto added = workspace.add_root(fixture.extra.string(), cfg);
@@ -514,6 +525,7 @@ TEST_CASE("Workspace rejects unsafe nested source indexes before mutation", "[un
     {
         Connection source(fixture.extra / ".codetopo" / "index.sqlite");
         schema::ensure_schema(source);
+        stamp_source_index(source, fixture.extra);
         source.exec("INSERT INTO roots(path,added_at) VALUES('nested-root',datetime('now'))");
     }
     WorkspaceDB workspace(fixture.db);
@@ -540,6 +552,7 @@ TEST_CASE("Cached source merge excludes competing writers through detach", "[uni
                     "VALUES(1,'cached.c','c',10,1,'hash','ok')");
         source.exec("INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
                     "VALUES(1,'symbol',1,'function','cachedSymbol','cached-symbol')");
+        stamp_source_index(source, fixture.extra);
     }
     SourceAdmissionProbe probe{source_db + ".lock"};
     std::unique_ptr<WorkspaceDB> workspace;

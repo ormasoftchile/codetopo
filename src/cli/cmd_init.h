@@ -161,11 +161,12 @@ inline bool write_workspace_mcp_config(const std::filesystem::path& config_path,
     yyjson_mut_obj_add_strcpy(doc, entry, "command",
         exe_path.empty() ? "codetopo" : exe_path.c_str());
 
-    // Workspace-local configs use relative root "."
+    // Hosts need not launch the server from the workspace directory.
+    auto repo_root = std::filesystem::absolute(config_path).parent_path().parent_path().lexically_normal().string();
     auto* args = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, args, "mcp");
     yyjson_mut_arr_add_str(doc, args, "--root");
-    yyjson_mut_arr_add_str(doc, args, ".");
+    yyjson_mut_arr_add_strcpy(doc, args, repo_root.c_str());
     if (watch) {
         yyjson_mut_arr_add_str(doc, args, "--watch");
     }
@@ -182,8 +183,8 @@ inline bool write_workspace_mcp_config(const std::filesystem::path& config_path,
 
 // Write/update the project-scoped .mcp.json at the repo root.
 // Format: { "mcpServers": { "codetopo": { "command": ..., "args": [...] } } }
-// This is the cross-agent standard location (Claude Code and others). Uses a
-// relative --root . since the config lives at the project root. Merges with
+// This is the cross-agent standard location (Claude Code and others). Uses an
+// absolute repository root independent of the host's working directory. Merges with
 // existing mcpServers entries — does not clobber them.
 inline bool write_root_mcp_config(const std::filesystem::path& repo_root,
                                   bool watch, const std::string& freshness) {
@@ -214,11 +215,11 @@ inline bool write_root_mcp_config(const std::filesystem::path& repo_root,
     yyjson_mut_obj_add_strcpy(doc, entry, "command",
         exe_path.empty() ? "codetopo" : exe_path.c_str());
 
-    // Relative --root . — config lives at the project root.
+    auto root_arg = std::filesystem::absolute(repo_root).lexically_normal().string();
     auto* args = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, args, "mcp");
     yyjson_mut_arr_add_str(doc, args, "--root");
-    yyjson_mut_arr_add_str(doc, args, ".");
+    yyjson_mut_arr_add_strcpy(doc, args, root_arg.c_str());
     if (watch) {
         yyjson_mut_arr_add_str(doc, args, "--watch");
     }
@@ -235,7 +236,7 @@ inline bool write_root_mcp_config(const std::filesystem::path& repo_root,
 
 // Write/update the Copilot CLI project-local MCP config at {repo_root}/.github/mcp.json.
 // Format: { "mcpServers": { "codetopo": { "type": "local", "command": ..., "args": [...], "env": {}, "tools": ["*"] } } }
-// Uses relative --root . since the config lives in the project alongside the workspace.
+// Uses an absolute repository root independent of the host's working directory.
 // Merges with existing mcpServers entries — does not clobber them.
 inline bool write_copilot_cli_mcp_config(const std::filesystem::path& repo_root,
                                           bool watch, const std::string& freshness) {
@@ -271,11 +272,11 @@ inline bool write_copilot_cli_mcp_config(const std::filesystem::path& repo_root,
     yyjson_mut_obj_add_strcpy(doc, entry, "command",
         exe_path.empty() ? "codetopo" : exe_path.c_str());
 
-    // Use relative --root . — config lives in the project root.
+    auto root_arg = fs::absolute(repo_root).lexically_normal().string();
     auto* args = yyjson_mut_arr(doc);
     yyjson_mut_arr_add_str(doc, args, "mcp");
     yyjson_mut_arr_add_str(doc, args, "--root");
-    yyjson_mut_arr_add_str(doc, args, ".");
+    yyjson_mut_arr_add_strcpy(doc, args, root_arg.c_str());
     if (watch) {
         yyjson_mut_arr_add_str(doc, args, "--watch");
     }
@@ -554,8 +555,8 @@ inline int run_init(const std::string& root_str,
     // Always write the two project-scoped configs, regardless of --editors:
     //   .mcp.json        — cross-agent standard at the repo root (Claude Code, etc.)
     //   .vscode/mcp.json — VS Code
-    // Both are committed with the project and use a relative --root, so no
-    // user-level/global config is ever touched.
+    // Both use an absolute --root independent of the client's launch directory;
+    // no user-level/global config is ever touched.
     if (write_root_mcp_config(repo_root, watch, freshness)) {
         written_configs.push_back(".mcp.json");
     } else {

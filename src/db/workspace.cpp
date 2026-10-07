@@ -4,6 +4,7 @@
 // Uses identical table names so the MCP server works unchanged.
 
 #include "db/workspace.h"
+#include "index/ownership.h"
 #include "db/schema.h"
 #include "db/fts.h"
 #include "index/pagerank.h"
@@ -337,6 +338,18 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
     FileLock source_writer(root_index + ".lock");
     if (!source_writer.acquire())
         throw std::runtime_error("Source index busy: another indexer holds the writer lock");
+    {
+        Connection source_probe(root_index, true);
+        auto source_owner = index_ownership::resolve_primary_root(
+            source_probe, abs_root, true, root_index);
+        auto source_status = index_ownership::inspect_metadata(source_probe, false);
+        if (!source_owner.metadata_present || source_status.index != "current") {
+            throw std::runtime_error(
+                "Source index ownership/completion is not verified for " + abs_root +
+                " (index_status=" + source_status.index +
+                "). Complete a full source index before merging it.");
+        }
+    }
     if (phase) phase("merging");
 
     // ATTACH reads the source WAL snapshot; no blocking truncation is required.
@@ -423,7 +436,9 @@ WorkspaceDB::AddResult WorkspaceDB::add_root(const std::string& root_path, const
 
     auto pagerank_phase = WorkspaceClock::now();
     log_workspace_line("computing workspace graph centrality...", color_output);
-    int ranked = compute_and_persist_pagerank(conn_);
+    PageRankOptions ranking;
+    ranking.scope_to_owned_files = true;
+    int ranked = compute_and_persist_pagerank(conn_, ranking);
     log_workspace_phase("centrality computed", pagerank_phase, color_output,
                         "(" + format_with_commas(ranked) + " symbols)");
 

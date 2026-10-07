@@ -102,7 +102,8 @@ private:
     void load_existing() {
         sqlite3_stmt* stmt = nullptr;
         int rc = sqlite3_prepare_v2(conn_.raw(),
-            "SELECT id, path, mtime_ns, size_bytes, content_hash FROM files",
+            "SELECT id, path, mtime_ns, size_bytes, content_hash FROM files "
+            "WHERE root_id IS NULL",
             -1, &stmt, nullptr);
         if (rc != SQLITE_OK) return;
 

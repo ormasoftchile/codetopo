@@ -31,11 +31,21 @@ struct McpError {
     // Serialize to JSON-RPC error response
     std::string to_json_rpc(int64_t id) {
         JsonMutDoc doc;
+        return serialize(doc, doc.new_int(id));
+    }
+
+    std::string to_json_rpc_id(yyjson_val* id) {
+        JsonMutDoc doc;
+        return serialize(doc, id ? yyjson_val_mut_copy(doc.doc, id) : doc.new_null());
+    }
+
+private:
+    std::string serialize(JsonMutDoc& doc, yyjson_mut_val* id) {
         auto* root = doc.new_obj();
         doc.set_root(root);
 
         yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
-        yyjson_mut_obj_add_int(doc.doc, root, "id", id);
+        yyjson_mut_obj_add_val(doc.doc, root, "id", id);
 
         auto* err = doc.new_obj();
         yyjson_mut_obj_add_int(doc.doc, err, "code", json_rpc_code);

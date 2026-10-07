@@ -6,6 +6,7 @@
 #include "db/connection.h"
 #include "db/schema.h"
 #include "db/queries.h"
+#include "index/ownership.h"
 #include "util/log.h"
 #include "mcp/workspace_jobs.h"
 #include "mcp/stdio_input.h"
@@ -101,7 +102,7 @@ public:
 
             auto doc = json_parse(line);
             if (!doc) {
-                write_error(-1, -32700, "parse_error", "Failed to parse JSON");
+                write_error(nullptr, -32700, "parse_error", "Failed to parse JSON");
                 continue;
             }
 
@@ -110,7 +111,7 @@ public:
             auto* id_val = yyjson_obj_get(root, "id");
             auto* params_val = yyjson_obj_get(root, "params");
 
-            int64_t id = id_val ? yyjson_get_sint(id_val) : -1;
+            auto* id = id_val;
             const char* method = method_val ? yyjson_get_str(method_val) : nullptr;
 
             if (!method) {
@@ -146,13 +147,19 @@ public:
                 auto* root = response.new_obj();
                 response.set_root(root);
                 yyjson_mut_obj_add_str(response.doc, root, "jsonrpc", "2.0");
-                yyjson_mut_obj_add_int(response.doc, root, "id", id);
+                add_response_id(response, root, id);
                 yyjson_mut_obj_add_val(response.doc, root, "result", response.new_obj());
                 json_write_line(response.to_string());
                 continue;
             }
             if (method_str == "ping") {
-                write_result(id, "{}");
+                JsonMutDoc response;
+                auto* root = response.new_obj();
+                response.set_root(root);
+                yyjson_mut_obj_add_str(response.doc, root, "jsonrpc", "2.0");
+                add_response_id(response, root, id);
+                yyjson_mut_obj_add_val(response.doc, root, "result", response.new_obj());
+                json_write_line(response.to_string());
                 continue;
             }
             if (method_str == "notifications/cancelled") {
@@ -201,10 +208,38 @@ public:
                         } else {
                             std::unique_lock<std::mutex> gate(writer_gate_, std::try_to_lock);
                             FileLock probe(conn_.db_path() + ".lock");
-                            result = jobs_.active() || (indexing_ && indexing_->load()) ||
-                                !gate.owns_lock() || !probe.acquire()
-                                ? R"({"status":"busy","retryable":true,"reason":"indexing_or_workspace_job"})"
-                                : R"({"status":"ready","health_check":"in_memory","counts_checked":false})";
+                            bool busy = jobs_.active() ||
+                                (indexing_ && indexing_->load()) ||
+                                !gate.owns_lock() || probe.held_by_live_process();
+                            auto metadata = index_ownership::inspect_metadata(conn_, busy);
+                            JsonMutDoc health;
+                            auto* out = health.new_obj();
+                            health.set_root(out);
+                            if (busy) {
+                                yyjson_mut_obj_add_str(health.doc, out, "status", "busy");
+                                yyjson_mut_obj_add_bool(health.doc, out, "retryable", true);
+                                yyjson_mut_obj_add_str(
+                                    health.doc, out, "reason", "indexing_or_workspace_job");
+                            } else if (metadata.index == "missing_metadata" ||
+                                       metadata.index == "interrupted" ||
+                                       metadata.index == "incomplete" ||
+                                       metadata.index == "needs_reconciliation") {
+                                yyjson_mut_obj_add_str(health.doc, out, "status", "degraded");
+                                yyjson_mut_obj_add_bool(health.doc, out, "retryable", false);
+                                yyjson_mut_obj_add_strcpy(
+                                    health.doc, out, "reason", metadata.index.c_str());
+                            } else {
+                                yyjson_mut_obj_add_str(health.doc, out, "status", "ready");
+                            }
+                            yyjson_mut_obj_add_strcpy(
+                                health.doc, out, "ownership_status", metadata.ownership.c_str());
+                            yyjson_mut_obj_add_strcpy(
+                                health.doc, out, "index_status", metadata.index.c_str());
+                            yyjson_mut_obj_add_str(
+                                health.doc, out, "health_check", "metadata_only");
+                            yyjson_mut_obj_add_bool(
+                                health.doc, out, "counts_checked", false);
+                            result = health.to_string();
                         }
                         write_result(id, result);
                     } catch (const std::exception& e) {
@@ -352,13 +387,20 @@ private:
         data_version_ = version;
     }
 
-    void handle_initialize(int64_t id) {
+    static void add_response_id(JsonMutDoc& doc, yyjson_mut_val* root, yyjson_val* id) {
+        // JSON-RPC IDs can be strings; coercing them to integers strands the
+        // client's pending initialize request even though the server is ready.
+        yyjson_mut_obj_add_val(doc.doc, root, "id",
+            id ? yyjson_val_mut_copy(doc.doc, id) : doc.new_null());
+    }
+
+    void handle_initialize(yyjson_val* id) {
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
 
         yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
-        yyjson_mut_obj_add_int(doc.doc, root, "id", id);
+        add_response_id(doc, root, id);
 
         auto* result = doc.new_obj();
         yyjson_mut_obj_add_str(doc.doc, result, "protocolVersion", "2024-11-05");
@@ -425,13 +467,13 @@ private:
         json_write_line(doc.to_string());
     }
 
-    void handle_tools_list(int64_t id) {
+    void handle_tools_list(yyjson_val* id) {
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
 
         yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
-        yyjson_mut_obj_add_int(doc.doc, root, "id", id);
+        add_response_id(doc, root, id);
 
         auto* result = doc.new_obj();
         auto* tools_arr = doc.new_arr();
@@ -473,14 +515,14 @@ private:
         json_write_line(doc.to_string());
     }
 
-    void write_result(int64_t id, const std::string& content_json,
+    void write_result(yyjson_val* id, const std::string& content_json,
                        const StalenessState* staleness = nullptr) {
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
 
         yyjson_mut_obj_add_str(doc.doc, root, "jsonrpc", "2.0");
-        yyjson_mut_obj_add_int(doc.doc, root, "id", id);
+        add_response_id(doc, root, id);
 
         // MCP tool results are wrapped in content array
         auto* result = doc.new_obj();
@@ -509,7 +551,7 @@ private:
         json_write_line(doc.to_string());
     }
 
-    void write_error(int64_t id, int code, const std::string& error_code,
+    void write_error(yyjson_val* id, int code, const std::string& error_code,
                      const std::string& message, bool log_error = true) {
         if (log_error) {
             mcp_log("error: " + error_code + " (" + std::to_string(code) + "): "
@@ -519,7 +561,7 @@ private:
         err.json_rpc_code = code;
         err.error_code = error_code;
         err.message = message;
-        json_write_line(err.to_json_rpc(id));
+        json_write_line(err.to_json_rpc_id(id));
     }
 
     static std::string truncate_response(std::string_view tool_name, const std::string& json) {

@@ -10,6 +10,14 @@ namespace codetopo {
 
 enum class FreshnessPolicy { eager, normal, lazy, off };
 
+inline bool freshness_reconciles_on_startup(FreshnessPolicy policy) {
+    return policy == FreshnessPolicy::eager || policy == FreshnessPolicy::normal;
+}
+
+inline bool freshness_allows_watching(FreshnessPolicy policy) {
+    return policy != FreshnessPolicy::off;
+}
+
 struct Config {
     // Indexer settings
     std::filesystem::path repo_root = ".";

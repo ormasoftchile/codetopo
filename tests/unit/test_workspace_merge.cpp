@@ -83,6 +83,9 @@ static void create_source_index(const fs::path& root) {
     conn.exec(
         "INSERT INTO refs(id, file_id, kind, name, start_line, start_col, end_line, end_col, resolved_node_id, evidence, containing_node_id) "
         "VALUES(2, 1, 'http_call', '/api/merged-needle', 2, 1, 2, 24, NULL, 'http_client_call', 2)");
+    schema::set_kv(conn, "repo_root", fs::canonical(root).string());
+    schema::set_kv(conn, "index_state", "current");
+    schema::set_kv(conn, "last_index_time", "2026-10-06T00:00:00Z");
     fts::rebuild(conn);
 }
 

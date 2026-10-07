@@ -9,8 +9,10 @@
 #include "mcp/error.h"
 #include "db/schema.h"
 #include "db/bind.h"
+#include "index/ownership.h"
 #include "index/quality.h"
 #include "index/diff.h"
+#include "util/lock.h"
 #include "core/inplace_vector.h"
 #include <sqlite3.h>
 #include <sstream>
@@ -32,6 +34,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <cctype>
 #include <cstdlib>
@@ -1458,7 +1461,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
         const auto& row = *row_ptr;
         size_t item_bytes = estimate_callsite_candidate_bytes(row, options.include_handles);
         if (result.max_bytes > 0 && !result.rows.empty() &&
-            std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(result.max_bytes)) {
+            std::saturating_add(approx_bytes, item_bytes) > static_cast<size_t>(result.max_bytes)) {
             result.budget_exceeded = true;
             result.has_more = true;
             break;
@@ -1468,7 +1471,7 @@ static CallsiteCandidateSet collect_callsite_candidates(
             break;
         }
         result.rows.push_back(row);
-        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
+        approx_bytes = std::saturating_add(approx_bytes, item_bytes + 1);
     }
     if (result.total > static_cast<int64_t>(result.rows.size()))
         result.filtered_hidden = result.total - static_cast<int64_t>(result.rows.size());
@@ -2059,6 +2062,9 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
     auto version = schema::get_kv(conn, "schema_version", "0");
     auto idx_version = schema::get_kv(conn, "indexer_version", "unknown");
     auto last_index = schema::get_kv(conn, "last_index_time", "");
+    FileLock writer_probe(conn.db_path() + ".lock");
+    bool writer_active = writer_probe.held_by_live_process();
+    auto metadata = index_ownership::inspect_metadata(conn, writer_active);
 
     // Skip integrity/quick_check in MCP hot path — too slow on large DBs (5GB+).
     // A basic connectivity test via the get_kv calls above is sufficient.
@@ -2082,19 +2088,46 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
 
     yyjson_mut_obj_add_strcpy(doc.doc, root, "repo_root", repo_root.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "db_status", db_status.c_str());
+    yyjson_mut_obj_add_strcpy(
+        doc.doc, root, "ownership_status", metadata.ownership.c_str());
+    yyjson_mut_obj_add_strcpy(
+        doc.doc, root, "index_status", metadata.index.c_str());
+    yyjson_mut_obj_add_bool(doc.doc, root, "indexing", writer_active);
 
     // R5: Freshness metadata — indexed vs current git state
     auto indexed_branch = schema::get_kv(conn, "git_branch", "");
     auto indexed_commit = schema::get_kv(conn, "git_head", "");
     auto current_branch = get_git_branch(repo_root);
     auto current_commit = get_git_head(repo_root);
-    bool stale = !indexed_commit.empty() && indexed_commit != current_commit;
+    std::optional<bool> stale;
+    std::string freshness_status = metadata.index;
+    if (metadata.index == "current") {
+        std::error_code git_ec;
+        bool git_worktree = std::filesystem::exists(
+            std::filesystem::path(repo_root) / ".git", git_ec) && !git_ec;
+        if (!current_commit.empty() && indexed_commit.empty()) {
+            freshness_status = "incomplete";
+        } else if (!current_commit.empty()) {
+            stale = indexed_commit != current_commit;
+            freshness_status = *stale ? "stale" : "current";
+        } else if (git_worktree) {
+            freshness_status = "unknown";
+        } else {
+            freshness_status = "current_unversioned";
+        }
+    }
 
     yyjson_mut_obj_add_strcpy(doc.doc, root, "indexed_branch", indexed_branch.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "indexed_commit", indexed_commit.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "current_branch", current_branch.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "current_commit", current_commit.c_str());
-    yyjson_mut_obj_add_bool(doc.doc, root, "stale", stale);
+    yyjson_mut_obj_add_strcpy(
+        doc.doc, root, "freshness_status", freshness_status.c_str());
+    if (stale) {
+        yyjson_mut_obj_add_bool(doc.doc, root, "stale", *stale);
+    } else {
+        yyjson_mut_obj_add_null(doc.doc, root, "stale");
+    }
 
     // Compute index_age_seconds from last_index_time
     int64_t index_age_seconds = -1;
@@ -2107,7 +2140,11 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
             tm_parsed.tm_year -= 1900;
             tm_parsed.tm_mon -= 1;
             tm_parsed.tm_isdst = -1;
-            time_t indexed_time = mktime(&tm_parsed);
+#ifdef _WIN32
+            time_t indexed_time = _mkgmtime(&tm_parsed);
+#else
+            time_t indexed_time = timegm(&tm_parsed);
+#endif
             if (indexed_time != -1) {
                 time_t now = time(nullptr);
                 index_age_seconds = static_cast<int64_t>(difftime(now, indexed_time));
@@ -2132,6 +2169,9 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
 
     auto last_index = schema::get_kv(conn, "last_index_time", "");
     auto idx_version = schema::get_kv(conn, "indexer_version", "");
+    FileLock writer_probe(conn.db_path() + ".lock");
+    bool writer_active = writer_probe.held_by_live_process();
+    auto metadata = index_ownership::inspect_metadata(conn, writer_active);
 
     JsonMutDoc doc;
     auto* root = doc.new_obj();
@@ -2145,6 +2185,10 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
     yyjson_mut_obj_add_str(doc.doc, root, "graph_counts_status", "not_computed");
     yyjson_mut_obj_add_strcpy(doc.doc, root, "last_index_time", last_index.c_str());
     yyjson_mut_obj_add_strcpy(doc.doc, root, "indexer_version", idx_version.c_str());
+    yyjson_mut_obj_add_strcpy(
+        doc.doc, root, "ownership_status", metadata.ownership.c_str());
+    yyjson_mut_obj_add_strcpy(
+        doc.doc, root, "index_status", metadata.index.c_str());
 
     // Per-root breakdown (workspace roots)
     auto* roots_arr = doc.new_arr();
@@ -3510,7 +3554,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
         const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
-        if (max_bytes > 0 && count > 0 && std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
+        if (max_bytes > 0 && count > 0 && std::saturating_add(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
             has_more = true;
             budget_exceeded = true;
             break;
@@ -3524,7 +3568,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
 
         yyjson_mut_arr_append(results, item);
         count++;
-        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
+        approx_bytes = std::saturating_add(approx_bytes, item_bytes + 1);
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
@@ -3533,7 +3577,7 @@ std::string symbol_list(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
     yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
-    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::add_sat(offset, static_cast<int64_t>(count)));
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::saturating_add(offset, static_cast<int64_t>(count)));
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
@@ -3729,7 +3773,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
         const char* row_sk = sk_txt ? reinterpret_cast<const char*>(sk_txt) : nullptr;
         size_t item_bytes = estimate_symbol_listing_bytes(row_kind, row_name, row_qn, row_file,
             row_sig, include_handles, fields_provided, fields_set);
-        if (max_bytes > 0 && count > 0 && std::add_sat(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
+        if (max_bytes > 0 && count > 0 && std::saturating_add(approx_bytes, item_bytes) > static_cast<size_t>(max_bytes)) {
             has_more = true;
             budget_exceeded = true;
             break;
@@ -3742,7 +3786,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
             include_handles, compact, false, "file_path", fields_set, fields_provided);
         yyjson_mut_arr_append(results, item);
         count++;
-        approx_bytes = std::add_sat(approx_bytes, item_bytes + 1);
+        approx_bytes = std::saturating_add(approx_bytes, item_bytes + 1);
     }
 
     add_pagination_fields(doc, root, results, total, has_more, offset, limit);
@@ -3751,7 +3795,7 @@ std::string symbols_in_path(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, root, "hidden_public_count", hidden_public_count);
     yyjson_mut_obj_add_bool(doc.doc, root, "min_span_lines_lossy", apply_min_span_filter);
     yyjson_mut_obj_add_int(doc.doc, root, "max_bytes", max_bytes);
-    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::add_sat(offset, static_cast<int64_t>(count)));
+    if (has_more) yyjson_mut_obj_add_int(doc.doc, root, "next_offset", std::saturating_add(offset, static_cast<int64_t>(count)));
     if (budget_exceeded) yyjson_mut_obj_add_bool(doc.doc, root, "budget_exceeded", true);
     if (apply_min_span_filter || hidden_public_count > 0) {
         auto* warnings = doc.new_arr();
@@ -6729,13 +6773,13 @@ std::string code_search(yyjson_val* params, Connection& conn,
 
             size_t match_bytes = 48 + lm.line_text.size() + ctx.size();
             if (max_bytes > 0 && (files_returned > 0 || shown > 0) &&
-                std::add_sat(approx_bytes, match_bytes) > static_cast<size_t>(max_bytes)) {
+                std::saturating_add(approx_bytes, match_bytes) > static_cast<size_t>(max_bytes)) {
                 budget_exceeded = true;
                 break;
             }
 
             shown++;
-            approx_bytes = std::add_sat(approx_bytes, match_bytes + 1);
+            approx_bytes = std::saturating_add(approx_bytes, match_bytes + 1);
 
             auto* match_obj = doc.new_obj();
             yyjson_mut_obj_add_int(doc.doc, match_obj, "line", lm.line_num);
@@ -7201,7 +7245,7 @@ std::string list_http_calls(yyjson_val* params, Connection& conn,
         yyjson_mut_arr_append(results, item);
     }
 
-    add_pagination_fields(doc, root, results, total, std::add_sat(offset, limit) < total, offset, limit);
+    add_pagination_fields(doc, root, results, total, std::saturating_add(offset, limit) < total, offset, limit);
     return doc.to_string();
 }
 
@@ -7246,6 +7290,12 @@ std::string workspace_add(yyjson_val* params, Connection& conn,
 
         FileLock writer(main_db + ".lock");
         if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
+        auto ownership = index_ownership::resolve_primary_root(
+            conn, repo_root, true, main_db);
+        if (!ownership.metadata_present) {
+            throw std::runtime_error(
+                "primary index ownership is missing; complete a full primary index first");
+        }
         WorkspaceDB ws(main_db);
         auto result = ws.add_root(target_path, cfg);
 
@@ -7282,6 +7332,12 @@ std::string workspace_remove(yyjson_val* params, Connection& conn,
 
         FileLock writer(main_db + ".lock");
         if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
+        auto ownership = index_ownership::resolve_primary_root(
+            conn, repo_root, true, main_db);
+        if (!ownership.metadata_present) {
+            throw std::runtime_error(
+                "primary index ownership is missing; complete a full primary index first");
+        }
         WorkspaceDB ws(main_db);
         auto result = ws.remove_root(target_path);
 

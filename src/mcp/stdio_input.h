@@ -42,7 +42,8 @@ public:
 #ifdef _WIN32
             auto input = GetStdHandle(STD_INPUT_HANDLE);
             DWORD available = sizeof(buffer);
-            if (GetFileType(input) == FILE_TYPE_PIPE) {
+            auto input_type = GetFileType(input);
+            if (input_type == FILE_TYPE_PIPE && idle_seconds > 0) {
                 if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) {
                     if (GetLastError() == ERROR_BROKEN_PIPE) { closed_ = true; continue; }
                     throw std::runtime_error("stdin pipe probe failed");
@@ -51,7 +52,7 @@ public:
                     std::this_thread::sleep_for(std::chrono::milliseconds(25));
                     continue;
                 }
-            } else if (GetFileType(input) == FILE_TYPE_CHAR &&
+            } else if (input_type == FILE_TYPE_CHAR && idle_seconds > 0 &&
                        WaitForSingleObject(input, 25) == WAIT_TIMEOUT) {
                 continue;
             }
@@ -62,7 +63,7 @@ public:
             }
 #else
             pollfd fd{STDIN_FILENO, POLLIN, 0};
-            int rc = poll(&fd, 1, 25);
+            int rc = poll(&fd, 1, idle_seconds > 0 ? 25 : -1);
             if (rc < 0) {
                 if (errno == EINTR) continue;
                 throw std::runtime_error("stdin poll failed");

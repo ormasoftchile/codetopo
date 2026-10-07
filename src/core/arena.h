@@ -43,7 +43,7 @@ public:
     void* allocate(size_t size, size_t alignment = alignof(std::max_align_t)) {
         size_t current = offset_;
         size_t aligned = (current + alignment - 1) & ~(alignment - 1);
-        size_t new_offset = std::add_sat(aligned, size);
+        size_t new_offset = std::saturating_add(aligned, size);
 
         if (new_offset > capacity_ || new_offset == std::numeric_limits<size_t>::max()) {
             overflowed_ = true;
@@ -64,11 +64,11 @@ public:
 
     // calloc semantics: allocate + zero-fill
     void* allocate_zeroed(size_t count, size_t size) {
-        size_t total = std::mul_sat(count, size);
+        size_t total = std::saturating_mul(count, size);
         size_t current = offset_;
         size_t aligned = (current + alignof(std::max_align_t) - 1)
                        & ~(alignof(std::max_align_t) - 1);
-        size_t new_offset = std::add_sat(aligned, total);
+        size_t new_offset = std::saturating_add(aligned, total);
 
         if (new_offset > capacity_ || total == std::numeric_limits<size_t>::max()) {
             overflowed_ = true;

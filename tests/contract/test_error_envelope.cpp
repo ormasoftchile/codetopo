@@ -66,3 +66,19 @@ TEST_CASE("limit_exceeded has correct code", "[contract][us2]") {
     REQUIRE(err.json_rpc_code == -32003);
     REQUIRE(err.error_code == "limit_exceeded");
 }
+
+TEST_CASE("Error envelope preserves string request IDs", "[contract][startup]") {
+    auto request = json_parse(R"({"id":"startup-1"})");
+    auto err = McpError::invalid_input("Missing parameter");
+    auto response = json_parse(err.to_json_rpc_id(yyjson_obj_get(request.root(), "id")));
+    REQUIRE(response);
+    REQUIRE(yyjson_is_str(yyjson_obj_get(response.root(), "id")));
+    REQUIRE(std::string(json_get_str(response.root(), "id")) == "startup-1");
+}
+
+TEST_CASE("Unidentified error envelope uses null ID", "[contract][startup]") {
+    auto err = McpError::invalid_input("Malformed request");
+    auto response = json_parse(err.to_json_rpc_id(nullptr));
+    REQUIRE(response);
+    REQUIRE(yyjson_is_null(yyjson_obj_get(response.root(), "id")));
+}

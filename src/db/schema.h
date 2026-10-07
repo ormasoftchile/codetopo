@@ -319,6 +319,14 @@ inline void set_kv(Connection& conn, const std::string& key, const std::string& 
     sqlite3_finalize(stmt);
 }
 
+inline void delete_kv(Connection& conn, const std::string& key) {
+    sqlite3_stmt* stmt = nullptr;
+    sqlite3_prepare_v2(conn.raw(), "DELETE FROM kv WHERE key=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
 inline std::string get_kv(Connection& conn, const std::string& key, const std::string& def = "") {
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(conn.raw(),
@@ -493,7 +501,6 @@ inline void rebuild_indexes(Connection& conn) {
 // Initialize or verify schema. Returns exit code (0=ok, 3=mismatch).
 inline int ensure_schema(Connection& conn) {
     register_custom_functions(conn.raw());
-    create_tables(conn);
     int version = get_schema_version(conn);
     bool recreate_nodes_fts = false;
 
@@ -511,6 +518,7 @@ inline int ensure_schema(Connection& conn) {
         ensure_nodes_rank_schema(conn);
         ensure_content_fts_tracker_rowid_schema(conn);
         ensure_edges_provenance_schema(conn);
+        create_tables(conn);
         return 0;  // Compatible
     }
 
@@ -639,6 +647,8 @@ inline int ensure_schema(Connection& conn) {
     }
 
     if (version == CURRENT_SCHEMA_VERSION) {
+        // Current indexes reference columns added by the migrations above.
+        create_tables(conn);
         if (recreate_nodes_fts) {
             create_fts(conn);
             conn.exec(

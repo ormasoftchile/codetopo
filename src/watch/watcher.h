@@ -187,6 +187,7 @@ private:
 
             // Parse the notification buffer, classifying and filtering as we go,
             // appending survivors to the pending batch.
+            bool relevant_event = false;
             auto* info = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(buffer);
             while (true) {
                 std::wstring filename(info->FileName, info->FileNameLength / sizeof(WCHAR));
@@ -207,8 +208,10 @@ private:
                 // so the watcher never re-triggers on its own index DB writes.
                 if (is_git_head_change(full_path)) {
                     pending.push_back({FileEvent::BranchSwitch, full_path});
+                    relevant_event = true;
                 } else if (!watch_path_ignored(root_, full_path)) {
                     pending.push_back({type, full_path});
+                    relevant_event = true;
                 }
 
                 if (info->NextEntryOffset == 0) break;
@@ -216,10 +219,24 @@ private:
                     reinterpret_cast<char*>(info) + info->NextEntryOffset);
             }
 
-            // Fresh activity: reset the quiet-period timer and re-arm for the next
-            // burst. Dispatch happens later, once things settle (WAIT_TIMEOUT path).
-            last_event_time = std::chrono::steady_clock::now();
+            // Relevant source activity resets the debounce window. Ignored WAL/build
+            // traffic must not postpone a pending source batch indefinitely.
+            if (relevant_event) {
+                last_event_time = std::chrono::steady_clock::now();
+            }
             if (!arm_read()) break;
+            if (!pending.empty() && running_.load() &&
+                (std::chrono::steady_clock::now() - last_event_time) >= debounce_) {
+                std::vector<WatchEvent> batch;
+                batch.swap(pending);
+                callback_(batch);
+            }
+            if (!relevant_event) {
+                // The database WAL lives under ignored .codetopo/. Keep the next
+                // overlapped read armed so source changes are not lost, but bound
+                // wakeups while an indexer is producing a dense stream of WAL events.
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
         }
 
         CancelIo(dir_handle);

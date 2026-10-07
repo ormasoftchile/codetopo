@@ -12,6 +12,7 @@
 #include "db/fts.h"
 #include "index/scanner.h"
 #include "index/change_detector.h"
+#include "index/ownership.h"
 #include "index/parser.h"
 #include "index/extractor.h"
 #include "index/persister.h"
@@ -20,6 +21,7 @@
 #include "util/git.h"
 #include "util/lock.h"
 #include "util/profiler.h"
+#include "util/seh.h"
 #include <iostream>
 #include <mutex>
 #include <atomic>
@@ -40,30 +42,6 @@
 #include <windows.h>
 #endif
 
-#ifdef _WIN32
-#include <windows.h>
-#include <eh.h>
-#include <malloc.h>  // _resetstkoflw
-
-// C++ exception wrapper for SEH exceptions
-struct SehException : std::exception {
-    DWORD code;
-    SehException(DWORD c) : code(c) {}
-    const char* what() const noexcept override { return "SEH exception"; }
-};
-
-// Per-thread SEH translator — converts SEH to C++ exception.
-// On stack overflow, must call _resetstkoflw() to restore the guard page.
-// Without it, the NEXT stack overflow triggers __fastfail (0xC0000409)
-// which is uncatchable.
-static void seh_translator(unsigned int code, EXCEPTION_POINTERS*) {
-    if (code == EXCEPTION_STACK_OVERFLOW) {
-        _resetstkoflw();
-    }
-    throw SehException(static_cast<DWORD>(code));
-}
-#endif
-
 #include "index/persist_queue.h"
 
 namespace codetopo {
@@ -80,6 +58,7 @@ int run_index(const Config& config) {
 
     auto repo_root = fs::canonical(config.repo_root);
     auto db_path = config.db_path;
+    bool targeted_mode = !config.only_files.empty() || !config.changed_file_lists.empty();
 
     // In supervised mode a live MCP reader holds a WAL read mark, so a TRUNCATE (or
     // RESTART) checkpoint would block on it for the full busy_timeout (up to 30s) at
@@ -119,6 +98,19 @@ int run_index(const Config& config) {
         }
     }
 
+    // Reject a database owned by a different repository before migrations,
+    // scanning, or any other write can occur.
+    if (fs::exists(db_path)) {
+        try {
+            Connection probe(db_path, true);
+            index_ownership::resolve_primary_root(
+                probe, repo_root, true, db_path.string());
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: " << e.what() << "\n";
+            return 1;
+        }
+    }
+
     // Register arena allocator with Tree-sitter (T008)
     register_arena_allocator();
 
@@ -134,6 +126,33 @@ int run_index(const Config& config) {
     schema::set_kv(conn, "schema_version", std::to_string(CURRENT_SCHEMA_VERSION));
     // Symbol search must track the same committed batches as structural reads.
     fts::create_sync_triggers(conn);
+
+    index_ownership::RootResolution ownership;
+    try {
+        ownership = index_ownership::resolve_primary_root(
+            conn, repo_root, true, db_path.string());
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+        return 1;
+    }
+    bool deletion_allowed = index_ownership::metadata_allows_deletion(ownership);
+    bool had_primary_rows = false;
+    {
+        sqlite3_stmt* stmt = nullptr;
+        sqlite3_prepare_v2(conn.raw(),
+            "SELECT 1 FROM files WHERE root_id IS NULL LIMIT 1", -1, &stmt, nullptr);
+        had_primary_rows = sqlite3_step(stmt) == SQLITE_ROW;
+        sqlite3_finalize(stmt);
+    }
+    if (targeted_mode && !ownership.metadata_present) {
+        std::cerr << "ERROR: Targeted reindex requires verified repo_root metadata. "
+                     "Run one full index with the explicit primary --root first; "
+                     "the ownership-establishing pass will not prune deletions.\n";
+        return 1;
+    }
+    const bool ownership_bootstrap_needs_followup =
+        !ownership.metadata_present && had_primary_rows;
+    schema::set_kv(conn, "index_state", "indexing");
 
     // Ensure quarantine table exists (additive migration)
     schema::ensure_quarantine_table(conn);
@@ -151,7 +170,8 @@ int run_index(const Config& config) {
     Persister persister(conn);
     std::vector<ScannedFile> work_list;
     bool force_cleared_index = false;
-    bool targeted_mode = !config.only_files.empty() || !config.changed_file_lists.empty();
+    bool skipped_deletions = false;
+    bool work_list_truncated = false;
 
     bool resumed = false;
     if (config.resume && fs::exists(worklist_path)) {
@@ -238,11 +258,18 @@ int run_index(const Config& config) {
 
         // Prune deleted files (T041)
         if (!config.force_reindex && !changes.deleted_paths.empty()) {
-            // Deletes must update symbol FTS immediately. In delete-only targeted
-            // runs there may be no later persist phase to create these triggers.
-            fts::create_sync_triggers(conn);
-            int pruned = persister.prune_deleted(changes.deleted_paths);
-            std::cerr << "Pruned " << pruned << " deleted files\n";
+            if (deletion_allowed) {
+                // Deletes must update symbol FTS immediately. In delete-only targeted
+                // runs there may be no later persist phase to create these triggers.
+                fts::create_sync_triggers(conn);
+                int pruned = persister.prune_deleted(changes.deleted_paths);
+                std::cerr << "Pruned " << pruned << " deleted files\n";
+            } else {
+                skipped_deletions = true;
+                std::cerr << "Ownership metadata is missing; preserved "
+                          << changes.deleted_paths.size()
+                          << " apparently deleted primary files for a later verified reconciliation\n";
+            }
         }
 
         // Merge new + changed into work list
@@ -262,11 +289,15 @@ int run_index(const Config& config) {
         // main-project rows once up front so the persist phase behaves like a
         // cold index.  On --resume this is intentionally skipped because the
         // first attempt already cleared the DB before writing progress.
-        if (config.force_reindex && !targeted_mode) {
+        if (config.force_reindex && !targeted_mode && deletion_allowed) {
             std::cerr << "Force reindex: clearing existing index rows...\n";
             int64_t cleared = persister.clear_main_project_index_for_force();
             force_cleared_index = true;
             std::cerr << "Force reindex: cleared " << cleared << " existing files\n";
+        } else if (config.force_reindex && !targeted_mode && !deletion_allowed &&
+                   had_primary_rows) {
+            std::cerr << "Ownership metadata is missing; --force extraction will not clear "
+                         "existing primary rows during this pass\n";
         }
     }
 
@@ -291,7 +322,9 @@ int run_index(const Config& config) {
             }
         }
 
-        persister.write_metadata(repo_root.string());
+        persister.write_metadata(
+            repo_root.string(),
+            !ownership_bootstrap_needs_followup && !skipped_deletions);
         conn.exec(kWalCheckpoint);
         fs::remove(worklist_path);  // Clean up stale worklist
         return 0;
@@ -308,6 +341,7 @@ int run_index(const Config& config) {
     // Apply --max-files to the work list (files that will actually be indexed),
     // not the scan (which includes files that may be skipped or unchanged).
     if (config.max_files > 0 && work_list.size() > static_cast<size_t>(config.max_files)) {
+        work_list_truncated = true;
         work_list.resize(config.max_files);
     }
 
@@ -435,7 +469,7 @@ int run_index(const Config& config) {
         ParsedFile result;
         result.file = file;
 
-#ifdef _WIN32
+#if CODETOPO_HAS_SEH_TRANSLATOR
         _set_se_translator(seh_translator);
 #endif
         try {
@@ -589,7 +623,7 @@ int run_index(const Config& config) {
         result.parse_status = result.extraction.truncated ? "partial" : "ok";
         result.parse_error = result.extraction.truncated ? result.extraction.truncation_reason : "";
 
-#ifdef _WIN32
+#if CODETOPO_HAS_SEH_TRANSLATOR
         } catch (const SehException& e) {
             char buf[64]; snprintf(buf, sizeof(buf), "SEH 0x%08X during parse/extract", e.code);
             result.parse_status = "failed";
@@ -993,7 +1027,9 @@ int run_index(const Config& config) {
     {
         ScopedPhase _pr(profiler.pagerank);
         auto pr_start = std::chrono::steady_clock::now();
-        int ranked = compute_and_persist_pagerank(conn, {}, progress_path);
+        PageRankOptions ranking;
+        ranking.scope_to_owned_files = true;
+        int ranked = compute_and_persist_pagerank(conn, ranking, progress_path.string());
         auto pr_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - pr_start).count();
         std::cerr << "Ranked " << ranked << " symbols by centrality in " << pr_elapsed << "ms\n";
@@ -1022,7 +1058,15 @@ int run_index(const Config& config) {
     // Write metadata (T049)
     {
         ScopedPhase _md(profiler.metadata);
-        persister.write_metadata(repo_root.string());
+        if (persist_errors > 0) {
+            schema::set_kv(conn, "index_state", "incomplete");
+        } else {
+            persister.write_metadata(
+                repo_root.string(),
+                !ownership_bootstrap_needs_followup &&
+                    !skipped_deletions &&
+                    !work_list_truncated);
+        }
     }
 
     // WAL checkpoint (T050). Standalone: TRUNCATE (not PASSIVE) -- turbo mode disables

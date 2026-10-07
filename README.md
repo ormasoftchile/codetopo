@@ -31,7 +31,9 @@ Tested on enterprise codebases with 450K+ files — indexes 100K files in ~10 mi
 ### Prerequisites
 
 - CMake ≥ 3.25
-- C++26 compiler (Clang 19+, GCC 14+, MSVC 19.40+)
+- Compiler and standard library supporting the required C++26 features, including
+  `std::saturating_add` and `std::saturating_mul` (verified with GCC 16.1;
+  accepting a C++26 language flag alone is insufficient)
 - [vcpkg](https://vcpkg.io/) with `VCPKG_ROOT` set
 
 ### Build
@@ -40,6 +42,53 @@ Tested on enterprise codebases with 450K+ files — indexes 100K files in ~10 mi
 cmake --preset release
 cmake --build build --config Release
 ```
+
+On Windows, MSVC-compatible compilers use `/EHa` and per-worker
+`_set_se_translator` to convert native parse/extract faults to file-level errors.
+MinGW/GCC does not provide that translator: ordinary C++ exceptions are still
+caught, but native faults terminate the indexing child. Public `index`, `init`,
+workspace indexing, and MCP reindexing use the existing subprocess supervisor,
+which detects the native exit status, quarantines in-flight files, and restarts.
+Direct `run_index` calls and the internal `--supervised` child flag do not provide
+that recovery boundary. GCC builds require matching MinGW dependencies, not
+MSVC-built libraries. On Windows, GNU compiler and thread runtimes are linked
+statically into the executables. Deploy the matching project dependency DLLs
+(`libsqlite3.dll`, `libxxhash.dll`, and `libyyjson.dll` for the dynamic MinGW
+triplet) beside `codetopo.exe`; no compiler installation or compiler directory
+on `PATH` is required.
+
+With Node.js available, Windows CTest includes `portable_startup`, which verifies
+version reporting, supervised indexing, and an MCP initialize/tools-list handshake
+with `PATH` restricted to Windows system directories. Run it against a deployed
+package with `node tests\integration\portable_startup_stdio.js <path-to-codetopo.exe>`.
+It also checks generated configs from a different working directory. To probe an
+existing config without regenerating it, use
+`node tests\integration\portable_startup_stdio.js --config .mcp.json build`.
+That smoke check closes stdin immediately after discovery; it does not verify a
+long-lived client session. For bounded startup diagnostics with the current
+environment, keep stdin open for 30 seconds:
+
+```powershell
+node tests\integration\portable_startup_stdio.js --config .mcp.json build --sustain --ambient --string-ids
+```
+
+Omit `--string-ids` to test numeric request IDs. The sustained probe timestamps
+initialize, pipelined discovery/read requests, ping, logging and cancellation,
+validates every advertised tool schema structurally, and reports the last
+completed request on a five-second request timeout. Use `--duration=60` or
+`--protocol=2024-11-05` to vary the session. It drains stdout/stderr continuously
+and checks shutdown after EOF. Passing this local probe does **not** establish
+that VS Code or Copilot CLI has finished its own startup; their actual request
+sequence and active server configuration still need host-side confirmation.
+The summary reports background reindex separately: protocol responsiveness can
+pass while an indexing child fails, so inspect that status and stderr as well.
+
+MCP startup upgrades supported older indexes in place; a schema 13 or 14 index
+does not require a full reindex. Column migrations run before creating indexes
+that reference the new columns, preserving existing symbols, edges, and search
+data. In VS Code, use **MCP: List Servers**, select **codetopo**, and choose
+**Show Output** to inspect the actual editor-hosted process. A separate running
+Copilot SDK or CLI instance does not establish that VS Code's instance is ready.
 
 ### One‑command setup
 
@@ -53,8 +102,9 @@ This will:
 1. Scan and index the repository
 2. Write project‑scoped MCP configs — always `.mcp.json` (repo root, the cross‑agent
    standard) and `.vscode/mcp.json`, plus Cursor/Windsurf/Copilot configs when those
-   editors are detected. No user‑level/global config is touched; all use a relative
-   `--root` and merge with existing entries.
+   editors are detected. No user‑level/global config is touched; all use an absolute
+   `--root` so startup does not depend on the client's working directory, and merge
+   with existing entries. Regenerate configs after moving the repository or binary.
 3. Install agent skills into `.github/skills/` (auto‑discovered by Copilot)
 4. Write agent‑guidance files — `.github/copilot-instructions.md` and `AGENTS.md` —
    so coding agents prefer codetopo tools over grep/glob/raw file reads. These are
@@ -121,6 +171,57 @@ codetopo mcp --root /path/to/repo
 ```
 
 The server communicates over stdio using JSON‑RPC. Connect it to any MCP‑compatible client.
+
+#### Primary-root ownership and safe recovery
+
+`--root` identifies the primary repository; the MCP client's working directory
+does not. Codetopo canonicalizes that root and compares it with the database's
+`repo_root` metadata before startup reconciliation, watching, explicit reindex,
+or workspace mutation. An explicit root that conflicts with database ownership
+is rejected before scanning or pruning. If both `--root` and ownership metadata
+are absent, automatic writes are disabled with an actionable startup error
+instead of treating `.` as the repository.
+
+An interrupted first index can leave a current schema but no root/completion
+metadata. With an explicit root, the next full index is an ownership-establishing
+pass: it may add or update files from that root, but it does not prune apparently
+deleted primary files or clear primary rows with `--force`. Existing extra-root
+records are scoped by `root_id` and remain intact. If pre-existing primary rows
+made deletion ambiguous, health reports `needs_reconciliation`; a later full
+index, after ownership is recorded, performs the normal primary-only prune.
+Targeted indexing is rejected until ownership has been established.
+
+Full primary reindexing retains already-resolved relationships instead of wiping
+resolver edges globally. Missing primary edges can be restored from persisted
+reference resolutions; extra-root internal graphs and root-prefixed file-node
+relationships are left intact. Edge insertion is idempotent, and edge indexes
+remain available throughout resolution and recovery.
+Recovered file records reuse surviving file-node identities, preserving incoming
+include/workspace links rather than failing on orphaned stable keys.
+Indexer ranking uses file-owned graph scopes and indexed edge/node probes;
+recovery does not use a global edge scan or scan node rows for rank updates.
+
+For a damaged or interrupted production index:
+
+1. Keep all MCP/watch/index writers stopped and preserve `index.sqlite` plus any
+   `-wal`/`-shm` companions as one backup set.
+2. Start the patched MCP with the intended absolute `--root` and
+   `--freshness=off`, or run one approved full `codetopo index --root <primary>
+   --db <primary>/.codetopo/index.sqlite`.
+3. Verify `server_info`, `repo_stats`, and `workspace_list`. The first safe pass
+   reports missing ownership, `indexing`, `interrupted`, or
+   `needs_reconciliation` explicitly; missing timestamps/commits do not report
+   `stale:false`.
+4. After confirming the canonical root and retained extra-root counts, approve a
+   second full index to reconcile deletions. Restore the normal freshness policy
+   and `--watch` afterward.
+
+Multiple stdio clients may share the database. Automatic startup/watcher work is
+coalesced with a cross-process reconciliation lock and bounded waiting; one MCP
+process does not own query access. The database writer lock still serializes the
+actual index transaction. On Windows, idle stdio waits block rather than polling,
+and ignored `.codetopo` WAL notifications are rate-limited while the next
+filesystem read remains armed.
 
 After client initialization, server diagnostics are sent both to stderr and as
 MCP `notifications/message` events. This includes tool calls, watcher changes,
@@ -304,7 +405,7 @@ selector. In JSON, escape each backslash once, e.g.
 | Tool | Description |
 |------|-------------|
 | `server_info` | Server capabilities, schema version (v15), database path, and uptime |
-| `server_health` | In-memory prompt readiness probe (`ready`/`busy`) without SQLite graph queries |
+| `server_health` | Metadata-only readiness probe (`ready`/`busy`/`degraded`) without graph scans |
 | `repo_stats` | Repository file counts and indexing metadata (uncomputed graph totals are null) |
 | `reindex` | Trigger a background re-index with non-blocking committed reads |
 | `workspace_add` | Start background extra-root indexing/merge job; returns `job_id` |
@@ -355,8 +456,10 @@ or new committed state, never a partially committed merge. Snapshots and cached
 statement cursors are released before writing the response. Workers never use
 or finalize the reader's statements; committed changes invalidate its cache at
 the next request, including independent CLI writer commits.
-`server_health` reports writer readiness, **not** read unavailability or a
-database integrity guarantee. Write conflicts (for example `ingest_traces`)
+`server_health` reports writer and index-metadata readiness, **not** read
+unavailability or a database integrity guarantee. `degraded` distinguishes
+missing ownership, interrupted indexing, incomplete metadata, and a required
+follow-up reconciliation. Write conflicts (for example `ingest_traces`)
 still return JSON-RPC `busy` (`data.error_code:"busy"`, `data.retryable:true`).
 Genuine SQLite read lock contention uses a 250ms busy timeout per SQLite
 operation, not the writer-sized 30s timeout. No missing index is silently
@@ -420,6 +523,13 @@ contents, unchanged primary identities and data across workspace mutations,
 pipelined cache traffic, and owned lock/progress/worklist cleanup. Its fixtures
 use independent Git repositories so the watcher does not inherit parent Git
 metadata.
+
+Wrong-root regression:
+`node tests\integration\root_ownership_stdio.js <path-to-codetopo.exe>` creates
+isolated primary/additional roots, removes completion metadata to simulate an
+interrupted index, launches two watched MCP clients from the additional root,
+and asserts the canonical child arguments, startup coalescing, degraded/current
+health transitions, and preservation of primary, extra-root, and graph records.
 
 Lookup-only regressions: `codetopo_tests.exe "[lookup-api]"` checks lexical
 normalization, selector semantics, and the actual scoped SQL query plans.
