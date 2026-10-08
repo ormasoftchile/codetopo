@@ -1,4 +1,5 @@
 #include "index/extractor.h"
+#include "index/call_binding.h"
 #include "core/inplace_vector.h"
 #include <algorithm>
 #include <array>
@@ -33,6 +34,44 @@ std::string source_text(TSNode node, const std::string& source) {
     uint32_t end = ts_node_end_byte(node);
     if (start >= source.size() || end > source.size() || start >= end) return "";
     return source.substr(start, end - start);
+}
+
+TSNode cpp_declarator_child(TSNode node) {
+    if (ts_node_is_null(node)) return {};
+    auto child = ts_node_child_by_field_name(node, "declarator", 10);
+    if (ts_node_is_null(child)) {
+        auto kind = std::string_view(ts_node_type(node));
+        if (kind == "parenthesized_declarator" || kind == "reference_declarator" ||
+            kind == "attributed_declarator") child = ts_node_named_child(node, 0);
+    }
+    return child;
+}
+
+TSNode cpp_callable_declarator(TSNode node) {
+    TSNode callable{};
+    for (int depth = 0; depth < 64 && !ts_node_is_null(node); ++depth) {
+        if (std::string_view(ts_node_type(node)) == "function_declarator") {
+            auto name = cpp_declarator_child(node);
+            if (!ts_node_is_null(name)) {
+                auto kind = std::string_view(ts_node_type(name));
+                if (kind == "identifier" || kind == "field_identifier" ||
+                    kind == "qualified_identifier" || kind == "destructor_name" ||
+                    kind == "operator_name" || kind == "template_function")
+                    callable = node;
+            }
+        }
+        node = cpp_declarator_child(node);
+    }
+    return callable;
+}
+
+TSNode cpp_declarator_name(TSNode node) {
+    for (int depth = 0; depth < 64 && !ts_node_is_null(node); ++depth) {
+        auto child = cpp_declarator_child(node);
+        if (ts_node_is_null(child)) return node;
+        node = child;
+    }
+    return {};
 }
 
 bool is_js_function_like(const std::string& type) {
@@ -868,8 +907,9 @@ ExtractionResult Extractor::extract(TSTree* tree, const std::string& source,
     std::vector<KeyCandidate> candidates;
     for (size_t i = 0; i < result.symbols.size(); ++i) {
         auto& sym = result.symbols[i];
+        const bool cpp_legacy_handle = language == "c" || language == "cpp";
         std::string base = make_stable_key(rel_path, sym.kind,
-                                            sym.qualname.empty() ? sym.name : sym.qualname);
+            cpp_legacy_handle ? sym.name : (sym.qualname.empty() ? sym.name : sym.qualname));
         candidates.push_back({base, sym.start_line});
     }
     auto keys = resolve_collisions(candidates);
@@ -1200,34 +1240,53 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
     std::string arg_pattern;
     TSNode args = find_argument_list_node(node);
     if (!ts_node_is_null(args)) {
-        arg_count = static_cast<int>(ts_node_named_child_count(args));
+        arg_count = 0;
+        bool expansion = false;
+        for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
+            auto child = ts_node_named_child(args, i);
+            std::string_view kind(ts_node_type(child));
+            if (kind == "comment") continue;
+            ++arg_count;
+            expansion |= (*language_ == "cpp" &&
+                kind.find("pack_expansion") != std::string_view::npos);
+        }
         if (arg_count <= 16) {
             inplace_vector<std::string, 16> patterns;
             for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
-                patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+                auto child = ts_node_named_child(args, i);
+                if (std::string_view(ts_node_type(child)) != "comment")
+                    patterns.push_back(classify_argument(child, *source_));
             }
             arg_pattern = join_patterns(patterns);
         } else {
             std::vector<std::string> patterns;
             patterns.reserve(static_cast<size_t>(arg_count));
             for (uint32_t i = 0; i < ts_node_named_child_count(args); ++i) {
-                patterns.push_back(classify_argument(ts_node_named_child(args, i), *source_));
+                auto child = ts_node_named_child(args, i);
+                if (std::string_view(ts_node_type(child)) != "comment")
+                    patterns.push_back(classify_argument(child, *source_));
             }
             arg_pattern = join_patterns(patterns);
         }
+        if (expansion) arg_count = -1;
     }
 
     std::string receiver_type_hint;
     std::string receiver = receiver_from_callee_text(name);
     std::string declaration_name = declaration_name_from_receiver(receiver);
-    if (!declaration_name.empty() && receiver != "this" && receiver != "self") {
+    const bool c_cpp = *language_ == "c" || *language_ == "cpp";
+    if (c_cpp && is_simple_identifier(receiver)) {
+        receiver_type_hint = infer_cpp_receiver_type(node, declaration_name);
+    }
+    if (!c_cpp && !declaration_name.empty() && receiver != "this" && receiver != "self") {
         uint32_t call_start = ts_node_start_byte(node);
         // 8KB window: type declarations are almost always within 200 lines of the call.
         // 64KB caused cumulative heap pressure crashing the indexer after ~2400 TS files.
         static constexpr size_t kReceiverTypeWindow = 8192;
         size_t window_start = call_start > kReceiverTypeWindow ? call_start - kReceiverTypeWindow : 0;
         std::string_view prefix(source_->data() + window_start, call_start - window_start);
-        receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
+        if (receiver_type_hint.empty())
+            receiver_type_hint = infer_type_from_declaration_text(prefix, receiver);
         if (receiver_type_hint.empty() && declaration_name[0] != '_') {
             std::string alt_receiver = receiver;
             std::string underscored = "_" + declaration_name;
@@ -1253,6 +1312,48 @@ void Extractor::add_call_ref(const std::string& name, TSNode node,
     }
 
     add_ref("call", name, node, evidence, arg_count, arg_pattern, receiver_type_hint);
+}
+
+std::string Extractor::infer_cpp_receiver_type(TSNode call, const std::string& receiver) {
+    if (receiver == "this" && !symbol_stack_.empty()) {
+        auto qualifier = result_->symbols[symbol_stack_.back()].qualname;
+        auto scope = qualifier.rfind("::");
+        if (scope != std::string::npos) return call_binding::type_name(qualifier.substr(0, scope));
+    }
+    auto type_of = [&](TSNode declaration) -> std::optional<std::string> {
+        auto name = cpp_declarator_name(cpp_declarator_child(declaration));
+        if (ts_node_is_null(name) || node_text(name) != receiver) return std::nullopt;
+        auto type = ts_node_child_by_field_name(declaration, "type", 4);
+        return ts_node_is_null(type) ? std::string() : call_binding::type_name(node_text(type));
+    };
+    uint32_t position = ts_node_start_byte(call);
+    for (auto parent = ts_node_parent(call); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        auto count = ts_node_named_child_count(parent);
+        for (uint32_t i = count; i > 0; --i) {
+            auto child = ts_node_named_child(parent, i - 1);
+            if (ts_node_start_byte(child) >= position &&
+                std::string_view(ts_node_type(parent)) != "field_declaration_list") continue;
+            std::string_view kind(ts_node_type(child));
+            if (kind == "declaration" || kind == "field_declaration") {
+                if (auto type = type_of(child)) return *type;
+            }
+        }
+        if (std::string_view(ts_node_type(parent)) == "function_definition") {
+            auto declarator = ts_node_child_by_field_name(parent, "declarator", 10);
+            while (!ts_node_is_null(declarator)) {
+                auto params = ts_node_child_by_field_name(declarator, "parameters", 10);
+                if (!ts_node_is_null(params)) {
+                    for (uint32_t i = 0; i < ts_node_named_child_count(params); ++i) {
+                        if (auto type = type_of(ts_node_named_child(params, i))) return *type;
+                    }
+                    break;
+                }
+                declarator = ts_node_child_by_field_name(declarator, "declarator", 10);
+            }
+        }
+    }
+    return {};
 }
 
 void Extractor::add_call_edge(int caller_idx, const std::string& callee_name, double confidence) {
@@ -1294,7 +1395,9 @@ void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, i
         if (!type) return false;
 
         std::string type_str(type);
-        const std::string& parent_qualname = root_qualname;
+        const bool c_cpp = *language_ == "c" || *language_ == "cpp";
+        std::string parent_qualname = c_cpp && !symbol_stack_.empty()
+            ? result_->symbols[symbol_stack_.back()].qualname : root_qualname;
 
         int sym_before = static_cast<int>(result_->symbols.size());
 
@@ -1336,6 +1439,11 @@ void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, i
         }
 
         bool pushed = static_cast<int>(result_->symbols.size()) > sym_before;
+        if (pushed && c_cpp) {
+            const auto& kind = result_->symbols[sym_before].kind;
+            pushed = kind == "function" || kind == "method" || kind == "class" ||
+                     kind == "struct" || kind == "namespace" || kind == "enum";
+        }
         if (pushed) symbol_stack_.push_back(sym_before);
 
         stack.push_back({node, ts_node_child_count(node), 0, pushed});
@@ -1362,21 +1470,52 @@ void Extractor::visit_node(TSNode root_node, const std::string& root_qualname, i
 
 void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::string& parent_qn) {
     if (type == "function_definition" || type == "function_declarator") {
-        auto name = get_declarator_identifier(node, "declarator");
-        if (name.empty()) name = get_name_from_child(node, "name");
-        if (name.empty()) {
-            uint32_t count = ts_node_named_child_count(node);
-            for (uint32_t i = 0; i < count; ++i) {
-                TSNode child = ts_node_named_child(node, i);
-                const char* ctype = ts_node_type(child);
-                if (ctype && std::string(ctype) == "identifier") {
-                    name = node_text(child);
-                    break;
-                }
+        if (type == "function_declarator") {
+            auto parent = ts_node_parent(node);
+            while (!ts_node_is_null(parent)) {
+                std::string_view parent_type(ts_node_type(parent));
+                if (parent_type == "function_definition" ||
+                    parent_type == "parameter_declaration" ||
+                    parent_type == "optional_parameter_declaration" ||
+                    parent_type == "type_definition" || parent_type == "alias_declaration" ||
+                    parent_type == "abstract_function_declarator") return;
+                if (parent_type == "declaration" || parent_type == "field_declaration") break;
+                if (parent_type == "compound_statement" || parent_type == "translation_unit") break;
+                parent = ts_node_parent(parent);
             }
         }
+        auto declarator = type == "function_definition"
+            ? ts_node_child_by_field_name(node, "declarator", 10) : node;
+        declarator = cpp_callable_declarator(declarator);
+        if (ts_node_is_null(declarator)) return;
+        if (type == "function_declarator" && !ts_node_eq(declarator, node)) return;
+        auto name_node = cpp_declarator_child(declarator);
+        if (ts_node_is_null(name_node)) return;
+        auto qualified = trim_copy(node_text(name_node));
+        auto name = get_callee_name(name_node);
         if (!name.empty()) {
-            add_symbol("function", name, node, parent_qn.empty() ? name : parent_qn + "::" + name);
+            if (qualified.starts_with("::")) qualified.erase(0, 2);
+            else if (!parent_qn.empty() && !qualified.starts_with(parent_qn + "::")) {
+                qualified = parent_qn + "::" + qualified;
+            }
+            auto symbol_node = node;
+            if (type == "function_declarator") {
+                auto parent = ts_node_parent(node);
+                if (!ts_node_is_null(parent) &&
+                    (std::string_view(ts_node_type(parent)) == "declaration" ||
+                     std::string_view(ts_node_type(parent)) == "field_declaration")) {
+                    symbol_node = parent;
+                }
+            }
+            auto signature = node_text(symbol_node);
+            auto body = ts_node_child_by_field_name(symbol_node, "body", 4);
+            if (!ts_node_is_null(body))
+                signature.resize(ts_node_start_byte(body) - ts_node_start_byte(symbol_node));
+            auto before = result_->symbols.size();
+            add_symbol("function", name, symbol_node, qualified, trim_copy(signature));
+            if (result_->symbols.size() > before) {
+                result_->symbols.back().is_definition = type == "function_definition";
+            }
         }
     }
     else if (type == "class_specifier" || type == "struct_specifier") {
@@ -1399,7 +1538,10 @@ void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::s
         }
     }
     else if (type == "field_declaration") {
-        auto name = get_declarator_identifier(node, "declarator");
+        auto decl = ts_node_child_by_field_name(node, "declarator", 10);
+        if (!ts_node_is_null(cpp_callable_declarator(decl))) return;
+        auto name_node = cpp_declarator_name(decl);
+        auto name = ts_node_is_null(name_node) ? std::string() : node_text(name_node);
         if (name.empty()) name = get_name_from_child(node, "declarator");
         if (!name.empty()) {
             add_symbol("field", name, node, parent_qn.empty() ? name : parent_qn + "::" + name);
@@ -1413,9 +1555,9 @@ void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::s
         }
     }
     else if (type == "call_expression") {
-        auto func = ts_node_child(node, 0);
+        auto func = ts_node_child_by_field_name(node, "function", 8);
         if (!ts_node_is_null(func)) {
-            std::string callee = get_callee_name(func);
+            std::string callee = trim_copy(node_text(func));
             add_call_ref(callee, node, "call_expression");
         }
     }
@@ -1450,7 +1592,10 @@ void Extractor::extract_c_cpp(TSNode node, const std::string& type, const std::s
         }
     }
     else if (type == "declaration") {
-        auto name = get_declarator_identifier(node, "declarator");
+        auto decl = ts_node_child_by_field_name(node, "declarator", 10);
+        if (!ts_node_is_null(cpp_callable_declarator(decl))) return;
+        auto name_node = cpp_declarator_name(decl);
+        auto name = ts_node_is_null(name_node) ? std::string() : node_text(name_node);
         if (name.empty()) {
             name = get_name_from_child(node, "declarator");
             if (!name.empty() && (name[0] == '*' || name[0] == '&')) {

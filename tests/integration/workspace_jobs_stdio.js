@@ -241,6 +241,9 @@ async function allReadTools(client, file = path.join(sqlDir, 'source0.c'), symbo
         ['source_at', { path: file, start_line: 1, end_line: 2 }],
         ['code_search', { query: symbol, file_pattern: file, limit: 5 }],
         ['list_http_calls', { file_pattern: file, limit: 5 }], ['get_traces', {}],
+        ['graph_diff', { base: 'HEAD', target: 'HEAD', file_pattern: file }],
+        ['get_edge_evidence', { node_id: selected.node_id, limit: 5 }],
+        ['graph_quality', {}],
         ...['symbol_get', 'callers_approx', 'callees_approx', 'references', 'context_for',
             'impact_of', 'find_similar', 'method_fields'].map(name => [name, selector])
     ];
@@ -813,7 +816,10 @@ async function connectedAcceptance(rootId) {
     result = await client.waitJob(accepted.job_id);
     assert.equal(result.status, 'completed', JSON.stringify(result));
     await writersReady();
-    assert.deepEqual(client.payload(await client.tool('workspace_list')).roots, []);
+    const remainingRoots = client.payload(await client.tool('workspace_list')).roots;
+    assert.equal(remainingRoots.length, 1);
+    assert.equal(remainingRoots[0].role, 'primary');
+    assert.equal(remainingRoots[0].path, primary);
     for (const id of [rootId, secondId]) {
         assert.equal(withDb(db => db.prepare('SELECT COUNT(*) AS n FROM files WHERE root_id=?').get(id).n), 0);
         assert.equal(withDb(db => db.prepare('SELECT COUNT(*) AS n FROM nodes INDEXED BY idx_nodes_stable_key WHERE stable_key>=? AND stable_key<?')
@@ -990,7 +996,10 @@ async function main() {
     accepted = client.payload(await client.tool('workspace_remove', { path: extra }));
     result = await client.waitJob(accepted.job_id);
     assert.equal(result.status, 'completed', JSON.stringify(result));
-    assert.deepEqual(client.payload(await client.tool('workspace_list')).roots, []);
+    const remainingRoots = client.payload(await client.tool('workspace_list')).roots;
+    assert.equal(remainingRoots.length, 1);
+    assert.equal(remainingRoots[0].role, 'primary');
+    assert.equal(remainingRoots[0].path, primary);
     let logs = await client.close();
     assert(logs.includes('stdin EOF') && logs.includes('workspace job:') && logs.includes('[child]'));
     assert(logs.includes('Changed: 1') && logs.includes('Deleted: 1'), logs.slice(-4000));

@@ -123,6 +123,7 @@ public:
 
             // T058: Initialization handshake
             if (method_str == "initialize") {
+                mcp_log("stdio: initialize received");
                 handle_initialize(id);
                 continue;
             }
@@ -202,9 +203,13 @@ public:
                             // Admission-free requests must not touch the query cache.
                             // Graph dispatch owns its independent committed read snapshot.
                             auto* path = tool_params ? json_get_str(tool_params, "path") : nullptr;
+                            auto* reparse = tool_params ? yyjson_obj_get(tool_params, "reparse") : nullptr;
+                            if (reparse && !yyjson_is_bool(reparse))
+                                throw std::runtime_error("reparse must be a boolean");
                             result = jobs_.start(name == "workspace_remove" ? "remove" :
                                 name == "workspace_refresh" ? "refresh" : "add",
-                                path ? path : "", conn_.db_path(), repo_root_);
+                                path ? path : "", conn_.db_path(), repo_root_,
+                                reparse && yyjson_get_bool(reparse));
                         } else {
                             std::unique_lock<std::mutex> gate(writer_gate_, std::try_to_lock);
                             FileLock probe(conn_.db_path() + ".lock");
@@ -452,10 +457,10 @@ private:
             "- Use file_search with absolute glob patterns to target a specific root, e.g. /Volumes/Projects/elkjs/**/*.ts\n"
             "- dir_list('.') lists all workspace roots — use those as starting points\n"
             "- code_search may be unavailable for extra roots; use symbol_search instead\n"
-            "- workspace_list returning {\"roots\":[]} is NORMAL for a single-root index: the primary "
-            "project is the implicit root (files with root_id IS NULL) and is never listed; only extra "
-            "roots added via 'workspace add' appear. It does NOT mean the repo is unindexed — confirm "
-            "with server_info.repo_root / repo_stats.file_count and browse via dir_list('.').\n\n"
+            "- workspace_list includes the primary repository as root_id=0, role=primary, "
+            "followed by added roots with role=additional. The database roots table still stores "
+            "only additional roots; primary files have root_id IS NULL. Primary graph totals are "
+            "null (not computed), not zero or a full-graph scan.\n\n"
             "KEY WORKFLOW: symbol_search (find symbol, get node_id) → context_for (source + callers + callees) "
             "→ impact_of (blast radius). "
             "For browsing: dir_list (orient) → file_summary (list symbols in file) → symbol_search + context_for. "

@@ -1,9 +1,12 @@
 #include "util/process.h"
+#include "util/stderr.h"
 #include "core/inplace_vector.h"
 #include <iostream>
 #include <filesystem>
 #include <thread>
 #include <chrono>
+#include <string_view>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,6 +24,36 @@ extern char** environ;
 #endif
 
 namespace codetopo {
+
+#ifdef _WIN32
+static std::string quote_windows_argument(const std::string& argument) {
+    if (!argument.empty() && argument.find_first_of(" \t\r\n\"") == std::string::npos) {
+        return argument;
+    }
+    std::string quoted = "\"";
+    size_t slashes = 0;
+    for (char c : argument) {
+        if (c == '\\') {
+            ++slashes;
+        } else {
+            quoted.append(c == '"' ? 2 * slashes + 1 : slashes, '\\');
+            quoted.push_back(c);
+            slashes = 0;
+        }
+    }
+    quoted.append(2 * slashes, '\\');
+    quoted.push_back('"');
+    return quoted;
+}
+#endif
+
+unsigned long get_current_process_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<unsigned long>(getpid());
+#endif
+}
 
 std::string get_self_executable_path() {
 #ifdef _WIN32
@@ -52,13 +85,7 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     // Build command line
     std::string cmdline = "\"" + exe + "\"";
     for (const auto& arg : args) {
-        cmdline += " ";
-        // Quote arguments that contain spaces
-        if (arg.find(' ') != std::string::npos) {
-            cmdline += "\"" + arg + "\"";
-        } else {
-            cmdline += arg;
-        }
+        cmdline += " " + quote_windows_argument(arg);
     }
 
     // Create Job Object so child is killed if supervisor dies
@@ -113,7 +140,7 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
 
     // Assign to job object before resuming
     if (hJob) AssignProcessToJobObject(hJob, pi.hProcess);
-    std::cerr << "[child] started pid=" << pi.dwProcessId << "\n";
+    write_stderr_line("[child] started pid=" + std::to_string(pi.dwProcessId));
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
@@ -123,9 +150,10 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     if (hJob) CloseHandle(hJob);
-    std::cerr << "[child] exited pid=" << pi.dwProcessId << " exit=" << static_cast<int>(exit_code)
-              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - started).count() << "\n";
+    write_stderr_line("[child] exited pid=" + std::to_string(pi.dwProcessId) +
+        " exit=" + std::to_string(static_cast<int>(exit_code)) +
+        " elapsed_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count()));
 
     return static_cast<int>(exit_code);
 
@@ -160,11 +188,12 @@ int spawn_and_wait(const std::string& exe, const std::vector<std::string>& args)
     }
 
     int status = 0;
-    std::cerr << "[child] started pid=" << pid << "\n";
+    write_stderr_line("[child] started pid=" + std::to_string(pid));
     waitpid(pid, &status, 0);
-    std::cerr << "[child] exited pid=" << pid << " wait_status=" << status
-              << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - started).count() << "\n";
+    write_stderr_line("[child] exited pid=" + std::to_string(pid) +
+        " wait_status=" + std::to_string(status) +
+        " elapsed_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count()));
 
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);  // Convention: 128+signal
@@ -262,9 +291,10 @@ int spawn_and_wait_with_stall_timeout(
 #endif
 }
 
-int spawn_and_read_stdout(const std::string& exe,
-                          const std::vector<std::string>& args,
-                          const std::function<void(const std::string&)>& on_line) {
+static int read_process_stdout(const std::string& exe,
+                               const std::vector<std::string>& args,
+                               const std::function<void(const std::string&)>& on_line,
+                               const std::function<void(std::string_view)>& on_bytes) {
 #ifdef _WIN32
     // Create pipe for child stdout
     SECURITY_ATTRIBUTES sa = {};
@@ -282,11 +312,7 @@ int spawn_and_read_stdout(const std::string& exe,
     // Build command line
     std::string cmdline = "\"" + exe + "\"";
     for (const auto& arg : args) {
-        cmdline += " ";
-        if (arg.find(' ') != std::string::npos)
-            cmdline += "\"" + arg + "\"";
-        else
-            cmdline += arg;
+        cmdline += " " + quote_windows_argument(arg);
     }
 
     HANDLE hJob = CreateJobObjectW(nullptr, nullptr);
@@ -296,8 +322,8 @@ int spawn_and_read_stdout(const std::string& exe,
         SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
     }
 
-    STARTUPINFOA si = {};
-    si.cb = sizeof(si);
+    STARTUPINFOEXA si = {};
+    si.StartupInfo.cb = sizeof(si);
     // Every handle passed via STARTF_USESTDHANDLES must be valid AND inheritable,
     // otherwise CreateProcess fails with ERROR_INVALID_PARAMETER (87). GetStdHandle()
     // can return NULL/non-inheritable handles when this process runs with redirected
@@ -310,16 +336,30 @@ int spawn_and_read_stdout(const std::string& exe,
                                     &nul_sa2, OPEN_EXISTING, 0, nullptr);
     HANDLE nul_stderr2 = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                      &nul_sa2, OPEN_EXISTING, 0, nullptr);
-    si.hStdInput = nul_stdin2;
-    si.hStdOutput = write_end;                       // child stdout → pipe
-    si.hStdError = nul_stderr2;                       // stderr → NUL (not read)
-    si.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul_stdin2;
+    si.StartupInfo.hStdOutput = write_end;
+    si.StartupInfo.hStdError = nul_stderr2;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    SIZE_T attribute_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attribute_size);
+    std::vector<unsigned char> attributes(attribute_size);
+    si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+    bool initialized = InitializeProcThreadAttributeList(
+        si.lpAttributeList, 1, 0, &attribute_size);
+    HANDLE inherited[] = {nul_stdin2, write_end, nul_stderr2};
+    bool handle_list = initialized && UpdateProcThreadAttribute(
+        si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        inherited, sizeof(inherited), nullptr, nullptr);
 
     PROCESS_INFORMATION pi = {};
-    if (!CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
-                        TRUE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+    bool spawned = handle_list && CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr,
+        TRUE, CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, nullptr, &si.StartupInfo, &pi);
+    DWORD spawn_error = spawned ? 0 : GetLastError();
+    if (initialized) DeleteProcThreadAttributeList(si.lpAttributeList);
+    if (!spawned) {
         std::cerr << "ERROR: Failed to spawn child process (error "
-                  << GetLastError() << ")\n";
+                  << spawn_error << ")\n";
         CloseHandle(read_end);
         CloseHandle(write_end);
         CloseHandle(nul_stdin2);
@@ -339,8 +379,13 @@ int spawn_and_read_stdout(const std::string& exe,
     std::string buffer;
     char chunk[4096];
     DWORD bytes_read;
-    while (ReadFile(read_end, chunk, sizeof(chunk), &bytes_read, nullptr)
+    BOOL read_ok = TRUE;
+    while ((read_ok = ReadFile(read_end, chunk, sizeof(chunk), &bytes_read, nullptr))
            && bytes_read > 0) {
+        if (on_bytes) {
+            on_bytes(std::string_view(chunk, bytes_read));
+            continue;
+        }
         buffer.append(chunk, bytes_read);
         size_t pos;
         while ((pos = buffer.find('\n')) != std::string::npos) {
@@ -350,6 +395,8 @@ int spawn_and_read_stdout(const std::string& exe,
             buffer.erase(0, pos + 1);
         }
     }
+    DWORD read_error = read_ok ? ERROR_SUCCESS : GetLastError();
+    bool read_failed = !read_ok && read_error != ERROR_BROKEN_PIPE;
     if (!buffer.empty()) {
         if (buffer.back() == '\r') buffer.pop_back();
         if (!buffer.empty()) on_line(buffer);
@@ -361,6 +408,10 @@ int spawn_and_read_stdout(const std::string& exe,
     GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hProcess);
     if (hJob) CloseHandle(hJob);
+    if (read_failed) {
+        std::cerr << "ERROR: Child stdout read failed (error " << read_error << ")\n";
+        return 1;
+    }
     return static_cast<int>(exit_code);
 
 #else
@@ -372,6 +423,7 @@ int spawn_and_read_stdout(const std::string& exe,
 
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
     posix_spawn_file_actions_addclose(&actions, pipefd[0]);
     posix_spawn_file_actions_addclose(&actions, pipefd[1]);
@@ -406,20 +458,48 @@ int spawn_and_read_stdout(const std::string& exe,
 
     FILE* f = fdopen(pipefd[0], "r");
     char line_buf[8192];
-    while (fgets(line_buf, sizeof(line_buf), f)) {
-        std::string line(line_buf);
-        if (!line.empty() && line.back() == '\n') line.pop_back();
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) on_line(line);
+    if (on_bytes) {
+        while (size_t bytes = fread(line_buf, 1, sizeof(line_buf), f)) {
+            on_bytes(std::string_view(line_buf, bytes));
+        }
+    } else {
+        while (fgets(line_buf, sizeof(line_buf), f)) {
+            std::string line(line_buf);
+            if (!line.empty() && line.back() == '\n') line.pop_back();
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty()) on_line(line);
+        }
     }
+    bool read_failed = ferror(f) != 0;
     fclose(f);
 
     int status = 0;
     waitpid(pid, &status, 0);
+    if (read_failed) {
+        std::cerr << "ERROR: Child stdout read failed\n";
+        return 1;
+    }
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 1;
 #endif
+}
+
+int spawn_and_read_stdout(const std::string& exe,
+                          const std::vector<std::string>& args,
+                          const std::function<void(const std::string&)>& on_line) {
+    return read_process_stdout(exe, args, on_line, {});
+}
+
+CapturedProcessOutput capture_process_stdout(
+    const std::string& exe, const std::vector<std::string>& args, size_t max_bytes) {
+    CapturedProcessOutput result;
+    result.exit_code = read_process_stdout(exe, args, {}, [&](std::string_view bytes) {
+        size_t available = max_bytes - result.output.size();
+        if (bytes.size() > available) result.truncated = true;
+        result.output.append(bytes.data(), (std::min)(available, bytes.size()));
+    });
+    return result;
 }
 
 } // namespace codetopo

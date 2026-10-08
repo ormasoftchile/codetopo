@@ -38,7 +38,8 @@ struct Config {
     bool no_gitignore = false;
     bool turbo = false;  // Aggressive perf: synchronous=OFF, batch=1000, larger cache
     bool workspace_content_fts = false;  // workspace add: opt in to line-level content FTS
-    bool force_reindex = false;  // Skip hash check, re-extract all files
+    bool force_reindex = false;  // Clear owned rows before a full rebuild
+    bool reparse_unchanged = false;  // Re-extract without clearing matching identities
     std::vector<std::string> exclude_patterns;  // Glob patterns to exclude (e.g. **/GlobalSuppressions.cs)
     bool supervised = false;   // True when running as a supervised child process
     bool safe_mode = false;    // True = commit after every file (for crash isolation)

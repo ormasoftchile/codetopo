@@ -58,6 +58,8 @@ int run_index(const Config& config) {
 
     auto repo_root = fs::canonical(config.repo_root);
     auto db_path = config.db_path;
+    auto progress_path = db_path;
+    progress_path += ".progress";
     bool targeted_mode = !config.only_files.empty() || !config.changed_file_lists.empty();
 
     // In supervised mode a live MCP reader holds a WAL read mark, so a TRUNCATE (or
@@ -215,12 +217,13 @@ int run_index(const Config& config) {
         }
 
         // Normal path: full scan + change detection
-        Scanner scanner(config);
         std::vector<ScannedFile> scanned_files;
         std::vector<std::string> targeted_deleted_paths;
         ChangeDetector::ChangeResult changes;
         {
             ScopedPhase _sc(profiler.scan);
+            ScanProgressReporter progress(progress_path);
+            Scanner scanner(config, [&](const ScanProgress& state) { progress.update(state); });
             if (targeted_mode) {
                 scanned_files = scanner.scan_paths(target_paths, targeted_deleted_paths);
                 std::cerr << "Targeted scan: " << scanned_files.size()
@@ -232,7 +235,7 @@ int run_index(const Config& config) {
                 std::cerr << "Found " << scanned_files.size() << " source files\n";
             }
 
-            ChangeDetector detector(conn, config.force_reindex);
+            ChangeDetector detector(conn, config.force_reindex || config.reparse_unchanged);
             changes = targeted_mode
                 ? detector.detect_targeted(scanned_files, targeted_deleted_paths)
                 : detector.detect(scanned_files);
@@ -421,8 +424,6 @@ int run_index(const Config& config) {
     // Progress file: child writes the relative path of the last committed
     // file to .progress after each batch commit.  On crash, the supervisor
     // reads it to identify committed vs. in-flight files.
-    auto progress_path = db_path;
-    progress_path += ".progress";
 
     // CLI, watch and workspace children can all share their DB with MCP readers.
     // Keep secondary indexes across every batch commit: readers require both

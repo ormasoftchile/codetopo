@@ -2,6 +2,8 @@
 
 #include <string>
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 
 namespace codetopo {
 namespace path_util {
@@ -26,14 +28,32 @@ inline std::string lookup_path(std::string path) {
     return result;
 }
 
+inline std::string lookup_key(const std::string& path) {
+    auto result = lookup_path(path);
+#ifdef _WIN32
+    std::transform(result.begin(), result.end(), result.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+    return result;
+}
+
+inline bool lookup_paths_equal(const std::string& left, const std::string& right) {
+    auto a = lookup_key(left);
+    auto b = lookup_key(right);
+    return !a.empty() && a == b;
+}
+
 // An absolute lookup under a root maps to its indexed relative spelling.
 inline std::string lookup_path_in_root(const std::string& path, const std::string& repo_root) {
     auto input = lookup_path(path);
     auto root = lookup_path(repo_root);
     if (input.empty() || root.empty() || !std::filesystem::path(input).is_absolute()) return {};
-    if (input == root) return ".";
+    auto input_key = lookup_key(input);
+    auto root_key = lookup_key(root);
+    if (input_key == root_key) return ".";
     if (root.back() != '/') root += '/';
-    return input.starts_with(root) ? input.substr(root.size()) : std::string();
+    if (root_key.back() != '/') root_key += '/';
+    return input_key.starts_with(root_key) ? input.substr(root.size()) : std::string();
 }
 
 // T012: Path normalization — forward slashes, relative to repo root,

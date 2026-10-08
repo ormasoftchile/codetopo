@@ -2,6 +2,7 @@
 #include "cli/cmd_index.h"
 #include "core/config.h"
 #include "db/connection.h"
+#include "db/schema.h"
 #include <sqlite3.h>
 #include <filesystem>
 #include <fstream>
@@ -109,5 +110,70 @@ TEST_CASE("Targeted reindex updates listed files and prunes listed deletes only"
         REQUIRE(targeted_scalar_int(conn, "SELECT COUNT(*) FROM files WHERE path = 'src/c.cpp'") == 0);
     }
 
+    fs::remove_all(root);
+}
+
+TEST_CASE("Reparse repairs unchanged C++ extraction without clearing stable or additional-root identities",
+          "[unit][targeted_reindex][cpp_binding]") {
+    auto root = fs::current_path() / "build" / "test_cpp_reparse";
+    fs::remove_all(root);
+    fs::create_directories(root / ".codetopo");
+    fs::create_directories(root / "src");
+    std::ofstream(root / "src" / "a.cpp") << "int alpha() { return 1; }\n";
+    std::ofstream(root / "src" / "b.cpp") << "int beta() { return 2; }\n";
+    auto cfg = targeted_config(root);
+    REQUIRE(run_index(cfg) == 0);
+    int64_t alpha;
+    int64_t beta;
+    int64_t file_id;
+    std::string hash;
+    {
+        Connection conn(cfg.db_path);
+        schema::register_custom_functions(conn.raw());
+        alpha = targeted_scalar_int(conn, "SELECT id FROM nodes WHERE stable_key='src/a.cpp::function::alpha'");
+        beta = targeted_scalar_int(conn, "SELECT id FROM nodes WHERE stable_key='src/b.cpp::function::beta'");
+        file_id = targeted_scalar_int(conn, "SELECT id FROM files WHERE path='src/a.cpp'");
+        hash = targeted_scalar_text(conn, "SELECT content_hash FROM files WHERE id=" + std::to_string(file_id));
+        conn.exec(
+            "INSERT INTO nodes(node_type,file_id,kind,name,qualname,start_line,end_line,stable_key) VALUES("
+            "'symbol'," + std::to_string(file_id) + ",'function','alpha','alpha',1,1,'src/a.cpp::function::alpha#2')");
+        conn.exec(
+            "INSERT INTO edges(src_id,dst_id,kind,confidence,evidence) VALUES(" +
+            std::to_string(beta) + "," + std::to_string(alpha) + ",'calls',0.75,'name-match')");
+        conn.exec(
+            "INSERT INTO edges(src_id,dst_id,kind,confidence,evidence,source,observed_count) VALUES(" +
+            std::to_string(beta) + "," + std::to_string(alpha) + ",'calls',0.99,'observed','runtime',42)");
+        conn.exec("INSERT INTO roots(id,path,added_at) VALUES(1,'additional-root',datetime('now'))");
+        conn.exec(
+            "INSERT INTO files(id,path,language,size_bytes,mtime_ns,content_hash,parse_status,root_id) "
+            "VALUES(500,'additional-root/keep.cpp','cpp',1,1,'keep','ok',1)");
+        conn.exec(
+            "INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
+            "VALUES(500,'symbol',500,'function','keep','1:keep.cpp::function::keep')");
+        conn.exec(
+            "INSERT INTO edges(id,src_id,dst_id,kind,confidence,evidence) "
+            "VALUES(500,500,500,'calls',0.9,'keep')");
+    }
+    cfg.reparse_unchanged = true;
+    cfg.only_files = {"src/a.cpp", "src/b.cpp"};
+    REQUIRE(run_index(cfg) == 0);
+    {
+        Connection conn(cfg.db_path);
+        CHECK(targeted_scalar_int(conn, "SELECT id FROM nodes WHERE stable_key='src/a.cpp::function::alpha'") == alpha);
+        CHECK(targeted_scalar_int(conn, "SELECT id FROM nodes WHERE stable_key='src/b.cpp::function::beta'") == beta);
+        CHECK(targeted_scalar_int(conn, "SELECT id FROM files WHERE path='src/a.cpp'") == file_id);
+        CHECK(targeted_scalar_text(conn, "SELECT content_hash FROM files WHERE id=" + std::to_string(file_id)) == hash);
+        CHECK(targeted_scalar_int(conn, "SELECT COUNT(*) FROM nodes WHERE name='alpha'") == 1);
+        CHECK(targeted_scalar_int(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=" + std::to_string(beta) +
+            " AND dst_id=" + std::to_string(alpha) + " AND source='static'") == 0);
+        CHECK(targeted_scalar_int(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=" + std::to_string(beta) +
+            " AND dst_id=" + std::to_string(alpha) + " AND source='runtime' AND observed_count=42") == 1);
+        CHECK(targeted_scalar_int(conn, "SELECT COUNT(*) FROM files WHERE id=500 AND root_id=1") == 1);
+        CHECK(targeted_scalar_int(conn, "SELECT COUNT(*) FROM nodes WHERE id=500 AND name='keep'") == 1);
+        CHECK(targeted_scalar_int(conn, "SELECT COUNT(*) FROM edges WHERE id=500 AND evidence='keep'") == 1);
+        CHECK(conn.foreign_key_check() == 0);
+    }
     fs::remove_all(root);
 }

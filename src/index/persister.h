@@ -2,6 +2,7 @@
 
 #include "db/connection.h"
 #include "index/extractor.h"
+#include "index/call_binding_db.h"
 #include "index/scanner.h"
 #include "util/hash.h"
 #include "util/git.h"
@@ -667,28 +668,30 @@ public:
         // Build file_id → file path early so symbol/include/class lookup can prefer
         // real implementation files over test/mock/fake/stub variants.
         std::unordered_map<int64_t, std::string> fileid_to_path;
+        std::unordered_map<int64_t, std::string> fileid_to_language;
         {
             sqlite3_stmt* stmt = nullptr;
             sqlite3_prepare_v2(conn_.raw(),
-                "SELECT id, path FROM files", -1, &stmt, nullptr);
+                "SELECT id, path, language FROM files", -1, &stmt, nullptr);
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 const unsigned char* path_raw = sqlite3_column_text(stmt, 1);
                 if (!path_raw) continue;
                 fileid_to_path[sqlite3_column_int64(stmt, 0)] =
                     reinterpret_cast<const char*>(path_raw);
+                const auto* language = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+                fileid_to_language[sqlite3_column_int64(stmt, 0)] = language ? language : "";
             }
             sqlite3_finalize(stmt);
         }
 
         // --- Step 1: Build in-memory lookup: name → candidate symbols ---
         // Also builds class_map in the same scan (merges former Step 4).
-        // Keep up to 50 candidates per name, sorted to prefer non-test definitions
-        // first so later resolution can use position as a quality signal.
         struct SymbolEntry {
             int64_t id;
             int64_t file_id;
             bool is_definition;
             bool is_test_or_mock;
+            call_binding::Target target;
         };
         std::unordered_map<std::string, std::vector<SymbolEntry>> symbol_map;
         symbol_map.reserve(2500000);
@@ -702,6 +705,8 @@ public:
         // All type-like kinds (class/struct/interface/enum/union/typedef/type_alias/type),
         // used to resolve 'type_ref' refs so type usages become queryable references.
         std::unordered_map<std::string, ClassEntry> type_map;
+        std::unordered_set<std::string> class_names;
+        std::unordered_set<std::string> namespace_names;
 
         // Incremental (targeted) mode: the unresolved-ref set spans the WHOLE repo (every
         // external/stdlib symbol that never had a definition stays resolved_node_id IS NULL
@@ -804,15 +809,7 @@ public:
                 };
                 for (const auto& full : affected_names) {
                     want_add(full);
-                    size_t suffix = std::string::npos;
-                    if (size_t p = full.rfind('.'); p != std::string::npos) suffix = p + 1;
-                    if (size_t p = full.rfind("::"); p != std::string::npos &&
-                        (suffix == std::string::npos || p + 2 > suffix)) suffix = p + 2;
-                    if (size_t p = full.rfind("->"); p != std::string::npos &&
-                        (suffix == std::string::npos || p + 2 > suffix)) suffix = p + 2;
-                    if (suffix != std::string::npos && suffix < full.size()) {
-                        want_add(full.substr(suffix));
-                    }
+                    want_add(call_binding::bare_name(full));
                 }
                 sqlite3_finalize(insw);
             }
@@ -826,10 +823,12 @@ public:
                     // Scoped to names referenced/defined by the changed files. CROSS JOIN
                     // pins the tiny temp table as the outer driver (no ANALYZE stats exist,
                     // so the planner would otherwise scan every symbol node).
-                    ? "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind "
-                      "FROM temp.__ct_want w CROSS JOIN nodes n "
+                    ? "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind, "
+                      "COALESCE(NULLIF(n.qualname,''),n.name), COALESCE(n.signature,'') "
+                      "FROM temp.__ct_want w CROSS JOIN nodes n INDEXED BY idx_nodes_name_type "
                       "ON n.name = w.name AND n.node_type = 'symbol'"
-                    : "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind "
+                    : "SELECT n.id, n.name, n.file_id, n.is_definition, n.kind, "
+                      "COALESCE(NULLIF(n.qualname,''),n.name), COALESCE(n.signature,'') "
                       "FROM files f CROSS JOIN nodes n INDEXED BY idx_nodes_file_id "
                       "ON n.file_id = f.id WHERE n.node_type = 'symbol'",
                 -1, &stmt, nullptr);
@@ -848,16 +847,13 @@ public:
                 const bool is_test_or_mock = path_it != fileid_to_path.end() &&
                     is_test_or_mock_path(path_it->second);
 
-                auto& entries = symbol_map[name];
-                if (entries.size() < 64) {
-                    entries.push_back({id, file_id, is_def, is_test_or_mock});
-                } else if (is_def && !is_test_or_mock) {
-                    for (auto& entry : entries) {
-                        if (entry.is_test_or_mock || !entry.is_definition) {
-                            entry = {id, file_id, is_def, is_test_or_mock};
-                            break;
-                        }
-                    }
+                const auto* qualname = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+                const auto* signature = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
+                if (kind_raw && (std::string_view(kind_raw) == "function" ||
+                    std::string_view(kind_raw) == "method" || std::string_view(kind_raw) == "constructor_fn")) {
+                    symbol_map[name].push_back({id, file_id, is_def, is_test_or_mock,
+                        call_binding::target(kind_raw, name, qualname ? qualname : name,
+                            signature ? signature : "", fileid_to_language[file_id])});
                 }
 
                 // Build class_map inline (replaces former Step 4 scan)
@@ -876,7 +872,10 @@ public:
                     };
                     if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface") {
                         prefer(class_map);
+                        class_names.insert(call_binding::without_templates(qualname ? qualname : name));
                     }
+                    if (kind_sv == "namespace")
+                        namespace_names.insert(call_binding::without_templates(qualname ? qualname : name));
                     if (kind_sv == "class" || kind_sv == "struct" || kind_sv == "interface" ||
                         kind_sv == "enum" || kind_sv == "union" || kind_sv == "typedef" ||
                         kind_sv == "type_alias" || kind_sv == "type") {
@@ -893,7 +892,6 @@ public:
             }
             sqlite3_finalize(stmt);
 
-            // Sort each candidate list once after all symbols are loaded and cap at 50
             for (auto& [_, entries] : symbol_map) {
                 std::sort(entries.begin(), entries.end(),
                     [](const SymbolEntry& a, const SymbolEntry& b) {
@@ -905,7 +903,18 @@ public:
                         }
                         return a.id < b.id;
                     });
-                if (entries.size() > 50) entries.resize(50);
+            }
+            if (incremental) {
+                std::unordered_set<std::string> owners;
+                for (const auto& [_, entries] : symbol_map) {
+                    for (const auto& entry : entries) {
+                        auto owner = call_binding::owner_scope(entry.target.qualname, entry.target.name);
+                        if (!owner.empty()) owners.insert(owner);
+                    }
+                }
+                auto scopes = call_binding::load_scopes(conn_, owners);
+                class_names.insert(scopes.classes.begin(), scopes.classes.end());
+                namespace_names.insert(scopes.namespaces.begin(), scopes.namespaces.end());
             }
             const bool color_output = stderr_is_tty();
             std::cerr << "  Loaded " << stderr_cyan(format_with_commas(loaded), color_output)
@@ -1028,12 +1037,17 @@ public:
                 // Re-resolve ONLY the pre-computed affected ref ids. CROSS JOIN pins the tiny
                 // __ct_affected as the driver so refs is reached by rowid — the repo-wide NULL
                 // backlog is never scanned. (Verified index-driven via EXPLAIN QUERY PLAN.)
-                ? "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint "
+                ? "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint, "
+                  "COALESCE(r.arg_count,-1), COALESCE(cn.qualname,''), COALESCE(f.language,'') "
                   "FROM temp.__ct_affected a CROSS JOIN refs r ON r.id = a.id "
+                  "LEFT JOIN nodes cn ON cn.id=r.containing_node_id "
+                  "LEFT JOIN files f ON f.id=r.file_id "
                   "WHERE r.resolved_node_id IS NULL"
-                : "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint "
+                : "SELECT r.id, r.file_id, r.kind, r.name, r.containing_node_id, r.receiver_type_hint, "
+                  "COALESCE(r.arg_count,-1), COALESCE(cn.qualname,''), COALESCE(f.language,'') "
                   "FROM files f INDEXED BY idx_files_root "
                   "CROSS JOIN refs r INDEXED BY idx_refs_file_id ON r.file_id = f.id "
+                  "LEFT JOIN nodes cn ON cn.id=r.containing_node_id "
                   "WHERE f.root_id IS NULL AND r.resolved_node_id IS NULL",
             -1, &ref_stmt, nullptr);
 
@@ -1043,6 +1057,7 @@ public:
             int64_t dst_id;   // resolved target node id
             const char* kind; // edge kind (static string literal)
             double confidence = 0.7;
+            const char* evidence = "name-match";
         };
         std::vector<EdgeTuple> edge_tuples;
         edge_tuples.reserve(1000000);
@@ -1089,7 +1104,7 @@ public:
             sqlite3_stmt* pe = nullptr;
             sqlite3_prepare_v2(conn_.raw(),
                 "SELECT e.src_id, e.dst_id, e.kind FROM edges e "
-                "WHERE e.evidence = 'name-match' AND e.src_id IN ("
+                "WHERE e.src_id IN ("
                 "  SELECT COALESCE(r.containing_node_id, fn.id) "
                 "  FROM temp.__ct_affected a CROSS JOIN refs r ON r.id = a.id "
                 "  LEFT JOIN files f ON f.id = r.file_id "
@@ -1107,36 +1122,30 @@ public:
 
         conn_.exec("BEGIN TRANSACTION");
         int batch = 0;
-        int call_resolved = 0, include_resolved = 0, inherit_resolved = 0, type_ref_resolved = 0;
+        int call_resolved = 0, call_ambiguous = 0, include_resolved = 0, inherit_resolved = 0, type_ref_resolved = 0;
         std::string name;
         name.reserve(256);  // reuse buffer across iterations
         auto find_cross_file_symbols = [&](
             const std::string& ref_name,
-            int64_t ref_file_id,
-            const std::string& receiver_type_hint
+            const std::string& receiver_type_hint,
+            int arguments,
+            const std::string& caller_language,
+            const std::string& caller_qualname
         ) -> std::vector<std::pair<int64_t, double>> {
             std::vector<std::pair<int64_t, double>> results;
 
             auto emit_candidates = [&](const std::vector<SymbolEntry>& entries) {
                 for (const auto& sym : entries) {
-                    if (sym.file_id == ref_file_id) continue;
+                    if (!call_binding::compatible(sym.target, ref_name, receiver_type_hint,
+                        arguments, caller_language, class_names, caller_qualname, namespace_names)) continue;
 
                     double conf = sym.is_definition ? 0.75 : 0.65;
                     if (sym.is_test_or_mock) conf -= 0.15;
 
                     if (!receiver_type_hint.empty()) {
-                        auto path_it = fileid_to_path.find(sym.file_id);
-                        if (path_it != fileid_to_path.end()) {
-                            std::string path_lower = path_it->second;
-                            std::string hint_lower = receiver_type_hint;
-                            std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(),
-                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                            std::transform(hint_lower.begin(), hint_lower.end(), hint_lower.begin(),
-                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                            if (path_lower.find(hint_lower) != std::string::npos) {
-                                conf = std::min(conf + 0.20, 0.95);
-                            }
-                        }
+                        auto owner = call_binding::owner_scope(sym.target.qualname, sym.target.name);
+                        if (call_binding::same_owner(owner, call_binding::type_name(receiver_type_hint)))
+                            conf = std::min(conf + 0.20, 0.95);
                     }
 
                     if (conf >= 0.3) {
@@ -1150,21 +1159,8 @@ public:
                 emit_candidates(it->second);
             }
 
-            size_t suffix_start = std::string::npos;
-            if (size_t dot_pos = ref_name.rfind('.'); dot_pos != std::string::npos) {
-                suffix_start = dot_pos + 1;
-            }
-            if (size_t scope_pos = ref_name.rfind("::"); scope_pos != std::string::npos &&
-                (suffix_start == std::string::npos || scope_pos + 2 > suffix_start)) {
-                suffix_start = scope_pos + 2;
-            }
-            if (size_t arrow_pos = ref_name.rfind("->"); arrow_pos != std::string::npos &&
-                (suffix_start == std::string::npos || arrow_pos + 2 > suffix_start)) {
-                suffix_start = arrow_pos + 2;
-            }
-
-            if (suffix_start != std::string::npos && suffix_start < ref_name.size()) {
-                std::string bare = ref_name.substr(suffix_start);
+            auto bare = call_binding::bare_name(ref_name);
+            if (bare != ref_name) {
                 auto it2 = symbol_map.find(bare);
                 if (it2 != symbol_map.end() && it2 != it) {
                     emit_candidates(it2->second);
@@ -1186,7 +1182,9 @@ public:
             }
 
             std::sort(results.begin(), results.end(),
-                [](const auto& a, const auto& b) { return a.second > b.second; });
+                [](const auto& a, const auto& b) {
+                    return a.second != b.second ? a.second > b.second : a.first < b.first;
+                });
 
             return results;
         };
@@ -1207,20 +1205,26 @@ public:
             std::string_view kind(kind_raw);
             name.assign(name_raw);
             std::string receiver_type_hint = rth_raw ? rth_raw : "";
+            int arguments = sqlite3_column_int(ref_stmt, 6);
+            const auto* caller_qn = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 7));
+            const auto* caller_lang = reinterpret_cast<const char*>(sqlite3_column_text(ref_stmt, 8));
             int64_t resolved_id = 0;
             bool resolved = false;
             const char* edge_kind = nullptr;
 
             if (kind == "call") {
-                auto candidates = find_cross_file_symbols(name, ref_file_id, receiver_type_hint);
+                auto candidates = find_cross_file_symbols(name, receiver_type_hint,
+                    arguments, caller_lang ? caller_lang : "", caller_qn ? caller_qn : "");
                 if (!candidates.empty()) {
-                    resolved_id = candidates[0].first;
-                    resolved = true;
+                    bool unique = candidates.size() == 1;
                     edge_kind = "calls";
-                    ++call_resolved;
-                    db::bind(update_stmt, resolved_id, ref_id);
-                    sqlite3_step(update_stmt);
-                    ++total_resolved;
+                    if (unique) {
+                        resolved_id = candidates[0].first;
+                        ++call_resolved;
+                        db::bind(update_stmt, resolved_id, ref_id);
+                        step_write(update_stmt);
+                        ++total_resolved;
+                    } else ++call_ambiguous;
 
                     auto path_it = fileid_to_path.find(ref_file_id);
                     if (path_it != fileid_to_path.end()) {
@@ -1231,7 +1235,9 @@ public:
                             for (size_t i = 0; i < std::min(candidates.size(), MAX_EDGES_PER_REF); ++i) {
                                 const auto& [cand_id, cand_conf] = candidates[i];
                                 if (seen_edge_keys.insert(EdgeKey{src_id, cand_id, 1}).second) {
-                                    edge_tuples.push_back({src_id, cand_id, edge_kind, cand_conf});
+                                    edge_tuples.push_back({src_id, cand_id, edge_kind,
+                                        unique ? cand_conf : std::min(cand_conf, 0.60),
+                                        unique ? "name-match" : "call-candidate"});
                                 }
                             }
                         }
@@ -1310,6 +1316,8 @@ public:
                   << stderr_cyan(format_with_commas(include_resolved), color_output) << " include, "
                   << stderr_cyan(format_with_commas(inherit_resolved), color_output) << " inherit, "
                   << stderr_cyan(format_with_commas(type_ref_resolved), color_output) << " type refs\n";
+        if (call_ambiguous > 0)
+            std::cerr << "  Kept " << call_ambiguous << " ambiguous call refs unresolved (candidate edges only)\n";
 
         // --- Step 6: Add missing edges without invalidating unchanged primary or
         // workspace relationships. Keep source/destination indexes live for readers
@@ -1321,21 +1329,20 @@ public:
 
         // Batch edge INSERT using 400-row chunks (1,600 SQL parameters, well within SQLite limit).
         const int RESOLVE_EDGE_BATCH = 400;
-        const int PARAMS_PER_EDGE = 4;  // src_id, dst_id, kind, confidence
+        const int PARAMS_PER_EDGE = 5;
 
         // Prepare batch statement: 400 rows × "(?,?,?,?, 'name-match')"
         std::string batch_sql =
-            "WITH candidates(src_id,dst_id,kind,confidence) AS (VALUES ";
+            "WITH candidates(src_id,dst_id,kind,confidence,evidence) AS (VALUES ";
         for (int i = 0; i < RESOLVE_EDGE_BATCH; ++i) {
             if (i > 0) batch_sql += ",";
-            batch_sql += "(?,?,?,?)";
+            batch_sql += "(?,?,?,?,?)";
         }
         batch_sql +=
             ") INSERT INTO edges(src_id,dst_id,kind,confidence,evidence) "
-            "SELECT c.src_id,c.dst_id,c.kind,c.confidence,'name-match' FROM candidates c "
+            "SELECT c.src_id,c.dst_id,c.kind,c.confidence,c.evidence FROM candidates c "
             "WHERE NOT EXISTS (SELECT 1 FROM edges e INDEXED BY idx_edges_src "
-            "WHERE e.src_id=c.src_id AND e.kind=c.kind AND e.dst_id=c.dst_id "
-            "AND e.evidence='name-match')";
+            "WHERE e.src_id=c.src_id AND e.kind=c.kind AND e.dst_id=c.dst_id)";
         sqlite3_stmt* batch_edge_stmt = nullptr;
         prepare_cached(batch_sql.c_str(), &batch_edge_stmt);
 
@@ -1343,9 +1350,9 @@ public:
         sqlite3_stmt* single_edge_stmt = nullptr;
         prepare_cached(
             "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-            "SELECT ?, ?, ?, ?, 'name-match' "
+            "SELECT ?, ?, ?, ?, ? "
             "WHERE NOT EXISTS (SELECT 1 FROM edges e INDEXED BY idx_edges_src "
-            "WHERE e.src_id=? AND e.kind=? AND e.dst_id=? AND e.evidence='name-match')",
+            "WHERE e.src_id=? AND e.kind=? AND e.dst_id=?)",
             &single_edge_stmt);
 
         int total_edges = static_cast<int>(edge_tuples.size());
@@ -1362,6 +1369,7 @@ public:
                 sqlite3_bind_int64(batch_edge_stmt, base + 1, t.dst_id);
                 sqlite3_bind_text(batch_edge_stmt, base + 2, t.kind, -1, SQLITE_STATIC);
                 sqlite3_bind_double(batch_edge_stmt, base + 3, t.confidence);
+                sqlite3_bind_text(batch_edge_stmt, base + 4, t.evidence, -1, SQLITE_STATIC);
             }
             step_write(batch_edge_stmt);
             edges_created += sqlite3_changes(conn_.raw());
@@ -1380,7 +1388,7 @@ public:
 
         for (int e = 0; e < remainder; ++e) {
             const auto& t = edge_tuples[full_chunks * RESOLVE_EDGE_BATCH + e];
-            db::bind(single_edge_stmt, t.src_id, t.dst_id, t.kind, t.confidence,
+            db::bind(single_edge_stmt, t.src_id, t.dst_id, t.kind, t.confidence, t.evidence,
                      t.src_id, t.kind, t.dst_id);
             step_write(single_edge_stmt);
             edges_created += sqlite3_changes(conn_.raw());

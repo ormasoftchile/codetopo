@@ -7,6 +7,7 @@
 #include "util/process.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -222,7 +223,44 @@ struct ReindexState {
                                       : "reindex: started (targeted, "
                                           + std::to_string(run_paths.size()) + " paths)");
                     auto exe = get_self_executable_path();
+                    mcp_log("reindex: child arguments --root " + root + " --db " + db);
+                    auto progress_since = fs::file_time_type::clock::now();
+                    std::jthread progress_monitor([&, progress_since](std::stop_token stop) {
+                        try {
+                            std::mutex wait_mutex;
+                            std::condition_variable_any wake;
+                            std::unique_lock wait_lock(wait_mutex);
+                            std::string previous;
+                            while (!stop.stop_requested()) {
+                                wake.wait_for(wait_lock, stop, std::chrono::seconds(5),
+                                              [] { return false; });
+                                if (stop.stop_requested()) break;
+                                std::error_code ec;
+                                auto path = fs::path(db + ".progress");
+                                auto mtime = fs::last_write_time(path, ec);
+                                std::string progress;
+                                if (!ec && mtime >= progress_since) {
+                                    std::ifstream input(path);
+                                    std::getline(input, progress);
+                                }
+                                if (progress.empty()) {
+                                    progress = "waiting for child progress";
+                                }
+                                if (progress != previous) {
+                                    previous = progress;
+                                    mcp_log("reindex: progress " + progress + " elapsed=" +
+                                        format_duration_seconds(
+                                            std::chrono::steady_clock::now() - started));
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            mcp_log("reindex: progress monitor failed: " +
+                                    truncate_for_log(e.what()));
+                        }
+                    });
                     int rc = spawn(exe, args);
+                    progress_monitor.request_stop();
+                    progress_monitor.join();
                     if (changed_file) {
                         std::error_code ec;
                         fs::remove(*changed_file, ec);

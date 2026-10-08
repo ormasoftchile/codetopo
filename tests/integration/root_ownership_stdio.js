@@ -235,8 +235,38 @@ async function main() {
     await waitForIndexState('current', bootstrap.index_generation);
     await waitForHealthStatus(first, 'ready');
 
+    db = openDb();
+    const writerLock = dbPath + '.lock';
+    fs.writeFileSync(writerLock, String(process.pid), { flag: 'wx' });
+    try {
+        db.exec('BEGIN IMMEDIATE');
+        db.prepare('UPDATE roots SET path = ? WHERE id = ?')
+            .run(path.join(base, 'uncommitted-extra'), root.id);
+        const started = Date.now();
+        const listing = run(['workspace', 'list'], primary);
+        assert(Date.now() - started < 3000, 'Read-only workspace listing waited for the writer');
+        assert(listing.stdout.includes(extra), listing.stdout);
+        assert(!listing.stdout.includes('uncommitted-extra'), listing.stdout);
+        assert.match(listing.stdout, /Workspace roots \(2\)/);
+        assert(listing.stdout.includes(primary), listing.stdout);
+        assert(listing.stdout.includes('[primary]'), listing.stdout);
+        assert(listing.stdout.includes('[additional]'), listing.stdout);
+    } finally {
+        db.exec('ROLLBACK');
+        db.close();
+        fs.unlinkSync(writerLock);
+    }
+
     const logs = (await first.close()) + (await second.close());
     assert(!/ownership conflict|reindex: failed/.test(logs), logs);
+    for (const client of [first, second]) {
+        const logFile = path.join(primary, '.codetopo', 'logs', `mcp-${client.child.pid}.log`);
+        const diagnostics = fs.readFileSync(logFile, 'utf8');
+        assert(diagnostics.includes('stdio: ready; waiting for client initialize'), diagnostics);
+        assert(diagnostics.includes('stdio: initialize received'), diagnostics);
+        assert(diagnostics.includes('tool: server_info'), diagnostics);
+        assert(diagnostics.includes('codetopo mcp stopped'), diagnostics);
+    }
     console.log('PASS: authoritative root, non-destructive bootstrap, concurrent MCP coordination');
 }
 

@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     bool index_safe_mode = false;
     bool index_resume = false;
     bool index_force = false;
+    bool index_reparse = false;
     std::vector<std::string> index_only_files;
     std::vector<std::string> index_changed_file_lists;
 
@@ -63,7 +64,9 @@ int main(int argc, char** argv) {
     sub_index->add_flag("--supervised", index_supervised, "Run as supervised child (internal)")->group("");
     sub_index->add_flag("--safe-mode", index_safe_mode, "Commit after every file (internal)")->group("");
     sub_index->add_flag("--resume", index_resume, "Resume from cached worklist (internal)")->group("");
-    sub_index->add_flag("--force", index_force, "Re-extract all files even if content is unchanged");
+    auto* index_force_opt = sub_index->add_flag("--force", index_force, "Clear owned index rows and rebuild");
+    sub_index->add_flag("--reparse", index_reparse,
+        "Re-extract unchanged files without clearing the index")->excludes(index_force_opt);
     int index_progress_offset = 0;
     int index_progress_total = 0;
     int index_max_files = 0;
@@ -256,6 +259,20 @@ int main(int argc, char** argv) {
     ws_add->add_flag("--with-content-fts", ws_with_content_fts,
         "Opt in to line-level content FTS for this added root (default: off)");
 
+    auto* ws_refresh = sub_workspace->add_subcommand("refresh", "Refresh an existing additional workspace root");
+    std::string ws_refresh_target;
+    std::string ws_refresh_root = ".";
+    int ws_refresh_threads = 4;
+    int ws_refresh_lock_timeout = 30;
+    bool ws_refresh_reparse = false;
+    ws_refresh->add_option("target", ws_refresh_target, "Additional root to refresh")->required();
+    ws_refresh->add_option("--root", ws_refresh_root, "Primary project root")->default_val(".");
+    ws_refresh->add_option("--threads", ws_refresh_threads, "Source index worker count")->default_val(4);
+    ws_refresh->add_option("--lock-timeout", ws_refresh_lock_timeout,
+        "Seconds to wait for writer admission")->default_val(30);
+    ws_refresh->add_flag("--reparse", ws_refresh_reparse,
+        "Re-extract unchanged source files without clearing the source index");
+
     auto* ws_remove = sub_workspace->add_subcommand("remove", "Remove a root from the workspace");
     std::string ws_remove_target;
     std::string ws_remove_root_pos = ".";
@@ -295,6 +312,7 @@ int main(int argc, char** argv) {
         cfg.no_gitignore = index_no_gitignore;
         cfg.turbo = index_turbo;
         cfg.force_reindex = index_force;
+        cfg.reparse_unchanged = index_reparse;
         cfg.exclude_patterns = index_exclude;
         cfg.only_files = index_only_files;
         cfg.changed_file_lists = index_changed_file_lists;
@@ -440,6 +458,13 @@ int main(int argc, char** argv) {
                 cfg.turbo = ws_turbo;
                 cfg.workspace_content_fts = ws_with_content_fts;
                 return codetopo::run_workspace_add(ws_root, ws_add_target, cfg, ws_add_lock_timeout);
+            }
+            if (ws_refresh->parsed()) {
+                codetopo::Config cfg;
+                cfg.thread_count = ws_refresh_threads;
+                cfg.reparse_unchanged = ws_refresh_reparse;
+                return codetopo::run_workspace_add(ws_refresh_root, ws_refresh_target,
+                    cfg, ws_refresh_lock_timeout, true);
             }
             if (ws_remove->parsed()) {
                 std::string ws_root = (ws_remove_root_pos_opt->count() > 0) ? ws_remove_root_pos : ws_remove_root_flag;

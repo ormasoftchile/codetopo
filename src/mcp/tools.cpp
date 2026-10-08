@@ -6,10 +6,14 @@
 #include "util/path.h"
 #include "util/git.h"
 #include "util/process.h"
+#include "util/log.h"
+#include "util/hash.h"
 #include "mcp/error.h"
 #include "db/schema.h"
 #include "db/bind.h"
+#include "db/workspace.h"
 #include "index/ownership.h"
+#include "index/call_binding.h"
 #include "index/quality.h"
 #include "index/diff.h"
 #include "util/lock.h"
@@ -67,6 +71,15 @@ static size_t cstr_len(const char* s) {
 }
 
 static std::string tool_error_json(const std::string& message);
+
+static const char* edge_interpretation(std::string_view evidence, std::string_view source) {
+    if (source == "runtime") return "runtime_observed";
+    if (evidence == "call-candidate" || evidence == "workspace_call_candidate")
+        return "ambiguous_call_candidate";
+    if (evidence == "name-match" || evidence == "workspace_cross_root")
+        return "name_match_heuristic";
+    return "indexed_relationship";
+}
 
 static constexpr const char* kPublicSymbolSql =
     "(n.visibility = 'public' OR "
@@ -376,7 +389,13 @@ static int64_t resolve_node_id(yyjson_val* params, Connection& conn, QueryCache&
         if (error) *error = McpError::invalid_input("Invalid 'file' path").to_json_rpc(0);
         return -1;
     }
-    auto file = resolve_db_path(conn.raw(), input_file, repo_root);
+    std::string file;
+    try {
+        file = resolve_db_path(conn.raw(), input_file, repo_root);
+    } catch (const std::invalid_argument& e) {
+        if (error) *error = McpError::invalid_input(e.what()).to_json_rpc(0);
+        return -1;
+    }
     if (file.empty()) {
         if (error) *error = McpError::not_found("File not found: " + input_file).to_json_rpc(0);
         return -1;
@@ -933,55 +952,6 @@ static std::string extract_receiver_hint(const std::string& callee_text,
     return {};
 }
 
-static std::string trim_ascii(std::string s) {
-    size_t first = 0;
-    while (first < s.size() && std::isspace(static_cast<unsigned char>(s[first]))) ++first;
-    size_t last = s.size();
-    while (last > first && std::isspace(static_cast<unsigned char>(s[last - 1]))) --last;
-    return s.substr(first, last - first);
-}
-
-static std::vector<std::string> split_top_level_commas(const std::string& text) {
-    std::vector<std::string> parts;
-    std::string current;
-    int paren = 0, angle = 0, brace = 0, bracket = 0;
-    char quote = 0;
-    for (size_t i = 0; i < text.size(); ++i) {
-        char c = text[i];
-        if (quote) {
-            current += c;
-            if (c == quote && (i == 0 || text[i - 1] != '\\')) quote = 0;
-            continue;
-        }
-        if (c == '"' || c == '\'' || c == '`') {
-            quote = c;
-            current += c;
-            continue;
-        }
-        if (c == '(') ++paren;
-        else if (c == ')' && paren > 0) --paren;
-        else if (c == '<') ++angle;
-        else if (c == '>' && angle > 0) --angle;
-        else if (c == '{') ++brace;
-        else if (c == '}' && brace > 0) --brace;
-        else if (c == '[') ++bracket;
-        else if (c == ']' && bracket > 0) --bracket;
-        if (c == ',' && paren == 0 && angle == 0 && brace == 0 && bracket == 0) {
-            parts.push_back(trim_ascii(current));
-            current.clear();
-        } else {
-            current += c;
-        }
-    }
-    auto tail = trim_ascii(current);
-    if (!tail.empty() || !parts.empty()) parts.push_back(tail);
-    if (parts.size() == 1) {
-        auto only = lower_copy(trim_ascii(parts[0]));
-        if (only.empty() || only == "void") parts.clear();
-    }
-    return parts;
-}
-
 static std::string classify_param_shape(std::string param) {
     param = lower_copy(param);
     if (param.find("=>") != std::string::npos || param.find("function") != std::string::npos ||
@@ -1006,44 +976,6 @@ static std::string classify_param_shape(std::string param) {
     return "unknown";
 }
 
-static bool has_top_level_char(const std::string& text, char needle) {
-    int paren = 0, angle = 0, brace = 0, bracket = 0;
-    char quote = 0;
-    for (size_t i = 0; i < text.size(); ++i) {
-        char c = text[i];
-        if (quote) {
-            if (c == quote && (i == 0 || text[i - 1] != '\\')) quote = 0;
-            continue;
-        }
-        if (c == '"' || c == '\'' || c == '`') {
-            quote = c;
-            continue;
-        }
-        if (c == '(') ++paren;
-        else if (c == ')' && paren > 0) --paren;
-        else if (c == '<') ++angle;
-        else if (c == '>' && angle > 0) --angle;
-        else if (c == '{') ++brace;
-        else if (c == '}' && brace > 0) --brace;
-        else if (c == '[') ++bracket;
-        else if (c == ']' && bracket > 0) --bracket;
-        else if (c == needle && paren == 0 && angle == 0 && brace == 0 && bracket == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool param_is_optional(const std::string& param) {
-    if (has_top_level_char(param, '=')) return true;
-    size_t colon = param.find(':');
-    size_t limit = colon == std::string::npos ? param.size() : colon;
-    for (size_t i = 0; i < limit; ++i) {
-        if (param[i] == '?') return true;
-    }
-    return false;
-}
-
 static std::string join_pattern_parts(const std::vector<std::string>& parts) {
     std::string out;
     for (const auto& part : parts) {
@@ -1058,38 +990,14 @@ static bool parse_param_shape_from_text(const std::string& text,
                                         int& min_param_count,
                                         int& param_count,
                                         std::string& param_pattern) {
-    if (text.empty()) return false;
-    size_t search_from = 0;
-    size_t open = std::string::npos;
-    while (true) {
-        size_t name_pos = target_name.empty() ? std::string::npos : text.find(target_name, search_from);
-        if (name_pos == std::string::npos) {
-            open = text.find('(', search_from);
-        } else {
-            open = text.find('(', name_pos + target_name.size());
-        }
-        if (open == std::string::npos) return false;
-        break;
-    }
-
-    int depth = 0;
-    size_t close = std::string::npos;
-    for (size_t i = open; i < text.size(); ++i) {
-        if (text[i] == '(') ++depth;
-        else if (text[i] == ')' && --depth == 0) {
-            close = i;
-            break;
-        }
-    }
-    if (close == std::string::npos || close <= open) return false;
-
-    auto params = split_top_level_commas(text.substr(open + 1, close - open - 1));
-    param_count = static_cast<int>(params.size());
-    min_param_count = 0;
+    auto params = call_binding::parameters(text, target_name);
+    if (!params) return false;
+    auto arity = call_binding::signature_arity(text, target_name);
+    param_count = arity.maximum;
+    min_param_count = arity.minimum;
     std::vector<std::string> shapes;
-    shapes.reserve(params.size());
-    for (auto& p : params) {
-        if (!param_is_optional(p)) ++min_param_count;
+    shapes.reserve(params->size());
+    for (auto& p : *params) {
         shapes.push_back(classify_param_shape(p));
     }
     param_pattern = join_pattern_parts(shapes);
@@ -1233,9 +1141,10 @@ static void score_candidate(CallsiteCandidate& row,
 
 static bool apply_arity_and_pattern_score(CallsiteCandidate& row,
                                           const TargetCallsiteInfo& target) {
-    if (target.param_count < 0 || row.arg_count < 0) return true;
+    if (target.min_param_count < 0 || row.arg_count < 0) return true;
     int min_param_count = target.min_param_count >= 0 ? target.min_param_count : target.param_count;
-    if (row.arg_count < min_param_count || row.arg_count > target.param_count) {
+    if (row.arg_count < min_param_count ||
+        (target.param_count >= 0 && row.arg_count > target.param_count)) {
         row.heuristic = "arity_mismatch_filtered";
         row.why = "call arity does not match the target overload parameter count";
         return false;
@@ -1660,6 +1569,54 @@ static void add_callsite_candidate_metadata(JsonMutDoc& doc, yyjson_mut_val* roo
     }
 }
 
+struct IndexedPathRoot {
+    int64_t id = 0;
+    std::string path;
+    std::string absolute;
+    bool primary = false;
+};
+
+static std::string absolute_lookup_root(const std::string& root) {
+    auto normalized = path_util::lookup_path(root);
+    if (normalized.empty()) return {};
+    auto path = std::filesystem::path(normalized);
+    if (!path.is_absolute()) path = std::filesystem::absolute(path);
+    return path_util::lookup_path(path.string());
+}
+
+static std::vector<IndexedPathRoot> indexed_path_roots(sqlite3* db,
+                                                      const std::string& primary_root) {
+    std::vector<IndexedPathRoot> roots;
+    roots.push_back({0, primary_root, absolute_lookup_root(primary_root), true});
+    sqlite3_stmt* raw = nullptr;
+    int rc = sqlite3_prepare_v2(db, "SELECT id,path FROM roots ORDER BY id", -1, &raw, nullptr);
+    if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(raw, sqlite3_finalize);
+    while ((rc = sqlite3_step(raw)) == SQLITE_ROW) {
+        auto* path = sqlite_text_or_null(raw, 1);
+        if (!path) continue;
+        roots.push_back({sqlite3_column_int64(raw, 0), path,
+                         absolute_lookup_root(path), false});
+    }
+    if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
+    return roots;
+}
+
+static std::optional<IndexedPathRoot> indexed_path_owner(
+    const std::vector<IndexedPathRoot>& roots, const std::string& full_path) {
+    std::optional<IndexedPathRoot> owner;
+    for (const auto& root : roots) {
+        if (path_util::lookup_path_in_root(full_path, root.absolute).empty()) continue;
+        if (!owner || root.absolute.size() > owner->absolute.size()) {
+            owner = root;
+        } else if (root.absolute.size() == owner->absolute.size() && root.id != owner->id) {
+            throw std::invalid_argument(
+                "Ambiguous indexed root ownership for path: " + full_path);
+        }
+    }
+    return owner;
+}
+
 // Preserve stored identity: primary files are relative; merged files use the
 // registered root's native spelling plus a forward-slash relative suffix.
 // Only root-bounded equality candidates are probed, never arbitrary suffixes.
@@ -1675,10 +1632,10 @@ static std::vector<std::string> db_path_candidates(sqlite3* db, const std::strin
     add(path);
     add(input);
     const bool absolute = std::filesystem::path(input).is_absolute();
-    auto primary = path_util::lookup_path(repo_root);
+    auto primary = absolute_lookup_root(repo_root);
     std::string full = absolute ? input : primary + "/" + input;
     auto under_root = [&](const std::string& raw_root, bool main_root) {
-        auto suffix = path_util::lookup_path_in_root(full, raw_root);
+        auto suffix = path_util::lookup_path_in_root(full, absolute_lookup_root(raw_root));
         if (suffix.empty()) return;
         if (suffix == ".") {
             add(raw_root);
@@ -1694,32 +1651,73 @@ static std::vector<std::string> db_path_candidates(sqlite3* db, const std::strin
     under_root(repo_root, true);
     if (absolute) {
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(db, "SELECT path FROM roots", -1, &stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rc = sqlite3_prepare_v2(db, "SELECT path FROM roots", -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
+        {
+            std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(stmt, sqlite3_finalize);
+            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
                 const char* root = sqlite_text_or_null(stmt, 0);
                 if (root) under_root(root, false);
             }
-            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
         }
     }
     return result;
 }
 
 static std::string resolve_db_path(sqlite3* db, const std::string& path, const std::string& repo_root) {
+    auto input = path_util::lookup_path(path);
+    if (input.empty()) return {};
+    auto full_path = std::filesystem::path(input).is_absolute()
+        ? input : absolute_lookup_root(repo_root) + "/" + input;
+    auto owner = indexed_path_owner(indexed_path_roots(db, repo_root), full_path);
+    if (!owner) return {};
     auto candidates = db_path_candidates(db, path, repo_root);
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT path FROM files WHERE path = ? LIMIT 1", -1, &stmt, nullptr) != SQLITE_OK)
-        return {};
+    auto scope = owner->primary
+        ? " AND (root_id IS NULL OR root_id=0)"
+        : " AND root_id=" + std::to_string(owner->id);
+    auto sql = "SELECT path FROM files WHERE path = ?" + scope + " LIMIT 1";
+    int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(stmt, sqlite3_finalize);
     std::string result;
     for (const auto& candidate : candidates) {
         sqlite3_reset(stmt);
         sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
             result = sqlite_text_or_null(stmt, 0);
             break;
         }
+        if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
     }
-    sqlite3_finalize(stmt);
+#ifdef _WIN32
+    if (result.empty()) {
+        sql = "SELECT path FROM files INDEXED BY idx_files_root WHERE " +
+            std::string(owner->primary ? "(root_id IS NULL OR root_id=0)" :
+                "root_id=" + std::to_string(owner->id));
+        sqlite3_stmt* fallback_raw = nullptr;
+        rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &fallback_raw, nullptr);
+        if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> fallback(
+            fallback_raw, sqlite3_finalize);
+        while ((rc = sqlite3_step(fallback_raw)) == SQLITE_ROW) {
+            auto* stored = sqlite_text_or_null(fallback_raw, 0);
+            if (!stored) continue;
+            bool matches = std::any_of(candidates.begin(), candidates.end(),
+                [&](const std::string& candidate) {
+                    return path_util::lookup_paths_equal(candidate, stored);
+                });
+            if (!matches) continue;
+            if (!result.empty() && result != stored) {
+                throw std::invalid_argument("Ambiguous case-normalized indexed file: " + path);
+            }
+            result = stored;
+        }
+        if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
+    }
+#endif
     return result;
 }
 
@@ -1825,9 +1823,26 @@ static std::string find_git_executable() {
 #endif
 }
 
+static CapturedProcessOutput git_stdout(const std::string& root,
+                                        const std::vector<std::string>& arguments) {
+    std::vector<std::string> args{"-C", root};
+    args.insert(args.end(), arguments.begin(), arguments.end());
+    return capture_process_stdout(find_git_executable(), args);
+}
+
+static std::string trimmed_git_output(std::string output) {
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
+    }
+    return output;
+}
+
 static bool collect_git_changed_files(const std::string& repo_root,
                                       const std::string& since,
                                       std::vector<std::string>& changed_files,
+                                      std::string& base_commit,
+                                      std::string& head_commit,
+                                      std::string& git_prefix,
                                       std::string& error) {
     changed_files.clear();
     error.clear();
@@ -1838,16 +1853,76 @@ static bool collect_git_changed_files(const std::string& repo_root,
         return false;
     }
 
-    int rc = spawn_and_read_stdout(find_git_executable(),
-        {"-C", repo_root, "diff", "--name-only", since + "..HEAD"},
-        [&](const std::string& line) {
-            if (!line.empty()) changed_files.push_back(line);
-        });
-    if (rc != 0) {
+    auto base = git_stdout(repo_root,
+        {"rev-parse", "--verify", "--end-of-options", since + "^{commit}"});
+    auto head = git_stdout(repo_root, {"rev-parse", "--verify", "HEAD^{commit}"});
+    if (base.exit_code != 0 || head.exit_code != 0 || base.truncated || head.truncated) {
+        error = "Cannot resolve comparison commits for ref '" + since + "' in " + repo_root;
+        return false;
+    }
+    base_commit = trimmed_git_output(std::move(base.output));
+    head_commit = trimmed_git_output(std::move(head.output));
+    auto valid_commit = [](const std::string& value) {
+        return (value.size() == 40 || value.size() == 64) &&
+            std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isxdigit(c); });
+    };
+    if (!valid_commit(base_commit) || !valid_commit(head_commit)) {
+        error = "Git returned an invalid comparison commit identity";
+        return false;
+    }
+    auto prefix = git_stdout(repo_root, {"rev-parse", "--show-prefix"});
+    if (prefix.exit_code != 0 || prefix.truncated) {
+        error = "Cannot resolve Git path prefix for repository " + repo_root;
+        return false;
+    }
+    git_prefix = trimmed_git_output(std::move(prefix.output));
+    auto diff = git_stdout(repo_root,
+        {"diff", "--name-only", "-z", "--relative",
+         base_commit + ".." + head_commit, "--", "."});
+    if (diff.exit_code != 0 || diff.truncated) {
         error = "git diff failed for ref '" + since + "'";
         return false;
     }
+    size_t start = 0;
+    while (start < diff.output.size()) {
+        auto end = diff.output.find('\0', start);
+        if (end == std::string::npos) {
+            error = "Git did not return a complete NUL-delimited changed-file list";
+            return false;
+        }
+        if (end > start) changed_files.emplace_back(diff.output, start, end - start);
+        start = end + 1;
+    }
     return true;
+}
+
+struct SourceRevisionVerification {
+    std::string status;
+    std::string compared_hash;
+};
+
+static SourceRevisionVerification source_revision_status(
+    const std::string& repository, const std::string& head_commit,
+    const std::string& git_prefix, const std::string& relative_path,
+    const std::string& indexed_hash) {
+    bool valid_hash = indexed_hash.size() == 16 &&
+        std::all_of(indexed_hash.begin(), indexed_hash.end(),
+            [](unsigned char c) { return std::isxdigit(c); });
+    if (!valid_hash) return {"unknown", {}};
+    auto source = git_stdout(repository, {"show", head_commit + ":" + git_prefix + relative_path});
+    if (source.truncated) return {"verification_limit_exceeded", {}};
+    if (source.exit_code != 0) return {"not_in_target_revision", {}};
+    auto compared_hash = hash_string(source.output);
+    if (compared_hash == indexed_hash) return {"matches_target_revision", compared_hash};
+    std::string crlf;
+    crlf.reserve(source.output.size());
+    for (size_t i = 0; i < source.output.size(); ++i) {
+        char c = source.output[i];
+        if (c == '\n' && (i == 0 || source.output[i - 1] != '\r')) crlf.push_back('\r');
+        crlf.push_back(c);
+    }
+    return {hash_string(crlf) == indexed_hash ? "matches_target_revision_crlf" :
+            "content_mismatch", compared_hash};
 }
 
 // Resolve a directory-or-file path to the canonical absolute path prefix as stored in the DB.
@@ -1858,12 +1933,20 @@ static bool collect_git_changed_files(const std::string& repo_root,
 static std::string resolve_db_dir_path(sqlite3* db, const std::string& path, const std::string& repo_root) {
     std::string input = path_util::lookup_path(path);
     if (input.empty() || input == "." || input == "./") return std::string();
+    auto full = std::filesystem::path(input).is_absolute()
+        ? input : absolute_lookup_root(repo_root) + "/" + input;
+    auto owner = indexed_path_owner(indexed_path_roots(db, repo_root), full);
+    if (!owner) return {};
+    auto scope = owner->primary
+        ? " AND (root_id IS NULL OR root_id=0)"
+        : " AND root_id=" + std::to_string(owner->id);
 
     auto exists_as_prefix = [&](const std::string& candidate) -> bool {
         sqlite3_stmt* stmt = nullptr;
-        sqlite3_prepare_v2(db,
-            "SELECT 1 FROM files WHERE path = ? OR (path >= ? AND path < ?) LIMIT 1",
-            -1, &stmt, nullptr);
+        auto sql = "SELECT 1 FROM files WHERE (path=? OR (path>=? AND path<?))" +
+            scope + " LIMIT 1";
+        int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
         std::string prefix = candidate;
         if (!prefix.empty() && prefix.back() != '/') prefix += '/';
         auto upper = prefix;
@@ -1871,21 +1954,44 @@ static std::string resolve_db_dir_path(sqlite3* db, const std::string& path, con
         sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 2, prefix.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt, 3, upper.c_str(), -1, SQLITE_TRANSIENT);
-        bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+        rc = sqlite3_step(stmt);
+        bool found = rc == SQLITE_ROW;
         sqlite3_finalize(stmt);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
         if (found) return true;
 
-        if (sqlite3_prepare_v2(db, "SELECT 1 FROM roots WHERE path = ? LIMIT 1", -1, &stmt, nullptr) == SQLITE_OK) {
-            sqlite3_bind_text(stmt, 1, candidate.c_str(), -1, SQLITE_TRANSIENT);
-            found = (sqlite3_step(stmt) == SQLITE_ROW);
-            sqlite3_finalize(stmt);
-        }
-        return found;
+        return !owner->primary && candidate == owner->path;
     };
 
     for (const auto& candidate : db_path_candidates(db, path, repo_root)) {
         if (exists_as_prefix(candidate)) return candidate;
     }
+#ifdef _WIN32
+    auto normalized = path_util::lookup_key(full);
+    auto prefix = normalized;
+    if (prefix.back() != '/') prefix += '/';
+    auto sql = "SELECT path FROM files INDEXED BY idx_files_root WHERE " +
+        std::string(owner->primary ? "(root_id IS NULL OR root_id=0)" :
+            "root_id=" + std::to_string(owner->id));
+    sqlite3_stmt* raw = nullptr;
+    int rc = sqlite3_prepare_v2(db, sql.c_str(), -1, &raw, nullptr);
+    if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(db));
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(raw, sqlite3_finalize);
+    std::string result;
+    while ((rc = sqlite3_step(raw)) == SQLITE_ROW) {
+        auto* stored = sqlite_text_or_null(raw, 0);
+        if (!stored) continue;
+        auto key = path_util::lookup_key(stored);
+        if (!key.starts_with(prefix)) continue;
+        auto candidate = std::string(stored).substr(0, normalized.size());
+        if (!result.empty() && result != candidate) {
+            throw std::invalid_argument("Ambiguous case-normalized indexed directory: " + path);
+        }
+        result = std::move(candidate);
+    }
+    if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(db));
+    if (!result.empty()) return result;
+#endif
     return {};
 }
 
@@ -2087,6 +2193,13 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
     yyjson_mut_obj_add_val(doc.doc, root, "capabilities", caps);
 
     yyjson_mut_obj_add_strcpy(doc.doc, root, "repo_root", repo_root.c_str());
+    auto diagnostic_path = active_mcp_log_path();
+    if (diagnostic_path.empty()) {
+        yyjson_mut_obj_add_null(doc.doc, root, "diagnostic_log");
+    } else {
+        yyjson_mut_obj_add_strcpy(
+            doc.doc, root, "diagnostic_log", diagnostic_path.string().c_str());
+    }
     yyjson_mut_obj_add_strcpy(doc.doc, root, "db_status", db_status.c_str());
     yyjson_mut_obj_add_strcpy(
         doc.doc, root, "ownership_status", metadata.ownership.c_str());
@@ -2158,7 +2271,7 @@ std::string server_info(yyjson_val* /*params*/, Connection& conn,
 
 // T061: repo_stats
 std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
-                               QueryCache& cache, const std::string& /*repo_root*/) {
+                               QueryCache& cache, const std::string& repo_root) {
     auto count_query = [&](const char* table) -> int64_t {
         std::string sql = std::string("SELECT COUNT(*) FROM ") + table;
         auto* stmt = cache.get(std::string("count_") + table, sql);
@@ -2200,13 +2313,16 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
             "  NULL AS symbol_count, NULL AS edge_count "
             "FROM roots r "
             "UNION ALL "
-            "SELECT 0, '(main)', "
-            "  (SELECT COUNT(*) FROM files WHERE root_id = 0), "
+            "SELECT 0, ?, "
+            "  (SELECT COUNT(*) FROM files INDEXED BY idx_files_root WHERE root_id IS NULL), "
             "  NULL, NULL "
-            "WHERE EXISTS (SELECT 1 FROM files WHERE root_id = 0) "
             "ORDER BY 1";
-        if (sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rc = sqlite3_prepare_v2(conn.raw(), sql, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) throw SqliteError(rc, sqlite3_errmsg(conn.raw()));
+        sqlite3_bind_text(stmt, 1, repo_root.c_str(), -1, SQLITE_TRANSIENT);
+        {
+            std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> statement(stmt, sqlite3_finalize);
+            while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
                 auto* entry = doc.new_obj();
                 int64_t rid = sqlite3_column_int64(stmt, 0);
                 auto* p = sqlite3_column_text(stmt, 1);
@@ -2215,11 +2331,13 @@ std::string repo_stats(yyjson_val* /*params*/, Connection& conn,
                 yyjson_mut_obj_add_strcpy(doc.doc, entry, "path",
                     p ? reinterpret_cast<const char*>(p) : "");
                 yyjson_mut_obj_add_int(doc.doc, entry, "files", fc);
+                yyjson_mut_obj_add_str(
+                    doc.doc, entry, "role", rid == 0 ? "primary" : "additional");
                 yyjson_mut_obj_add_null(doc.doc, entry, "symbols");
                 yyjson_mut_obj_add_null(doc.doc, entry, "edges");
                 yyjson_mut_arr_append(roots_arr, entry);
             }
-            sqlite3_finalize(stmt);
+            if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(conn.raw()));
         }
     }
     yyjson_mut_obj_add_val(doc.doc, root, "roots", roots_arr);
@@ -5234,6 +5352,10 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     CallsiteCandidateOptions candidate_options = parse_callsite_candidate_options(params);
 
     // BFS from node_id following reverse edges
+    double min_confidence = params ? json_get_double(params, "min_confidence", 0.0) : 0.0;
+    if (!std::isfinite(min_confidence) || min_confidence < 0.0 || min_confidence > 1.0) {
+        return McpError::invalid_input("'min_confidence' must be between 0 and 1").to_json_rpc(0);
+    }
     std::vector<int64_t> frontier = {node_id};
     std::unordered_set<int64_t> visited = {node_id};
 
@@ -5245,7 +5367,8 @@ std::string impact_of(yyjson_val* params, Connection& conn,
     auto* sym = doc.new_obj();
     {
         auto* stmt = cache.get("impact_symbol",
-            "SELECT n.name, f.path, n.stable_key, n.rank FROM nodes n LEFT JOIN files f ON n.file_id = f.id WHERE n.id = ?");
+            "SELECT n.name,f.path,n.stable_key,n.rank,n.qualname,n.kind,COALESCE(f.root_id,0) "
+            "FROM nodes n LEFT JOIN files f ON n.file_id=f.id WHERE n.id=?");
         sqlite3_bind_int64(stmt, 1, node_id);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             yyjson_mut_obj_add_int(doc.doc, sym, "node_id", node_id);
@@ -5256,6 +5379,13 @@ std::string impact_of(yyjson_val* params, Connection& conn,
             if (fp) yyjson_mut_obj_add_strcpy(doc.doc, sym, "file_path", reinterpret_cast<const char*>(fp));
             double rk = sqlite3_column_double(stmt, 3);
             if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, sym, "rank", rk);
+            if (auto* qualname = sqlite_text_or_null(stmt, 4))
+                yyjson_mut_obj_add_strcpy(doc.doc, sym, "qualname", qualname);
+            if (auto* kind = sqlite_text_or_null(stmt, 5))
+                yyjson_mut_obj_add_strcpy(doc.doc, sym, "kind", kind);
+            yyjson_mut_obj_add_int(doc.doc, sym, "root_id", sqlite3_column_int64(stmt, 6));
+        } else {
+            return McpError::not_found("Impact target is not present in the index").to_json_rpc(0);
         }
     }
     yyjson_mut_obj_add_val(doc.doc, root, "symbol", sym);
@@ -5271,12 +5401,17 @@ std::string impact_of(yyjson_val* params, Connection& conn,
         for (int64_t nid : frontier) {
             // Find nodes that depend on nid (reverse edges: dst_id = nid)
             auto* stmt = cache.get("impact_reverse",
-                "SELECT e.src_id, n.name, f.path, e.kind, e.confidence, n.stable_key, n.rank "
-                "FROM edges e JOIN nodes n ON e.src_id = n.id "
+                "SELECT e.src_id,n.name,f.path,e.kind,e.confidence,n.stable_key,n.rank,"
+                "e.evidence,e.source,e.observed_count,dst.stable_key,n.qualname,"
+                "COALESCE(f.root_id,0),COALESCE(target_file.root_id,0) "
+                "FROM edges e INDEXED BY idx_edges_dst JOIN nodes n ON e.src_id=n.id "
+                "JOIN nodes dst ON dst.id=e.dst_id "
                 "LEFT JOIN files f ON n.file_id = f.id "
-                "WHERE e.dst_id = ? AND e.kind != 'contains' "
-                "ORDER BY n.rank DESC");
+                "LEFT JOIN files target_file ON target_file.id=dst.file_id "
+                "WHERE e.dst_id=? AND e.kind!='contains' AND e.confidence>=? "
+                "ORDER BY n.rank DESC,e.confidence DESC");
             sqlite3_bind_int64(stmt, 1, nid);
+            sqlite3_bind_double(stmt, 2, min_confidence);
 
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 int64_t src_id = sqlite3_column_int64(stmt, 0);
@@ -5302,6 +5437,23 @@ std::string impact_of(yyjson_val* params, Connection& conn,
                 }
                 yyjson_mut_obj_add_strcpy(doc.doc, item, "relationship", relationship);
                 yyjson_mut_obj_add_int(doc.doc, item, "distance", d);
+                yyjson_mut_obj_add_real(doc.doc, item, "confidence", sqlite3_column_double(stmt, 4));
+                const char* evidence = sqlite_text_or_null(stmt, 7);
+                if (evidence) yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", evidence);
+                else yyjson_mut_obj_add_null(doc.doc, item, "evidence");
+                const char* source = sqlite_text_or_null(stmt, 8);
+                if (source)
+                    yyjson_mut_obj_add_strcpy(doc.doc, item, "edge_source", source);
+                yyjson_mut_obj_add_int(doc.doc, item, "observed_count", sqlite3_column_int64(stmt, 9));
+                yyjson_mut_obj_add_int(doc.doc, item, "via_node_id", nid);
+                add_stable_key_if_present(doc, item, sqlite_text_or_null(stmt, 10), "via_stable_key");
+                if (auto* qualname = sqlite_text_or_null(stmt, 11))
+                    yyjson_mut_obj_add_strcpy(doc.doc, item, "qualname", qualname);
+                yyjson_mut_obj_add_int(doc.doc, item, "root_id", sqlite3_column_int64(stmt, 12));
+                yyjson_mut_obj_add_bool(doc.doc, item, "cross_root",
+                    sqlite3_column_int64(stmt, 12) != sqlite3_column_int64(stmt, 13));
+                yyjson_mut_obj_add_str(doc.doc, item, "edge_interpretation",
+                    edge_interpretation(evidence ? evidence : "", source ? source : ""));
                 double rk = sqlite3_column_double(stmt, 6);
                 if (rk > 0.0) yyjson_mut_obj_add_real(doc.doc, item, "rank", rk);
                 yyjson_mut_arr_append(impacted, item);
@@ -5348,7 +5500,6 @@ std::string impact_of(yyjson_val* params, Connection& conn,
 // T094: detect_changes — git diff blast-radius analysis
 std::string detect_changes(yyjson_val* params, Connection& conn,
                            QueryCache& cache, const std::string& repo_root) {
-    (void)repo_root;
     if (!params) return McpError::invalid_input("Missing parameters").to_json_rpc(0);
 
     const char* requested_root = json_get_str(params, "repo_root");
@@ -5358,6 +5509,21 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         return McpError::invalid_input("Missing 'repo_root'").to_json_rpc(0);
     if (!since || !*since)
         return McpError::invalid_input("Missing 'since'").to_json_rpc(0);
+    auto normalized_request = absolute_lookup_root(requested_root);
+    if (normalized_request.empty())
+        return McpError::invalid_input("Invalid 'repo_root' path").to_json_rpc(0);
+    std::optional<IndexedPathRoot> requested_scope;
+    try {
+        requested_scope = indexed_path_owner(
+            indexed_path_roots(conn.raw(), repo_root), normalized_request);
+    } catch (const std::invalid_argument& e) {
+        return McpError::invalid_input(e.what()).to_json_rpc(0);
+    }
+    if (!requested_scope) {
+        return McpError::invalid_input(
+            "Requested repository is not an indexed primary or additional root: " +
+            std::string(requested_root)).to_json_rpc(0);
+    }
 
     int64_t depth = json_get_int(params, "depth", 2);
     if (depth < 0) depth = 0;
@@ -5369,9 +5535,25 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
 
     std::vector<std::string> changed_files_raw;
     std::string git_error;
-    if (!collect_git_changed_files(requested_root, since, changed_files_raw, git_error)) {
+    std::string base_commit, head_commit, git_prefix;
+    if (!collect_git_changed_files(normalized_request, since, changed_files_raw,
+                                   base_commit, head_commit, git_prefix, git_error)) {
         return McpError::invalid_input(git_error).to_json_rpc(0);
     }
+    auto revision_key = requested_scope->primary ? "git_head" :
+        workspace_root_metadata_key(requested_scope->id, "git_head");
+    auto* revision_stmt = cache.get("detect_changes_revision",
+        "SELECT value FROM kv WHERE key=?");
+    sqlite3_bind_text(revision_stmt, 1, revision_key.c_str(), -1, SQLITE_TRANSIENT);
+    std::string indexed_commit;
+    int revision_rc = sqlite3_step(revision_stmt);
+    if (revision_rc == SQLITE_ROW) {
+        if (auto* value = sqlite_text_or_null(revision_stmt, 0)) indexed_commit = value;
+    } else if (revision_rc != SQLITE_DONE) {
+        throw SqliteError(revision_rc, sqlite3_errmsg(conn.raw()));
+    }
+    std::string index_revision = indexed_commit.empty() ? "unknown" :
+        indexed_commit == head_commit ? "matches_target" : "stale";
 
     std::vector<std::string> changed_files;
     changed_files.reserve(changed_files_raw.size());
@@ -5388,15 +5570,89 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
     std::vector<ChangedFileRow> indexed_files;
     indexed_files.reserve(changed_files.size());
     std::unordered_set<int64_t> seen_file_ids;
+    struct FileResolution {
+        std::string path;
+        std::string indexed_path;
+        std::string language;
+        std::string parse_status;
+        std::string source_status;
+        std::string status;
+        std::string indexed_hash;
+        std::string compared_hash;
+        int64_t id = -1;
+        int64_t symbols = 0;
+    };
+    std::vector<FileResolution> file_resolutions;
+    int source_files = 0;
+    int unresolved_source_files = 0;
+    int unverified_source_files = 0;
     auto* file_stmt = cache.get("detect_changes_file_lookup",
-        "SELECT id, path FROM files WHERE path = ?");
+        "SELECT id,path,language,parse_status,content_hash,root_id FROM files WHERE path=?");
 
     for (const auto& rel_path : changed_files) {
-        std::string resolved = resolve_db_path(conn.raw(), rel_path, requested_root);
-        if (resolved.empty()) continue;
+        FileResolution resolution;
+        resolution.path = rel_path;
+        resolution.language = path_util::detect_language(std::filesystem::path(rel_path));
+        bool source_file = !resolution.language.empty();
+        if (source_file) ++source_files;
+        auto absolute_file = path_util::lookup_path(normalized_request + "/" + rel_path);
+        std::string resolved;
+        try {
+            resolved = resolve_db_path(conn.raw(), absolute_file, repo_root);
+        } catch (const std::invalid_argument& e) {
+            resolution.status = "ambiguous_path";
+            resolution.source_status = e.what();
+            if (source_file) ++unresolved_source_files;
+            file_resolutions.push_back(std::move(resolution));
+            continue;
+        }
+        if (resolved.empty()) {
+            resolution.status = source_file ? "not_indexed" : "unsupported_language";
+            resolution.source_status = "unavailable";
+            if (source_file) ++unresolved_source_files;
+            file_resolutions.push_back(std::move(resolution));
+            continue;
+        }
+        sqlite3_reset(file_stmt);
         sqlite3_bind_text(file_stmt, 1, resolved.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(file_stmt) != SQLITE_ROW) continue;
+        int rc = sqlite3_step(file_stmt);
+        if (rc != SQLITE_ROW) throw SqliteError(rc, sqlite3_errmsg(conn.raw()));
         int64_t file_id = sqlite3_column_int64(file_stmt, 0);
+        bool primary_file = sqlite3_column_type(file_stmt, 5) == SQLITE_NULL ||
+            sqlite3_column_int64(file_stmt, 5) == 0;
+        if ((requested_scope->primary && !primary_file) ||
+            (!requested_scope->primary &&
+             sqlite3_column_int64(file_stmt, 5) != requested_scope->id)) {
+            throw std::runtime_error("Changed-file lookup resolved the wrong root identity: " + rel_path);
+        }
+        resolution.id = file_id;
+        resolution.indexed_path = resolved;
+        if (auto* language = sqlite_text_or_null(file_stmt, 2)) resolution.language = language;
+        if (!source_file && !resolution.language.empty()) {
+            source_file = true;
+            ++source_files;
+        }
+        if (auto* status = sqlite_text_or_null(file_stmt, 3)) resolution.parse_status = status;
+        auto hash = sqlite_text_or_null(file_stmt, 4);
+        resolution.indexed_hash = hash ? hash : "";
+        auto verification = source_revision_status(
+            normalized_request, head_commit, git_prefix, rel_path, resolution.indexed_hash);
+        resolution.source_status = std::move(verification.status);
+        resolution.compared_hash = std::move(verification.compared_hash);
+        if (resolution.source_status == "content_mismatch" ||
+            resolution.source_status == "not_in_target_revision" ||
+            resolution.source_status == "verification_limit_exceeded") {
+            resolution.status = "source_revision_unavailable";
+            if (source_file) ++unresolved_source_files;
+            file_resolutions.push_back(std::move(resolution));
+            continue;
+        }
+        if (resolution.source_status == "unknown" ||
+            resolution.parse_status != "ok") {
+            if (source_file) ++unverified_source_files;
+        }
+        resolution.status = "indexed";
+        file_resolutions.push_back(std::move(resolution));
         if (!seen_file_ids.insert(file_id).second) continue;
 
         ChangedFileRow row;
@@ -5417,25 +5673,28 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
     };
     std::vector<ChangedSymbolRow> changed_symbols;
     std::vector<int64_t> changed_symbol_ids;
+    std::unordered_map<int64_t, int64_t> symbols_by_file;
     changed_symbol_ids.reserve(indexed_files.size() * 4);
     if (!indexed_files.empty()) {
-        std::string sql =
-            "SELECT n.id, n.name, n.kind, n.qualname, f.path, n.stable_key "
-            "FROM nodes n JOIN files f ON n.file_id = f.id "
-            "WHERE n.file_id IN (";
+        std::string sql = "WITH selected_files(id) AS (VALUES ";
         for (size_t i = 0; i < indexed_files.size(); ++i) {
-            if (i) sql += ", ";
-            sql += "?";
+            if (i) sql += ",";
+            sql += "(?)";
         }
-        sql += ") AND n.node_type = 'symbol' "
-               "AND n.kind IN ('function', 'method', 'class', 'interface') "
+        sql += ") "
+            "SELECT n.id, n.name, n.kind, n.qualname, f.path, n.stable_key "
+            ",n.file_id FROM selected_files selected "
+            "CROSS JOIN files f ON f.id=selected.id "
+            "CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id=selected.id "
+            "WHERE n.node_type='symbol' "
                "ORDER BY f.path, n.start_line, n.id";
 
         auto* stmt = cache.get("detect_changes_symbols_" + std::to_string(indexed_files.size()), sql);
         for (size_t i = 0; i < indexed_files.size(); ++i)
             sqlite3_bind_int64(stmt, static_cast<int>(i + 1), indexed_files[i].id);
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             ChangedSymbolRow row;
             row.id = sqlite3_column_int64(stmt, 0);
             row.name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
@@ -5448,6 +5707,17 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
                 row.stable_key = reinterpret_cast<const char*>(sk);
             changed_symbol_ids.push_back(row.id);
             changed_symbols.push_back(std::move(row));
+            ++symbols_by_file[sqlite3_column_int64(stmt, 6)];
+        }
+        if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(conn.raw()));
+    }
+    for (auto& resolution : file_resolutions) {
+        resolution.symbols = symbols_by_file[resolution.id];
+        if (resolution.status == "indexed" && resolution.symbols == 0) {
+            resolution.status = "no_indexed_symbols";
+            if (!resolution.language.empty()) {
+                ++unresolved_source_files;
+            }
         }
     }
 
@@ -5460,6 +5730,11 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
         std::string stable_key;
         int distance = 0;
         double confidence = 0.0;
+        int64_t via_node_id = 0;
+        std::string via_stable_key;
+        std::string evidence;
+        std::string edge_source;
+        int64_t observed_count = 0;
     };
 
     std::vector<ImpactedRow> impacted_rows;
@@ -5468,14 +5743,17 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
     std::vector<int64_t> frontier = changed_symbol_ids;
     int max_depth_reached = 0;
     constexpr size_t kMaxImpacted = 500;
+    bool impact_truncated = false;
 
     for (int current_depth = 1;
          current_depth <= depth && !frontier.empty() && impacted_rows.size() < kMaxImpacted;
          ++current_depth) {
         std::string sql =
-            "SELECT e.src_id, n.name, n.kind, n.qualname, f.path, e.confidence, n.stable_key "
-            "FROM edges e "
-            "JOIN nodes n ON e.src_id = n.id "
+            "SELECT e.src_id,n.name,n.kind,n.qualname,f.path,e.confidence,n.stable_key,"
+            "e.dst_id,target.stable_key,e.evidence,e.source,e.observed_count "
+            "FROM edges e INDEXED BY idx_edges_dst_conf "
+            "CROSS JOIN nodes n ON e.src_id=n.id "
+            "CROSS JOIN nodes target ON target.id=e.dst_id "
             "LEFT JOIN files f ON n.file_id = f.id "
             "WHERE e.dst_id IN (";
         for (size_t i = 0; i < frontier.size(); ++i) {
@@ -5497,10 +5775,16 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             std::string file;
             std::string stable_key;
             double confidence = 0.0;
+            int64_t via_node_id = 0;
+            std::string via_stable_key;
+            std::string evidence;
+            std::string edge_source;
+            int64_t observed_count = 0;
         };
         std::unordered_map<int64_t, PendingImpact> pending;
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             int64_t src_id = sqlite3_column_int64(stmt, 0);
             if (visited.count(src_id)) continue;
 
@@ -5518,8 +5802,14 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             if (const auto* sk = sqlite3_column_text(stmt, 6))
                 row.stable_key = reinterpret_cast<const char*>(sk);
             row.confidence = confidence;
+            row.via_node_id = sqlite3_column_int64(stmt, 7);
+            if (auto* via = sqlite_text_or_null(stmt, 8)) row.via_stable_key = via;
+            if (auto* evidence = sqlite_text_or_null(stmt, 9)) row.evidence = evidence;
+            if (auto* source = sqlite_text_or_null(stmt, 10)) row.edge_source = source;
+            row.observed_count = sqlite3_column_int64(stmt, 11);
             pending[src_id] = std::move(row);
         }
+        if (rc != SQLITE_DONE) throw SqliteError(rc, sqlite3_errmsg(conn.raw()));
 
         std::vector<std::pair<int64_t, PendingImpact>> ordered;
         ordered.reserve(pending.size());
@@ -5535,6 +5825,8 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
 
         std::vector<int64_t> next_frontier;
         next_frontier.reserve(ordered.size());
+        size_t remaining = kMaxImpacted - impacted_rows.size();
+        if (ordered.size() > remaining) impact_truncated = true;
         for (auto& entry : ordered) {
             if (impacted_rows.size() >= kMaxImpacted) break;
             visited.insert(entry.first);
@@ -5549,10 +5841,19 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             row.stable_key = std::move(entry.second.stable_key);
             row.distance = current_depth;
             row.confidence = entry.second.confidence;
+            row.via_node_id = entry.second.via_node_id;
+            row.via_stable_key = std::move(entry.second.via_stable_key);
+            row.evidence = std::move(entry.second.evidence);
+            row.edge_source = std::move(entry.second.edge_source);
+            row.observed_count = entry.second.observed_count;
             impacted_rows.push_back(std::move(row));
         }
 
         if (!next_frontier.empty()) max_depth_reached = current_depth;
+        if (impacted_rows.size() >= kMaxImpacted &&
+            current_depth < depth && !next_frontier.empty()) {
+            impact_truncated = true;
+        }
         frontier = std::move(next_frontier);
     }
 
@@ -5573,6 +5874,88 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
     doc.set_root(root);
 
     yyjson_mut_obj_add_strcpy(doc.doc, root, "since", since);
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "repo_root", normalized_request.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "base_commit", base_commit.c_str());
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "compared_commit", head_commit.c_str());
+    yyjson_mut_obj_add_int(doc.doc, root, "root_id", requested_scope->id);
+    yyjson_mut_obj_add_str(doc.doc, root, "root_role",
+        requested_scope->primary ? "primary" : "additional");
+    yyjson_mut_obj_add_str(doc.doc, root, "symbol_mapping_strategy", "file_level_conservative");
+    yyjson_mut_obj_add_strcpy(doc.doc, root, "index_revision_status", index_revision.c_str());
+    if (indexed_commit.empty()) yyjson_mut_obj_add_null(doc.doc, root, "indexed_commit");
+    else yyjson_mut_obj_add_strcpy(doc.doc, root, "indexed_commit", indexed_commit.c_str());
+    const char* mapping_status = source_files == 0 ? "no_source_changes" :
+        unresolved_source_files >= source_files ? "unresolved" :
+        (unresolved_source_files || unverified_source_files) ? "partial" : "complete";
+    bool analysis_complete = index_revision == "matches_target" &&
+        (std::strcmp(mapping_status, "complete") == 0 || source_files == 0) &&
+        !impact_truncated;
+    yyjson_mut_obj_add_str(doc.doc, root, "mapping_status", mapping_status);
+    yyjson_mut_obj_add_bool(doc.doc, root, "analysis_complete", analysis_complete);
+    yyjson_mut_obj_add_bool(doc.doc, root, "impact_truncated", impact_truncated);
+    yyjson_mut_obj_add_int(doc.doc, root, "impact_limit", kMaxImpacted);
+    yyjson_mut_obj_add_str(doc.doc, root, "status",
+        analysis_complete ? "complete" :
+        std::strcmp(mapping_status, "unresolved") == 0 ? "unresolved" : "partial");
+    auto* diagnostics = doc.new_arr();
+    auto add_diagnostic = [&](const char* code, const std::string& message,
+                              const std::string& file = {}, bool warning = true) {
+        auto* diagnostic = doc.new_obj();
+        yyjson_mut_obj_add_str(doc.doc, diagnostic, "code", code);
+        yyjson_mut_obj_add_str(doc.doc, diagnostic, "severity", warning ? "warning" : "info");
+        yyjson_mut_obj_add_strcpy(doc.doc, diagnostic, "message", message.c_str());
+        if (!file.empty()) yyjson_mut_obj_add_strcpy(doc.doc, diagnostic, "file", file.c_str());
+        yyjson_mut_arr_append(diagnostics, diagnostic);
+    };
+    if (index_revision == "unknown") {
+        add_diagnostic("indexed_revision_unknown",
+            "The selected root's indexed commit is not recorded. Mapping uses this root's "
+            "current stored graph, not a verified historical graph.");
+    } else if (index_revision == "stale") {
+        add_diagnostic("indexed_revision_mismatch",
+            "The selected root's indexed commit differs from the compared commit. "
+            "Current source hashes are verified where available, but graph coverage is not current.");
+    }
+    if (impact_truncated) {
+        add_diagnostic("impact_limit_reached",
+            "The indexed source mapping is available, but call impact exceeded the "
+            "500-node limit before the requested traversal completed.");
+    }
+    auto* resolutions = doc.new_arr();
+    auto* unresolved = doc.new_arr();
+    for (const auto& resolution : file_resolutions) {
+        auto* entry = doc.new_obj();
+        yyjson_mut_obj_add_strcpy(doc.doc, entry, "file", resolution.path.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, entry, "status", resolution.status.c_str());
+        yyjson_mut_obj_add_strcpy(doc.doc, entry, "source_revision_status", resolution.source_status.c_str());
+        if (!resolution.indexed_hash.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, entry, "indexed_content_hash", resolution.indexed_hash.c_str());
+        if (!resolution.compared_hash.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, entry, "compared_content_hash", resolution.compared_hash.c_str());
+        yyjson_mut_obj_add_int(doc.doc, entry, "symbol_count", resolution.symbols);
+        if (resolution.id >= 0) {
+            yyjson_mut_obj_add_int(doc.doc, entry, "file_id", resolution.id);
+            yyjson_mut_obj_add_strcpy(doc.doc, entry, "indexed_path", resolution.indexed_path.c_str());
+            yyjson_mut_obj_add_strcpy(doc.doc, entry, "parse_status", resolution.parse_status.c_str());
+        }
+        yyjson_mut_arr_append(resolutions, entry);
+        if (resolution.status == "unsupported_language") {
+            add_diagnostic("unsupported_language",
+                "This changed file has no supported source-language mapping.", resolution.path, false);
+        } else if (resolution.status != "indexed") {
+            yyjson_mut_arr_add_strcpy(doc.doc, unresolved, resolution.path.c_str());
+            add_diagnostic(resolution.status.c_str(),
+                "Changed source could not be mapped completely in the requested root: " +
+                resolution.source_status, resolution.path);
+        } else if (resolution.source_status == "unknown" || resolution.parse_status != "ok") {
+            add_diagnostic("source_mapping_unverified",
+                "Source revision or complete parsed symbol coverage could not be verified.",
+                resolution.path);
+        }
+    }
+    yyjson_mut_obj_add_val(doc.doc, root, "file_resolution", resolutions);
+    yyjson_mut_obj_add_val(doc.doc, root, "unresolved_changed_files", unresolved);
+    yyjson_mut_obj_add_val(doc.doc, root, "diagnostics", diagnostics);
     for (const auto& path : changed_files)
         yyjson_mut_arr_add_strcpy(doc.doc, changed_files_arr, path.c_str());
     yyjson_mut_obj_add_val(doc.doc, root, "changed_files", changed_files_arr);
@@ -5599,6 +5982,16 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
             yyjson_mut_obj_add_strcpy(doc.doc, item, "stable_key", impacted.stable_key.c_str());
         yyjson_mut_obj_add_int(doc.doc, item, "distance", impacted.distance);
         yyjson_mut_obj_add_real(doc.doc, item, "confidence", impacted.confidence);
+        yyjson_mut_obj_add_int(doc.doc, item, "via_node_id", impacted.via_node_id);
+        if (!impacted.via_stable_key.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "via_stable_key", impacted.via_stable_key.c_str());
+        if (!impacted.evidence.empty())
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "evidence", impacted.evidence.c_str());
+        else yyjson_mut_obj_add_null(doc.doc, item, "evidence");
+        yyjson_mut_obj_add_strcpy(doc.doc, item, "edge_source", impacted.edge_source.c_str());
+        yyjson_mut_obj_add_int(doc.doc, item, "observed_count", impacted.observed_count);
+        yyjson_mut_obj_add_str(doc.doc, item, "edge_interpretation",
+            edge_interpretation(impacted.evidence, impacted.edge_source));
         yyjson_mut_arr_append(impacted_arr, item);
     }
     yyjson_mut_obj_add_val(doc.doc, root, "impacted_symbols", impacted_arr);
@@ -5607,7 +6000,15 @@ std::string detect_changes(yyjson_val* params, Connection& conn,
     yyjson_mut_obj_add_int(doc.doc, summary, "changed_symbols", static_cast<int64_t>(changed_symbols.size()));
     yyjson_mut_obj_add_int(doc.doc, summary, "impacted_symbols", static_cast<int64_t>(impacted_rows.size()));
     yyjson_mut_obj_add_int(doc.doc, summary, "max_depth_reached", max_depth_reached);
+    yyjson_mut_obj_add_int(doc.doc, summary, "changed_source_files", source_files);
+    yyjson_mut_obj_add_int(doc.doc, summary, "unresolved_source_files", unresolved_source_files);
+    yyjson_mut_obj_add_int(doc.doc, summary, "unverified_source_files", unverified_source_files);
     yyjson_mut_obj_add_val(doc.doc, root, "summary", summary);
+    if (!analysis_complete) {
+        mcp_log("detect_changes: incomplete analysis root=" + normalized_request +
+            " root_id=" + std::to_string(requested_scope->id) +
+            " mapping=" + mapping_status + " revision=" + index_revision);
+    }
 
     return doc.to_string();
 }
@@ -7357,40 +7758,36 @@ std::string workspace_remove(yyjson_val* params, Connection& conn,
 }
 
 std::string workspace_list(yyjson_val* /*params*/, Connection& conn,
-                           QueryCache& /*cache*/, const std::string& /*repo_root*/) {
+                           QueryCache& /*cache*/, const std::string& repo_root) {
     try {
         JsonMutDoc doc;
         auto* root = doc.new_obj();
         doc.set_root(root);
         auto* arr = doc.new_arr();
 
-        sqlite3_stmt* stmt = nullptr;
-        const std::string sql =
-            "SELECT r.id, r.path, "
-            "(SELECT COUNT(*) FROM files WHERE root_id=r.id), "
-            "(SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id=f.id WHERE f.root_id=r.id), "
-            + workspace_edge_count_sql("r.id") + " "
-            "FROM roots r ORDER BY r.id";
-        if (sqlite3_prepare_v2(conn.raw(), sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-            throw std::runtime_error(sqlite3_errmsg(conn.raw()));
-        int rc = SQLITE_OK;
-        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        for (const auto& entry : read_workspace_inventory(conn, repo_root)) {
             auto* item = doc.new_obj();
-            yyjson_mut_obj_add_int(doc.doc, item, "root_id", sqlite3_column_int64(stmt, 0));
-            yyjson_mut_obj_add_strcpy(doc.doc, item, "path",
-                reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1)));
-            yyjson_mut_obj_add_int(doc.doc, item, "file_count", sqlite3_column_int64(stmt, 2));
-            yyjson_mut_obj_add_int(doc.doc, item, "symbol_count", sqlite3_column_int64(stmt, 3));
-            yyjson_mut_obj_add_int(doc.doc, item, "edge_count", sqlite3_column_int64(stmt, 4));
+            yyjson_mut_obj_add_int(doc.doc, item, "root_id", entry.id);
+            yyjson_mut_obj_add_strcpy(doc.doc, item, "path", entry.path.c_str());
+            yyjson_mut_obj_add_int(doc.doc, item, "file_count", entry.files);
+            yyjson_mut_obj_add_str(
+                doc.doc, item, "role", entry.primary ? "primary" : "additional");
+            yyjson_mut_obj_add_bool(
+                doc.doc, item, "graph_counts_checked", entry.graph_counts_checked);
+            if (entry.graph_counts_checked) {
+                yyjson_mut_obj_add_int(doc.doc, item, "symbol_count", entry.symbols);
+                yyjson_mut_obj_add_int(doc.doc, item, "edge_count", entry.edges);
+            } else {
+                yyjson_mut_obj_add_null(doc.doc, item, "symbol_count");
+                yyjson_mut_obj_add_null(doc.doc, item, "edge_count");
+            }
             yyjson_mut_arr_append(arr, item);
         }
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(conn.raw()));
 
         yyjson_mut_obj_add_val(doc.doc, root, "roots", arr);
         return doc.to_string();
     } catch (const std::exception& e) {
-        return std::string(R"({"error":")") + e.what() + R"("})";
+        return tool_error_json(e.what());
     }
 }
 

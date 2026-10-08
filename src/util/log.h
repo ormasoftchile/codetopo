@@ -1,6 +1,7 @@
 #pragma once
 
 #include "util/json.h"
+#include "util/stderr.h"
 
 #include <string>
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string_view>
+#include <functional>
 
 #ifdef _WIN32
 #include <io.h>
@@ -101,6 +103,23 @@ inline std::optional<int> mcp_log_level_value(std::string_view level) {
     return std::nullopt;
 }
 
+struct McpLogSink {
+    std::mutex mutex;
+    std::function<void(const std::string&)> write;
+    std::filesystem::path path;
+};
+
+inline McpLogSink& mcp_log_sink() {
+    static McpLogSink sink;
+    return sink;
+}
+
+inline std::filesystem::path active_mcp_log_path() {
+    auto& sink = mcp_log_sink();
+    std::lock_guard lock(sink.mutex);
+    return sink.path;
+}
+
 inline void mcp_log(const std::string& msg) {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
@@ -115,7 +134,12 @@ inline void mcp_log(const std::string& msg) {
     std::string line = std::string("[") + buf + "] " + msg;
 
     // Always write to stderr (visible in terminal / VS Code output channel).
-    std::cerr << line << "\n" << std::flush;
+    write_stderr_line(line);
+    {
+        auto& sink = mcp_log_sink();
+        std::lock_guard lock(sink.mutex);
+        if (sink.write) sink.write(line);
+    }
 
     if (mcp_notify_active().load(std::memory_order_relaxed) &&
         mcp_log_level().load(std::memory_order_relaxed) <= 1) {
@@ -193,6 +217,7 @@ public:
     void info(const std::string& msg) { log("INFO", msg); }
     void warn(const std::string& msg) { log("WARN", msg); }
     void error(const std::string& msg) { log("ERROR", msg); }
+    bool good() const { return file_.is_open() && file_.good(); }
 
     void log(const std::string& level, const std::string& msg) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -253,6 +278,59 @@ private:
         std::filesystem::rename(log_path_, first_rotated);
 
         file_.open(log_path_, std::ios::app);
+    }
+};
+
+class ScopedMcpLogFile {
+public:
+    explicit ScopedMcpLogFile(const std::filesystem::path& path) : logger_(path) {
+        if (!logger_.good()) {
+            std::cerr << "WARN: Cannot open MCP diagnostic log: " << path.string()
+                      << '\n' << std::flush;
+            return;
+        }
+        auto& sink = mcp_log_sink();
+        std::lock_guard lock(sink.mutex);
+        previous_ = std::move(sink.write);
+        previous_path_ = std::move(sink.path);
+        sink.path = path;
+        sink.write = [this, path](const std::string& line) {
+            if (failed_) return;
+            try {
+                logger_.info(line);
+                if (!logger_.good()) report_failure(path, "write failed");
+            } catch (const std::filesystem::filesystem_error& e) {
+                report_failure(path, e.what());
+            }
+        };
+        enabled_ = true;
+    }
+
+    ~ScopedMcpLogFile() {
+        if (enabled_) {
+            auto& sink = mcp_log_sink();
+            std::lock_guard lock(sink.mutex);
+            sink.write = std::move(previous_);
+            sink.path = std::move(previous_path_);
+        }
+    }
+
+    bool enabled() const { return enabled_; }
+    ScopedMcpLogFile(const ScopedMcpLogFile&) = delete;
+    ScopedMcpLogFile& operator=(const ScopedMcpLogFile&) = delete;
+
+private:
+    Logger logger_;
+    std::function<void(const std::string&)> previous_;
+    std::filesystem::path previous_path_;
+    bool enabled_ = false;
+    bool failed_ = false;
+
+    void report_failure(const std::filesystem::path& path, const std::string& reason) {
+        failed_ = true;
+        mcp_log_sink().path.clear();
+        std::cerr << "WARN: MCP diagnostic log disabled after an error: "
+                  << path.string() << ": " << reason << '\n' << std::flush;
     }
 };
 

@@ -9,8 +9,17 @@
 #include <iostream>
 #include <utility>
 #include <functional>
+#include <array>
 
 namespace codetopo {
+
+inline std::string workspace_root_metadata_key(int64_t root_id, const std::string& key) {
+    return "workspace_root:" + std::to_string(root_id) + ":" + key;
+}
+
+inline constexpr std::array<const char*, 5> workspace_revision_keys = {
+    "git_head", "git_branch", "last_index_time", "index_generation", "index_state"
+};
 
 // Ownership is independent of numeric IDs, including legacy offset-allocated rows.
 inline std::string workspace_node_ids_sql(const std::string& root_id) {
@@ -25,6 +34,30 @@ inline std::string workspace_edge_count_sql(const std::string& root_id) {
     return "(SELECT COUNT(*) FROM edges WHERE src_id IN (" +
         workspace_node_ids_sql(root_id) + "))";
 }
+
+struct WorkspaceRootInfo {
+    int64_t id = 0;
+    std::string path;
+    int64_t files = 0;
+    int64_t symbols = 0;
+    int64_t edges = 0;
+    bool primary = false;
+    bool graph_counts_checked = true;
+};
+
+inline std::string workspace_roots_sql() {
+    return "SELECT r.id, r.path, "
+        "(SELECT COUNT(*) FROM files INDEXED BY idx_files_root WHERE root_id=r.id), "
+        "(SELECT COUNT(*) FROM files f INDEXED BY idx_files_root "
+        "CROSS JOIN nodes n INDEXED BY idx_nodes_file_id ON n.file_id=f.id "
+        "WHERE f.root_id=r.id), " +
+        workspace_edge_count_sql("r.id") + " FROM roots r ORDER BY r.id";
+}
+
+// No schema migration, writer admission, or content backfill occurs on this read path.
+std::vector<WorkspaceRootInfo> read_workspace_roots(Connection& conn);
+std::vector<WorkspaceRootInfo> read_workspace_inventory(
+    Connection& conn, const std::string& primary_root);
 
 // Multi-root workspace: merges extra roots directly into the main index.sqlite.
 // roots table + root_id column on files allow multiple projects to coexist in
@@ -47,7 +80,7 @@ public:
         int64_t edges_total = -1;
     };
     struct RemoveResult { int64_t files = 0; int64_t symbols = 0; int64_t edges = 0; };
-    struct RootInfo { int64_t id = 0; std::string path; int64_t files = 0; int64_t symbols = 0; int64_t edges = 0; };
+    using RootInfo = WorkspaceRootInfo;
 
     // Add a root: index it (using existing supervisor), then merge into main DB tables.
     AddResult add_root(const std::string& root_path, const Config& cfg,
@@ -57,7 +90,7 @@ public:
     // Remove a root: cascade-delete all its records.
     RemoveResult remove_root(const std::string& root_path);
 
-    // List all roots with stats.
+    // List persisted additional roots with stats; user-facing inventory also includes primary.
     std::vector<RootInfo> list_roots();
     bool has_root(const std::string& path);
 
@@ -72,6 +105,8 @@ private:
     void populate_content_fts_for_root(int64_t root_id, bool color_output);
     void resume_pending_content_fts();
     void clear_root_rows(int64_t root_id);
+    void stage_refresh_relationships(int64_t root_id);
+    void restore_refresh_relationships();
 };
 
 // Legacy path — kept only for detecting old installations.

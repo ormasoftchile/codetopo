@@ -182,3 +182,25 @@ TEST_CASE("spawn_and_wait handles rapid successive calls", "[process]") {
         REQUIRE(rc == 0);
     }
 }
+
+TEST_CASE("Raw process capture preserves bytes and reports bounded truncation",
+          "[process][raw-process-capture]") {
+#ifdef _WIN32
+    const std::string executable = "powershell.exe";
+    const std::vector<std::string> arguments = {
+        "-NoProfile", "-NonInteractive", "-Command",
+        "[Console]::OpenStandardOutput().Write([byte[]](65,0,66,13,10,10),0,6)"
+    };
+#else
+    const std::string executable = "/bin/sh";
+    const std::vector<std::string> arguments = {"-c", "printf 'A\\000B\\r\\n\\n'"};
+#endif
+    auto captured = capture_process_stdout(executable, arguments);
+    REQUIRE(captured.exit_code == 0);
+    CHECK_FALSE(captured.truncated);
+    CHECK(captured.output == std::string("A\0B\r\n\n", 6));
+    auto bounded = capture_process_stdout(executable, arguments, 4);
+    REQUIRE(bounded.exit_code == 0);
+    CHECK(bounded.truncated);
+    CHECK(bounded.output == std::string("A\0B\r", 4));
+}
