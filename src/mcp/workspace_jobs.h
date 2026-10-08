@@ -19,8 +19,10 @@ public:
     bool active() const { return active_.load(); }
 
     std::string start(const std::string& operation, const std::string& path,
-                      const std::string& db, const std::string& primary) {
+                      const std::string& db, const std::string& primary, bool reparse = false) {
         if (path.empty()) throw std::runtime_error("missing required parameter: path");
+        if (reparse && operation != "refresh")
+            throw std::runtime_error("reparse is only supported for workspace refresh");
         auto target = std::filesystem::canonical(path).string();
         if (!std::filesystem::is_directory(target))
             throw std::runtime_error("workspace path must be a directory");
@@ -33,6 +35,7 @@ public:
         active_ = true;
         id_ = "workspace-" + std::to_string(++sequence_);
         operation_ = operation;
+        reparse_ = reparse;
         path_ = target;
         status_ = "queued";
         phase_ = "waiting_for_writer";
@@ -41,7 +44,7 @@ public:
         started_ = std::chrono::steady_clock::now();
         finished_ = {};
         try {
-            worker_ = std::thread([this, operation, target, db] {
+            worker_ = std::thread([this, operation, target, db, reparse] {
                 try {
                     std::unique_lock<std::mutex> gate(gate_, std::defer_lock);
                     while (!gate.try_lock()) {
@@ -71,6 +74,7 @@ public:
                         Config cfg;
                         cfg.thread_count = (std::min)(4, cfg.effective_thread_count());
                         cfg.parse_timeout_s = 5;
+                        cfg.reparse_unchanged = reparse;
                         auto r = ws.add_root(target, cfg, true,
                             [this](const std::string& phase) { checkpoint(phase); });
                         yyjson_mut_obj_add_int(doc.doc, out, "root_id", r.root_id);
@@ -138,6 +142,7 @@ private:
     mutable std::mutex mutex_;
     std::thread worker_;
     std::atomic<bool> active_{false}, cancel_{false};
+    bool reparse_ = false;
     uint64_t sequence_ = 0;
     std::string id_, operation_, path_, status_, phase_, error_, result_;
     std::chrono::steady_clock::time_point started_{}, finished_{};
@@ -160,6 +165,7 @@ private:
         doc.set_root(out);
         yyjson_mut_obj_add_strcpy(doc.doc, out, "job_id", id_.c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, out, "operation", operation_.c_str());
+        yyjson_mut_obj_add_bool(doc.doc, out, "reparse", reparse_);
         yyjson_mut_obj_add_strcpy(doc.doc, out, "path", path_.c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, out, "status", status_.c_str());
         yyjson_mut_obj_add_strcpy(doc.doc, out, "phase", phase_.c_str());

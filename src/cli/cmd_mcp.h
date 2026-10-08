@@ -124,6 +124,21 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             probe, root_hint, root_was_explicit, resolved_db_path);
     }
     std::string repo_root = root_resolution.root.string();
+    auto log_directory = root_resolution.root / ".codetopo" / "logs";
+    std::error_code log_ec;
+    fs::create_directories(log_directory, log_ec);
+    if (log_ec) {
+        mcp_log("warning: cannot create diagnostic log directory: " +
+                log_directory.string() + ": " + log_ec.message());
+    }
+    auto diagnostic_path = log_directory /
+        ("mcp-" + std::to_string(get_current_process_id()) + ".log");
+    ScopedMcpLogFile diagnostic_log(diagnostic_path);
+    mcp_log("lifecycle: root_resolved repo=" + repo_root + " db=" + resolved_db_path);
+    if (diagnostic_log.enabled()) {
+        mcp_log("diagnostics: " + diagnostic_path.string());
+    }
+    mcp_log("startup: checking schema metadata");
 
     // Warn about legacy workspace.sqlite — it is no longer used.
     {
@@ -252,6 +267,16 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
             yyjson_mut_obj_remove_key(properties, key);
             yyjson_mut_obj_add_val(doc.doc, properties, key, property);
         }
+        if (name == "impact_of") {
+            auto* confidence = doc.new_obj();
+            yyjson_mut_obj_add_str(doc.doc, confidence, "type", "number");
+            yyjson_mut_obj_add_real(doc.doc, confidence, "minimum", 0.0);
+            yyjson_mut_obj_add_real(doc.doc, confidence, "maximum", 1.0);
+            yyjson_mut_obj_add_str(doc.doc, confidence, "description",
+                "Minimum indexed-edge confidence to traverse (default 0). "
+                "Confidence is a heuristic score, not proof of a resolved receiver.");
+            yyjson_mut_obj_add_val(doc.doc, properties, "min_confidence", confidence);
+        }
         yyjson_mut_obj_add_int(doc.doc, yyjson_mut_obj_get(properties, "stable_key"), "minLength", 1);
         yyjson_mut_obj_add_int(doc.doc, yyjson_mut_obj_get(properties, "node_id"), "minimum", 0);
         auto alternatives = json_parse(R"({"anyOf":[{"required":["stable_key"]},{"required":["node_id"]},{"required":["symbol","file"]}]})");
@@ -337,11 +362,11 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","properties":{"scope":{"type":"string","description":"Optional file path or directory prefix to restrict results (e.g. 'src/mcp/' or 'src/cli/main.cpp')"},"limit":{"type":"integer","description":"Max results (default 20)"}},"required":[]})J");
 
     register_node_tool("impact_of", tools::impact_of,
-        "Compute the blast radius of changing a symbol from exact graph edges. If first-hop exact callers are empty, candidate_impacted fallback is always on (not version/flag gated) for overloaded/common member calls. Candidate impact is first-hop only, lean by default, and can be narrowed by receiver. Receiver-type resolution depends on local type annotations and metadata reports resolution_status plus hidden candidates.",
+        "Compute blast radius from indexed graph edges, exposing confidence, evidence, source, and hop target identity. Stored name-match edges are heuristic, not confirmed dispatch. If first-hop indexed callers are empty, refs-backed candidate fallback is available. Candidate impact is first-hop only and can be narrowed by receiver.",
         R"J({"type":"object","properties":{"stable_key":{"type":"string","description":"Preferred reindex-proof symbol handle. When provided, node_id is ignored."},"node_id":{"type":"integer","description":"Volatile node_id of the symbol to analyze"},"expected_stable_key":{"type":"string","description":"Optional guard for node_id staleness/reuse."},"depth":{"type":"integer","description":"How many levels of transitive callers to follow (default 2, max 3)"},"max_nodes":{"type":"integer","description":"Max exact impacted nodes and candidate_impacted rows (default 50, max 200)"},"include_candidates":{"type":"boolean","description":"When true, always add candidate_impacted; when false, exact-empty fallback still returns candidate_impacted. Omitted means add candidates if exact impact is empty."},"mode":{"type":"string","enum":["exact","exact_then_candidates","exact_plus_candidates"],"description":"Candidate collection mode for candidate_impacted. Default exact_then_candidates; exact-empty fallback is always on."},"receiver":{"type":"string","description":"Optional receiver type/text filter for candidate_impacted (e.g. LinkedMap). Receiver-type resolution depends on local type annotations; response includes candidate_impacted_resolution_status, totals, receiver_type_hits, and hidden counts."},"include_handles":{"type":"boolean","description":"Opt in to candidate ref_id/caller_node_id/span/evidence fields. Default false keeps candidates lean."},"max_bytes":{"type":"integer","description":"Soft byte budget for candidate_impacted (default 16000, 0 disables, max 100000)."}}})J");
 
     server.register_tool("detect_changes", tools::detect_changes,
-        "Given a git ref, list changed files and symbols, then walk reverse call edges to estimate blast radius for PR review.",
+        "Resolve commit changes within the requested indexed primary/additional root, conservatively map changed files to current indexed symbols, and estimate callers. Reports root identity, indexed/compared commits, source revision verification, and explicit unresolved/stale mapping diagnostics.",
         R"J({"type":"object","properties":{"repo_root":{"type":"string","description":"Path to the git repository root"},"since":{"type":"string","description":"Git ref to diff against HEAD (branch, SHA, HEAD~N, etc.)"},"file_pattern":{"type":"string","description":"Optional GLOB filter for changed files (e.g. 'src/**/*.go')"},"depth":{"type":"integer","description":"BFS depth for impacted callers (default 2, max 5)"},"min_confidence":{"type":"number","description":"Minimum calls-edge confidence to follow (default 0.5)"}},"required":["repo_root","since"]})J");
 
     server.register_tool("file_deps", tools::file_deps,
@@ -415,12 +440,14 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         R"J({"type":"object","properties":{"path":{"type":"string","description":"Absolute path of the workspace root to remove"}},"required":["path"]})J");
 
     server.register_tool("workspace_list", tools::workspace_list,
-        "List all roots in the multi-root workspace with file/symbol/edge counts.",
+        "List the primary root and all additional workspace roots. File counts are exact; "
+        "primary graph totals are null to avoid a repository-wide graph scan.",
         R"J({"type":"object","properties":{}})J");
 
     server.register_tool("workspace_refresh", {},
-        "Start a background refresh of an existing extra root only. Reindexes changed/new/deleted files there before merging, never the primary root. Returns job_id.",
-        R"J({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})J");
+        "Start a background refresh of an existing extra root only, never the primary root. "
+        "Set reparse=true to repair extraction/linking of unchanged source files without clearing the source index. Returns job_id.",
+        R"J({"type":"object","properties":{"path":{"type":"string"},"reparse":{"type":"boolean","default":false}},"required":["path"]})J");
     server.register_tool("workspace_job_status", {},
         "Get the retained job status, phase, elapsed_ms, result or error without querying SQLite. Only the latest job is retained per session.",
         R"J({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]})J");
@@ -529,6 +556,8 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
         mcp_log("watcher: started (" + std::to_string(debounce_ms) + "ms debounce)");
     }
 
+    mcp_log("stdio: ready; waiting for client initialize and JSON-RPC requests "
+            "(stdout is the protocol stream, diagnostics use stderr and the log file)");
     int rc = server.run();
 
     // Watcher::~Watcher() calls stop(), but be explicit about shutdown order.

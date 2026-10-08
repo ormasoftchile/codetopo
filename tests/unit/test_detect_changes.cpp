@@ -26,6 +26,12 @@ namespace {
 
 void cleanup(const fs::path& p) {
     std::error_code ec;
+    if (fs::exists(p, ec)) {
+        for (fs::recursive_directory_iterator it(p, ec), end; !ec && it != end; it.increment(ec)) {
+            fs::permissions(it->path(), fs::perms::owner_write, fs::perm_options::add, ec);
+            if (ec) ec.clear();
+        }
+    }
     fs::remove_all(p, ec);
 }
 

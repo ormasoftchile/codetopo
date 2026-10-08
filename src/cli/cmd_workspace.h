@@ -61,7 +61,7 @@ inline bool validate_workspace_primary(
 }
 
 inline int run_workspace_add(const std::string& root_str, const std::string& target_path,
-                             const Config& cfg, int lock_timeout_s = 30) {
+                             const Config& cfg, int lock_timeout_s = 30, bool refresh = false) {
     namespace fs = std::filesystem;
 
     auto repo_root = fs::canonical(root_str).string();
@@ -91,8 +91,10 @@ inline int run_workspace_add(const std::string& root_str, const std::string& tar
 
     try {
         WorkspaceDB ws(db_path);
-        auto result = ws.add_root(target_path, cfg);
-        std::cout << "Added root: " << fs::canonical(target_path).string() << "\n"
+        if (refresh && !ws.has_root(fs::canonical(target_path).string()))
+            throw std::runtime_error("refresh requires an existing additional root");
+        auto result = ws.add_root(target_path, cfg, refresh);
+        std::cout << (refresh ? "Refreshed root: " : "Added root: ") << fs::canonical(target_path).string() << "\n"
                   << "  root_id: " << result.root_id << "\n"
                   << "  files:   " << format_with_commas(result.files) << "\n"
                   << "  symbols: " << format_with_commas(result.symbols) << "\n"
@@ -152,23 +154,25 @@ inline int run_workspace_list(const std::string& root_str) {
         return 0;
     }
     try {
-        FileLock writer(db_path + ".lock");
-        if (!writer.acquire()) throw std::runtime_error("database busy: writer lock held");
-        if (!validate_workspace_primary(db_path, repo_root)) return 1;
-        WorkspaceDB ws(db_path);
-        auto roots = ws.list_roots();
-
-        if (roots.empty()) {
-            std::cout << "No extra workspace roots configured.\n";
-            return 0;
+        Connection conn(db_path, true);
+        std::vector<WorkspaceRootInfo> roots;
+        {
+            ReadSnapshot snapshot(conn);
+            index_ownership::resolve_primary_root(conn, repo_root, true, db_path);
+            roots = read_workspace_inventory(conn, repo_root);
         }
 
         std::cout << "Workspace roots (" << roots.size() << "):\n";
         for (const auto& r : roots) {
             std::cout << "  [" << r.id << "] " << r.path
-                      << " (" << r.files << " files, "
-                      << r.symbols << " symbols, "
-                      << r.edges << " edges)\n";
+                      << (r.primary ? " [primary]" : " [additional]")
+                      << " (" << r.files << " files";
+            if (r.graph_counts_checked) {
+                std::cout << ", " << r.symbols << " symbols, " << r.edges << " edges";
+            } else {
+                std::cout << "; graph totals not computed";
+            }
+            std::cout << ")\n";
         }
         return 0;
     } catch (const std::exception& e) {

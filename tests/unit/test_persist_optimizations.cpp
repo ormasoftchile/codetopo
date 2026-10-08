@@ -307,7 +307,7 @@ TEST_CASE("Force clear truncates main-project index but keeps metadata", "[unit]
     cleanup(tmp);
 }
 
-TEST_CASE("resolve_references emits multiple call edges for overloaded targets",
+TEST_CASE("resolve_references rejects targets incompatible with a typed receiver",
           "[unit][persist_opt][resolve_refs]") {
     auto tmp = make_test_dir("test_resolve_refs_multitarget");
     auto db_path = tmp / "multitarget.sqlite";
@@ -341,19 +341,19 @@ TEST_CASE("resolve_references emits multiple call edges for overloaded targets",
 
         auto [resolved, edges_created] = persister.resolve_references();
         CHECK(resolved == 1);
-        CHECK(edges_created == 3);
+        CHECK(edges_created == 1);
 
         CHECK(count_query(conn,
             "SELECT COUNT(*) FROM refs WHERE resolved_node_id = " + std::to_string(delegating_send)) == 1);
 
         CHECK(count_query(conn,
             "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
-            " AND kind = 'calls'") == 3);
+            " AND kind = 'calls'") == 1);
 
         CHECK(count_query(conn,
             "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
             " AND dst_id = " + std::to_string(http_send) +
-            " AND ABS(confidence - 0.75) < 0.0001") == 1);
+            " AND ABS(confidence - 0.75) < 0.0001") == 0);
         CHECK(count_query(conn,
             "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
             " AND dst_id = " + std::to_string(delegating_send) +
@@ -361,7 +361,7 @@ TEST_CASE("resolve_references emits multiple call edges for overloaded targets",
         CHECK(count_query(conn,
             "SELECT COUNT(*) FROM edges WHERE src_id = " + std::to_string(caller_symbol) +
             " AND dst_id = " + std::to_string(fake_send) +
-            " AND ABS(confidence - 0.60) < 0.0001") == 1);
+            " AND ABS(confidence - 0.60) < 0.0001") == 0);
     }
 
     cleanup(tmp);

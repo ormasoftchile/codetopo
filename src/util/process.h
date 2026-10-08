@@ -3,8 +3,11 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <cstddef>
 
 namespace codetopo {
+
+unsigned long get_current_process_id();
 
 // Get the path to the currently running executable.
 std::string get_self_executable_path();
@@ -27,5 +30,15 @@ int spawn_and_wait_with_stall_timeout(
 int spawn_and_read_stdout(const std::string& exe,
                           const std::vector<std::string>& args,
                           const std::function<void(const std::string&)>& on_line);
+
+struct CapturedProcessOutput {
+    int exit_code = 1;
+    std::string output;
+    bool truncated = false;
+};
+
+CapturedProcessOutput capture_process_stdout(
+    const std::string& exe, const std::vector<std::string>& args,
+    size_t max_bytes = 64 * 1024 * 1024);
 
 } // namespace codetopo

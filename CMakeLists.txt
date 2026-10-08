@@ -169,6 +169,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_source_at.cpp
     tests/unit/test_csharp_extractor.cpp
     tests/unit/test_javascript_extractor.cpp
+    tests/unit/test_cpp_call_binding.cpp
     tests/unit/test_persist_optimizations.cpp
     tests/unit/test_dec039_optimizations.cpp
     tests/unit/test_watchdog_timeout.cpp
@@ -176,8 +177,13 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_lean_listing.cpp
     tests/unit/test_approx_callgraph.cpp
     tests/unit/test_detect_changes.cpp
+    tests/unit/test_extra_root_resolution.cpp
     tests/unit/test_workspace_merge.cpp
     tests/unit/test_workspace_jobs.cpp
+    tests/unit/test_workspace_listing.cpp
+    tests/unit/test_startup_progress.cpp
+    tests/unit/test_scan_performance.cpp
+    tests/unit/test_scanner_correctness.cpp
     tests/unit/test_trace_tools.cpp
     tests/unit/test_targeted_reindex.cpp
     tests/unit/test_bind.cpp

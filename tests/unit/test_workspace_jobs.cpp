@@ -219,6 +219,7 @@ TEST_CASE("Workspace queries use scoped graph index plans without ANALYZE", "[un
         "SELECT COUNT(*) FROM files f CROSS JOIN nodes n ON n.file_id=f.id WHERE f.root_id=1",
         "SELECT " + workspace_edge_count_sql("1"),
         "SELECT " + workspace_edge_count_sql("r.id") + " FROM roots r",
+        workspace_roots_sql(),
         workspace_node_ids_sql("1"),
         "SELECT n.id FROM temp.__ct_root_nodes t CROSS JOIN nodes n ON n.id=t.id WHERE n.node_type='symbol'",
         "DELETE FROM nodes WHERE id IN (SELECT id FROM temp.__ct_root_nodes)",
@@ -469,22 +470,22 @@ TEST_CASE("Committed graph reads overlap real workspace replacement through comm
     REQUIRE(sqlite3_txn_state(reader.raw(), "main") == SQLITE_TXN_NONE);
 }
 
-TEST_CASE("Workspace scoped name lookup resolves both cross-root directions", "[unit][workspace][integration]") {
+TEST_CASE("Workspace scoped namespace lookup resolves both cross-root directions", "[unit][workspace][integration]") {
     JobFixture fixture;
     fs::create_directories(fixture.extra / ".codetopo");
     auto seed = [](const std::string& db, const std::string& definition, const std::string& call) {
         Connection conn(db);
         schema::ensure_schema(conn);
         conn.exec("INSERT INTO files(id,path,language,size_bytes,mtime_ns,content_hash,parse_status) "
-                  "VALUES(1,'fixture.c','c',10,1,'hash','ok')");
-        conn.exec("INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key,is_definition) "
-                  "VALUES(1,'symbol',1,'function','" + definition + "','sym-" + definition + "',1)");
+                  "VALUES(1,'fixture.cpp','cpp',10,1,'hash','ok')");
+        conn.exec("INSERT INTO nodes(id,node_type,file_id,kind,name,qualname,stable_key,is_definition) "
+                  "VALUES(1,'symbol',1,'function','" + definition + "','api::" + definition + "','sym-" + definition + "',1)");
         conn.exec("INSERT INTO refs(id,file_id,kind,name,start_line,start_col,end_line,end_col,containing_node_id) "
                   "VALUES(1,1,'call','" + call + "',1,0,1,1,1)");
     };
-    seed(fixture.db, "primaryTarget", "mergedTarget");
+    seed(fixture.db, "primaryTarget", "api::mergedTarget");
     auto source = (fixture.extra / ".codetopo" / "index.sqlite").string();
-    seed(source, "mergedTarget", "receiver.primaryTarget");
+    seed(source, "mergedTarget", "api::primaryTarget");
     {
         Connection source_conn(source);
         stamp_source_index(source_conn, fixture.extra);

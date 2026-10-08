@@ -13,6 +13,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
+#include <cctype>
 #include <sqlite3.h>
 #include <string>
 #include <memory>
@@ -72,8 +74,8 @@ static void create_source_index(const fs::path& root) {
         "INSERT INTO nodes(id, node_type, file_id, kind, name, qualname, signature, start_line, end_line, is_definition, fingerprint, stable_key) "
         "VALUES(2, 'symbol', 1, 'function', 'mergedNeedleSymbol', 'mergedNeedleSymbol', 'mergedNeedleSymbol()', 1, 3, 1, 'abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd', 'sym:mergedNeedleSymbol')");
     conn.exec(
-        "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
-        "VALUES(2, 2, 'references', 1.0, 'test')");
+        "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence, source, observed_count) "
+        "VALUES(2, 2, 'references', 1.0, 'test', 'runtime', 7)");
     conn.exec(
         "INSERT INTO edges(src_id, dst_id, kind, confidence, evidence) "
         "VALUES(1, 2, 'contains', 1.0, 'file-node-src-test')");
@@ -86,6 +88,7 @@ static void create_source_index(const fs::path& root) {
     schema::set_kv(conn, "repo_root", fs::canonical(root).string());
     schema::set_kv(conn, "index_state", "current");
     schema::set_kv(conn, "last_index_time", "2026-10-06T00:00:00Z");
+    schema::set_kv(conn, "git_head", "source-snapshot-commit");
     fts::rebuild(conn);
 }
 
@@ -105,6 +108,12 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
     auto ws = std::make_unique<WorkspaceDB>(default_db(main_root));
     auto result = ws->add_root(src_root, cfg);
     REQUIRE(result.root_id > 0);
+    {
+        Connection merged(default_db(main_root), true);
+        CHECK(schema::get_kv(merged, workspace_root_metadata_key(result.root_id, "git_head")) ==
+              "source-snapshot-commit");
+        CHECK(schema::get_kv(merged, "git_head").empty());
+    }
     REQUIRE(result.files == 1);
     REQUIRE(result.symbols == 1);
     REQUIRE(result.edges == 2);
@@ -116,6 +125,9 @@ TEST_CASE("Workspace add bulk-merges rows and keeps FTS/remove correct", "[unit]
         auto symbol_node = scalar_count(conn, "SELECT id FROM nodes WHERE stable_key='1:sym:mergedNeedleSymbol'");
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM files WHERE root_id=" + std::to_string(result.root_id)) == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM edges WHERE src_id=" + std::to_string(file_node)) == 1);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=" + std::to_string(symbol_node) +
+            " AND source='runtime' AND observed_count=7") == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM refs WHERE containing_node_id=" + std::to_string(symbol_node)) == 2);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes WHERE id=" + std::to_string(symbol_node) + " AND fingerprint IS NOT NULL") == 1);
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
@@ -365,6 +377,84 @@ TEST_CASE("Invalid source mappings fail atomically and detach before source admi
         Connection conn(default_db(primary.string()));
         REQUIRE(scalar_count(conn, "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH 'mergedNeedleSymbol'") == 1);
         REQUIRE(conn.foreign_key_check() == 0);
+    }
+    cleanup_workspace_test_dir(base);
+}
+
+TEST_CASE("Workspace refresh preserves observed and non-call relationships by stable identity",
+          "[unit][workspace][cpp_binding][graph-preservation]") {
+    auto base = fs::current_path() / "build" / "test_workspace_refresh_relationships";
+    cleanup_workspace_test_dir(base);
+    auto primary = base / "primary";
+    auto extra = base / "ExtraRoot";
+    fs::create_directories(primary);
+    fs::create_directories(extra);
+    create_empty_index(primary);
+    create_source_index(extra);
+    auto database = primary / ".codetopo" / "index.sqlite";
+    {
+        Connection conn(database);
+        schema::register_custom_functions(conn.raw());
+        conn.exec(
+            "INSERT INTO files(id,path,language,size_bytes,mtime_ns,content_hash,parse_status) "
+            "VALUES(1,'primary.cpp','cpp',1,1,'primary','ok')");
+        conn.exec(
+            "INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
+            "VALUES(100,'symbol',1,'function','primary','primary.cpp::function::primary')");
+    }
+    int64_t old_target;
+    int64_t root_id;
+    {
+        WorkspaceDB workspace(database.string());
+        root_id = workspace.add_root(extra.string(), Config{}).root_id;
+        Connection conn(database);
+        schema::register_custom_functions(conn.raw());
+        old_target = scalar_count(conn, "SELECT id FROM nodes WHERE stable_key='1:sym:mergedNeedleSymbol'");
+        conn.exec(
+            "INSERT INTO nodes(id,node_type,file_id,kind,name,stable_key) "
+            "VALUES(1000,'symbol',1,'function','growth','primary.cpp::function::growth')");
+        conn.exec(
+            "INSERT INTO edges(src_id,dst_id,kind,confidence,evidence,source,observed_count,first_seen,last_seen) "
+            "VALUES(100," + std::to_string(old_target) + ",'calls',0.99,'observed','runtime',42,'first','last')");
+        conn.exec(
+            "INSERT INTO edges(src_id,dst_id,kind,confidence,evidence) VALUES"
+            "(100," + std::to_string(old_target) + ",'references',0.9,'qualified-reference'),"
+            "(100," + std::to_string(old_target) + ",'calls',0.75,'name-match')");
+        conn.exec(
+            "INSERT INTO refs(file_id,kind,name,containing_node_id,resolved_node_id) "
+            "VALUES(1,'type_ref','mergedNeedleSymbol',100," + std::to_string(old_target) + ")");
+    }
+    {
+        WorkspaceDB workspace(database.string());
+        auto spelling = fs::canonical(extra).string();
+#ifdef _WIN32
+        std::transform(spelling.begin(), spelling.end(), spelling.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        std::replace(spelling.begin(), spelling.end(), '\\', '/');
+#endif
+        REQUIRE(workspace.has_root(spelling));
+        REQUIRE(workspace.add_root(spelling, Config{}).root_id == root_id);
+        Connection conn(database);
+        auto target = scalar_count(conn, "SELECT id FROM nodes WHERE stable_key='1:sym:mergedNeedleSymbol'");
+        CHECK(target != old_target);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM nodes WHERE id IN (100,1000) AND file_id=1") == 2);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=100 AND dst_id=" + std::to_string(target) +
+            " AND source='runtime' AND observed_count=42 AND first_seen='first' AND last_seen='last'") == 1);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=100 AND dst_id=" + std::to_string(target) +
+            " AND kind='references' AND evidence='qualified-reference'") == 1);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=100 AND evidence='name-match'") == 0);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM refs WHERE file_id=1 AND resolved_node_id=" + std::to_string(target)) == 1);
+        CHECK(scalar_count(conn,
+            "SELECT COUNT(*) FROM edges WHERE src_id=" + std::to_string(target) +
+            " AND source='runtime' AND observed_count=7") == 1);
+        CHECK(scalar_count(conn, "SELECT COUNT(*) FROM files WHERE root_id IS NULL") == 1);
+        CHECK(scalar_count(conn, "SELECT COUNT(*) FROM roots") == 1);
+        CHECK(conn.foreign_key_check() == 0);
     }
     cleanup_workspace_test_dir(base);
 }

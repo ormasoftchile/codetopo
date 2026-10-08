@@ -227,6 +227,39 @@ After client initialization, server diagnostics are sent both to stderr and as
 MCP `notifications/message` events. This includes tool calls, watcher changes,
 and reindex completion or failure. Clients can filter protocol logs with
 `logging/setLevel`; stderr diagnostics remain available regardless of that level.
+MCP also retains these diagnostics under the primary root in
+`.codetopo/logs/mcp-<pid>.log` (50 MB rotation, three retained rotations per
+process). The startup message prints the exact log path. Startup readiness is
+separate from client initialization: an idle stdio server waits for the host to
+send `initialize`, and stdout must remain JSON-RPC rather than console text.
+Background reindex scan phases report visited directories, entries, source-file
+counts, and elapsed time to stderr and `index.sqlite.progress` every five
+seconds. MCP relays changing child progress into its diagnostic log and, after
+initialization, protocol logging notifications; a long scan is no longer a
+silent interval that is indistinguishable from a hung process.
+Filesystem reconciliation caches each directory listing for ignore loading and
+file selection, instead of walking the tree twice. On Windows, directory
+enumeration supplies file sizes and timestamps directly; the root is
+canonicalized once, with separate canonicalization only for reparse points.
+Existing timestamp precision and source selection are retained so unchanged
+files still take the mtime/size fast path. This optimization does not disable
+startup reconciliation, change freshness policies, or disable watching.
+
+The hidden Catch2 `[scan-performance]` benchmark measures scanning alone without
+opening a database. Set `CODETOPO_SCAN_ROOT` and `CODETOPO_SCAN_REPORT` to an
+authorized repository and workspace-local JSON report path, then run
+`codetopo_tests.exe "[scan-performance]"`. The report records phase timings and
+filesystem-operation counts, plus a sorted `.manifest` containing every source
+path, language, size, and timestamp for exact before/after comparisons.
+
+In VS Code, use the **locally configured/native** MCP server when you want its
+stderr and protocol logs in the Output panel. With an agent-host chat focused,
+`MCP: List Servers` may default to that chat's runtime-managed `.mcp.json`
+servers instead; choose **Show locally configured servers...** to select the
+native `.vscode/mcp.json` entry. Agent-host Output channels in VS Code 1.139.1
+record runtime state, not the server's complete stderr/protocol log stream.
+An agent-managed entry showing `Running` is not a verification that its live
+Codetopo logs are visible in the native MCP Output channel.
 
 ```bash
 # With file watching for auto‑reindex
@@ -411,20 +444,20 @@ selector. In JSON, escape each backslash once, e.g.
 | `workspace_add` | Start background extra-root indexing/merge job; returns `job_id` |
 | `workspace_refresh` | Incrementally reindex an existing extra root, then merge it; returns `job_id` |
 | `workspace_remove` | Start background extra-root removal job; returns `job_id` |
-| `workspace_list` | List committed extra roots with scoped file, symbol, and edge counts |
+| `workspace_list` | List the primary root and additional roots; exact file counts and scoped additional-root graph counts |
 | `workspace_job_status` | Poll a workspace job's phase, elapsed time, terminal result, or error |
 | `workspace_job_cancel` | Request cancellation of a workspace job at the next safe phase boundary |
 
 ### Workspace jobs and editor lifecycle
 
-MCP workspace mutations are asynchronous; CLI `workspace add/remove` and `query`
+MCP workspace mutations are asynchronous; CLI `workspace add/refresh/remove` and `query`
 retain their synchronous behavior. For MCP, call `workspace_add` or
 `workspace_refresh` with `{"path":"C:\\projects\\reference"}`, then call
 `workspace_job_status` with the returned `{"job_id":"workspace-1"}`.
 Only one job runs at a time; only the latest job is retained in memory for the
 session. IDs are session-local, not durable across reconnections.
 
-Status contains `operation`, `path`, `status`, `phase`, `elapsed_ms`,
+Status contains `operation`, `path`, `reparse`, `status`, `phase`, `elapsed_ms`,
 `cancel_requested` and `cancellation_policy`. States are `queued`, `running`,
 `completed`, `failed`, or `cancelled`; `completed` includes `result`, and
 `failed` includes `error`. Progress is phase-level, not a fabricated percentage:
@@ -439,7 +472,32 @@ writer transaction and foreign keys are remapped together. Primary growth and
 legacy high IDs cannot collide on refresh; cleanup uses root ownership, not ID
 ranges. Stable symbol keys retain their root prefix across refreshes.
 CLI add still reuses an existing source index; use MCP refresh or
-`codetopo index --root <extra-root>` before a synchronous CLI add to update it.
+`codetopo workspace refresh <extra-root> --root <primary-root>` to update it.
+For extraction/linking repairs after an upgrade, request
+`workspace_refresh({"path":"<extra-root>","reparse":true})` or add `--reparse`
+to that CLI refresh. This reparses unchanged files in the **selected additional
+root**, preserves matching source symbol/file identities, and does not clear
+the source index or index the primary root. A direct `index --reparse` is also
+available; unlike `--force`, it does not clear owned rows up front. Normal
+startup/watch behavior remains incremental and never implicitly requests this
+repair. Back up the destination and source indexes before repairing production
+data.
+Refresh remaps runtime observations and cross-root non-call relationships by
+stable identity, including observation counts/timestamps. Old static call
+inference is rebound instead of being blindly restored. Registrations retain
+their original root ID/path spelling when a Windows case/separator variant is
+used; conflicting duplicate registrations produce an error.
+CLI `codetopo workspace list` is read-only and remains available while an index
+or workspace writer holds the lock. It reports a committed WAL snapshot, does
+not migrate or backfill the database, and never requires stopping MCP or watching.
+It shows **all workspace roots**, including `[0] [primary]` and each added
+repository as `[id] [additional]`. MCP `workspace_list` returns the same
+inventory with `role: "primary"` / `"additional"`, and `repo_stats.roots`
+also includes the primary. The primary remains implicit in SQLite
+(`files.root_id IS NULL`); displaying it does not insert a duplicate row into
+`roots` or alter ownership. Primary file counts are exact; its symbol/edge
+totals are explicitly not computed (`null` in MCP responses) rather than
+triggering multi-million-row graph counts.
 
 `workspace_job_cancel` is explicit: client request timeouts and
 `notifications/cancelled` do **not** cancel an accepted job. Cancellation is
@@ -469,7 +527,7 @@ source locks remain held through DETACH. No global graph totals, index rebuild
 or full integrity scan is used as a health proxy. `repo_stats` reports file
 counts and metadata; `symbol_count`/`edge_count` and per-root graph totals are
 `null`, with `graph_counts_checked:false` and `graph_counts_status:"not_computed"`.
-Workspace job results and `workspace_list` retain their scoped exact counts.
+Workspace job results and additional-root entries retain their scoped exact counts.
 
 Editor stdio sessions default to **no idle shutdown** (`--idle-timeout 0`).
 An explicitly positive idle timeout is enforced while waiting for input,
@@ -544,6 +602,72 @@ native Windows and forward-slash separators accepted. Search patterns retain
 SQLite GLOB semantics (`*` can match directory separators); they are not
 filesystem-style single-level globs. Scoped plan regressions use the production
 schema without `ANALYZE` and reject full node/edge index traversals.
+
+### Additional-root lookup and commit impact
+
+Absolute file selectors resolve against the registered primary/additional root
+identity. Windows case variants and native, forward, or mixed separators are
+accepted without changing stored paths or stable keys. Relative file selectors
+remain primary-root-relative; they never select an additional file merely
+because its suffix matches. If a normalized path or symbol matches multiple
+indexed identities, the result is explicitly ambiguous; use the returned
+`stable_key` to select the intended symbol. Symbol names and stable keys remain
+case-sensitive. Wildcard filters retain SQLite GLOB semantics, including case
+sensitivity in the wildcard portion.
+
+`detect_changes` runs its commit comparison relative to the requested indexed
+repository/subtree, then maps its paths through that root's identity. It does
+not search the primary root for same-named additional-root files. Mapping is
+**file-level conservative**: `changed_symbols` contains indexed symbols in the
+changed files, including C++ structs/types/fields, not a historical AST diff of
+only the modified declarations. Call impact follows stored `calls` edges.
+
+Responses include `root_id`, `root_role`, resolved comparison commits,
+`indexed_commit`, `index_revision_status`, `mapping_status`,
+`analysis_complete`, `file_resolution`, and `diagnostics`.
+Source mapping completeness is separate from traversal completeness:
+`impact_truncated`, `impact_limit`, and `impact_limit_reached` explicitly report
+the 500-node call-impact cap; a capped traversal never sets `analysis_complete`
+to true.
+Unsupported/unindexed source, unavailable historical files, incomplete parses,
+unknown revision metadata, or content mismatches are not reported as clean
+empty impact. Available source hashes are compared to the fixed target commit,
+with LF/CRLF worktree equivalence handled explicitly. Symbols whose indexed
+content differs are not projected onto that target revision.
+
+Additional-root merges now capture their source index's commit/completion
+metadata atomically with the graph. Older merged indexes may lack this metadata;
+the tools report `indexed_revision_status: "unknown"` rather than borrowing the
+primary repository's commit. `server_health` readiness is not a guarantee that
+every additional root matches its repository's current HEAD.
+
+`impact_of` and `detect_changes` expose each followed edge's confidence,
+evidence, source, observation count, and `via_stable_key`. An indexed
+`name-match` relationship is labeled `name_match_heuristic`, not confirmed
+receiver/overload dispatch. `impact_of.min_confidence` can filter traversal;
+the score is heuristic, not a probability. Stable-handle lookup establishes
+the indexed target identity, not the correctness of every inferred call edge.
+
+C/C++ extraction emits a definition once, not again for its child declarator.
+Genuine prototypes and overloads remain separate; namespace/type qualification
+and enclosing-call ownership are retained. Existing file-scoped C/C++ base
+stable handles remain compatible. Suffixed handles distinguish genuine
+same-file name collisions, not duplicate AST representations.
+
+Both local/cross-file and cross-root call binding check language, known argument
+arity (including defaults/variadics), explicit qualification, and known receiver
+ownership. Unrelated member/free functions are not interchangeable simply
+because their bare names match. Unknown C/C++ member receivers remain
+unresolved rather than producing name-only indexed call edges; refs-backed
+candidate tools can still report their approximate evidence.
+Multiple compatible overloads retain candidate edges (`call-candidate` or
+`workspace_call_candidate`, confidence at most 0.60) without arbitrarily setting
+`resolved_node_id`. Impact output labels these `ambiguous_call_candidate`,
+unique name-based matches `name_match_heuristic`, and observed runtime edges
+`runtime_observed`. This is conservative structural binding, not a full C++
+compiler/type resolver.
+Unqualified cross-namespace `using`/ADL dispatch and complex receiver expressions
+are not guessed when their scope/type cannot be established.
 
 ## Project Structure
 
