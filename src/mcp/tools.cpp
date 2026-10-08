@@ -18,6 +18,7 @@
 #include "index/diff.h"
 #include "util/lock.h"
 #include "core/inplace_vector.h"
+#include "core/saturating.h"
 #include <sqlite3.h>
 #include <sstream>
 #include <fstream>

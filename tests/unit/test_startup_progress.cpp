@@ -93,7 +93,7 @@ TEST_CASE("Scan heartbeat persists current phase and shuts down without waiting 
                std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        CHECK(fs::last_write_time(path) != initial);
+        CHECK((fs::last_write_time(path) != initial));
     }
     auto started = std::chrono::steady_clock::now();
     {

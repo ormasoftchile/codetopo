@@ -12,6 +12,7 @@
 #include <memory>
 #include <cassert>
 #include <limits>
+#include "core/saturating.h"
 
 namespace codetopo {
 
