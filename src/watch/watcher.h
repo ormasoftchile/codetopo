@@ -13,6 +13,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
+#include "util/git.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,7 +35,8 @@ struct WatchEvent {
 inline bool is_git_head_change(const fs::path& p) {
     auto s = p.generic_string();
     return s.find(".git/HEAD") != std::string::npos
-        || s.find(".git/refs/") != std::string::npos;
+        || s.find(".git/refs/") != std::string::npos
+        || (s.find(".git/worktrees/") != std::string::npos && (s.ends_with("/HEAD") || s.ends_with("\\HEAD")));
 }
 
 // Directories the watcher must never descend into or fire events for. Mirrors
@@ -179,7 +181,8 @@ private:
                 // events (happens on very large bursts, e.g. a big checkout). Inject
                 // a synthetic BranchSwitch so the consumer re-derives the change set
                 // from `git diff` instead of a lossy partial list.
-                pending.push_back({FileEvent::BranchSwitch, root_ / ".git" / "HEAD"});
+                auto head_path = get_git_head_path(root_);
+                pending.push_back({FileEvent::BranchSwitch, head_path.empty() ? (root_ / ".git" / "HEAD") : head_path});
                 last_event_time = std::chrono::steady_clock::now();
                 if (!arm_read()) break;
                 continue;
@@ -274,13 +277,13 @@ private:
     void run_polling() {
         auto known_files = collect_files();
 
-        // Track .git/HEAD separately for branch-switch detection (the .git dir
+        // Track HEAD separately for branch-switch detection (the .git dir
         // itself is pruned from collect_files()).
-        auto git_head = root_ / ".git" / "HEAD";
+        auto git_head = get_git_head_path(root_);
         fs::file_time_type git_head_mtime{};
         {
             std::error_code ec;
-            if (fs::exists(git_head, ec)) git_head_mtime = fs::last_write_time(git_head, ec);
+            if (!git_head.empty() && fs::exists(git_head, ec)) git_head_mtime = fs::last_write_time(git_head, ec);
         }
 
         while (running_) {
@@ -288,8 +291,8 @@ private:
 
             std::vector<WatchEvent> events;
 
-            // Branch-switch detection via explicit .git/HEAD stat.
-            {
+            // Branch-switch detection via explicit HEAD stat.
+            if (!git_head.empty()) {
                 std::error_code ec;
                 if (fs::exists(git_head, ec)) {
                     auto mtime = fs::last_write_time(git_head, ec);
