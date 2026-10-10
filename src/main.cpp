@@ -15,6 +15,7 @@
 #include "cli/cmd_parse_file.h"
 #include "cli/cmd_quality.h"
 #include "cli/cmd_diff.h"
+#include "cli/cmd_worktree.h"
 #include "index/supervisor.h"
 #include "util/repo.h"
 
@@ -292,6 +293,24 @@ int main(int argc, char** argv) {
         "Main project root (positional, default: current dir)")->default_val(".");
     ws_list->add_option("--root", ws_list_root_flag, "Main project root directory (flag)")->default_val(".");
 
+    // --- worktree subcommand ---
+    auto* sub_worktree = app.add_subcommand("worktree", "Worktree intelligence: fast index reuse across Git worktrees");
+    sub_worktree->require_subcommand(1);
+
+    auto* wt_init = sub_worktree->add_subcommand("init", "Bootstrap a worktree index from the primary repository");
+    std::string wt_init_root = ".";
+    std::string wt_init_from;
+    wt_init->add_option("--root", wt_init_root, "Worktree root directory")->default_val(".");
+    wt_init->add_option("--from", wt_init_from, "Primary repository root to seed from (auto-detected if omitted)");
+
+    auto* wt_sync = sub_worktree->add_subcommand("sync", "Fast reconcile worktree index against latest changes");
+    std::string wt_sync_root = ".";
+    wt_sync->add_option("--root", wt_sync_root, "Worktree root directory")->default_val(".");
+
+    auto* wt_status = sub_worktree->add_subcommand("status", "Show worktree intelligence status and index details");
+    std::string wt_status_root = ".";
+    wt_status->add_option("--root", wt_status_root, "Worktree root directory")->default_val(".");
+
     // --- Parse and dispatch ---
     CLI11_PARSE(app, argc, argv);
 
@@ -473,6 +492,23 @@ int main(int argc, char** argv) {
             if (ws_list->parsed()) {
                 std::string ws_root = (ws_list_root_pos_opt->count() > 0) ? ws_list_root_pos : ws_list_root_flag;
                 return codetopo::run_workspace_list(ws_root);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: " << e.what() << "\n";
+            return 1;
+        }
+    }
+
+    if (sub_worktree->parsed()) {
+        try {
+            if (wt_init->parsed()) {
+                return codetopo::run_worktree_init(wt_init_root, wt_init_from);
+            }
+            if (wt_sync->parsed()) {
+                return codetopo::run_worktree_sync(wt_sync_root);
+            }
+            if (wt_status->parsed()) {
+                return codetopo::run_worktree_status(wt_status_root);
             }
         } catch (const std::exception& e) {
             std::cerr << "FATAL: " << e.what() << "\n";

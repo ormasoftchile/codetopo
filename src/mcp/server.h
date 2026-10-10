@@ -600,15 +600,17 @@ private:
         return out.to_string();
     }
 
-    // R2: Stat .git/HEAD to cheaply detect branch switches / new commits.
+    // R2: Stat HEAD to cheaply detect branch switches / new commits.
+    // Handles standard Git repositories as well as linked Git worktrees.
     // Only spawns git processes when mtime has actually changed.
     void check_staleness() {
         namespace fs = std::filesystem;
-        auto head_path = fs::path(repo_root_) / ".git" / "HEAD";
+        auto head_path = get_git_head_path(repo_root_);
+        if (head_path.empty()) return;
 
         std::error_code ec;
         auto mtime = fs::last_write_time(head_path, ec);
-        if (ec) return;  // no .git/HEAD — not a git repo, skip
+        if (ec) return;  // cannot stat HEAD — skip
 
         // Fast path: mtime unchanged since last check
         if (mtime == staleness_.last_head_mtime) return;

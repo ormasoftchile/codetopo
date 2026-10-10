@@ -11,6 +11,7 @@
 #include "util/log.h"
 #include "util/lock.h"
 #include "util/git.h"
+#include "index/worktree_reconcile.h"
 #include "watch/watcher.h"
 #include <iostream>
 #include <filesystem>
@@ -104,6 +105,27 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
     const auto startup_started = std::chrono::steady_clock::now();
     const auto startup_wall_time = std::chrono::system_clock::now();
     mcp_log("lifecycle: startup");
+
+    if (!fs::exists(db_path)) {
+        // Zero-config worktree intelligence: if database does not exist, but
+        // root_hint is a linked Git worktree whose primary repo has an existing index,
+        // automatically bootstrap the worktree index from the primary repository.
+        auto wt_info = resolve_worktree_info(root_hint);
+        if (wt_info.is_worktree) {
+            std::string primary_db = default_db(wt_info.primary_repo_root.string());
+            if (fs::exists(primary_db)) {
+                mcp_log("lifecycle: auto-bootstrapping worktree index from primary " +
+                        wt_info.primary_repo_root.string());
+                auto res = bootstrap_worktree_index(root_hint);
+                if (res.success) {
+                    mcp_log("lifecycle: worktree index ready (" +
+                            std::to_string(res.files_changed) + " files reconciled)");
+                } else {
+                    mcp_log("warning: worktree bootstrap failed: " + res.error);
+                }
+            }
+        }
+    }
 
     if (!fs::exists(db_path)) {
         mcp_log("shutdown: startup_error database not found: " + db_path);
@@ -502,10 +524,7 @@ inline int run_mcp(const std::string& db_path, const std::string& root_hint,
                     if (s.find(".codetopo/") != std::string::npos) continue;
                     if (s.find(".codetopo\\") != std::string::npos) continue;
                     if (ev.type == FileEvent::BranchSwitch) {
-                        if (s.find(".git/HEAD") != std::string::npos ||
-                            s.find(".git\\HEAD") != std::string::npos) {
-                            branch_switch = true;
-                        }
+                        branch_switch = true;
                         continue;
                     }
                     // Skip .git/ internals (pack files, index, refs updates, etc.)

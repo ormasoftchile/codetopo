@@ -193,6 +193,7 @@ set(CODETOPO_TEST_SOURCES
     tests/unit/test_root_ownership.cpp
     tests/unit/test_resolver_preservation.cpp
     tests/unit/test_schema_migrations.cpp
+    tests/unit/test_worktree.cpp
 )
 
 # Source files (excluding main.cpp) needed by tests
